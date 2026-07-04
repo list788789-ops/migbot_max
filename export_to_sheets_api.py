@@ -60,10 +60,10 @@ def fetch_rows():
             rows.append([
                 emp.full_name,
                 emp.citizenship,
-                emp.category.value,
+                emp.category.value if emp.category else "",
                 emp.entry_date.strftime("%d.%m.%Y") if emp.entry_date else "",
                 emp.contract_date.strftime("%d.%m.%Y") if emp.contract_date else "",
-                emp.employment_status.value,
+                emp.employment_status or "",
                 "да" if consent else "нет",
                 nearest_deadline.strftime("%d.%m.%Y") if nearest_deadline else "",
                 emp.phone or "",
