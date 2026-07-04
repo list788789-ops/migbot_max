@@ -68,6 +68,8 @@ class ObligationType(str, enum.Enum):
     CONTRACT_TERMINATION_NOTICE = "contract_termination_notice"
     MEDICAL_EXAM = "medical_exam"
     PATENT_PAYMENT = "patent_payment"             # не используется в MVP, зарезервировано
+    EFS1_REPORT = "efs1_report"                   # ЕФС-1 в СФР — не позднее следующего рабочего дня
+                                                   # после приказа о приёме / даты договора
 
 
 class DeadlineUnit(str, enum.Enum):
