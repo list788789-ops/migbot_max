@@ -31,6 +31,7 @@ from sqlalchemy.orm import Session
 from maxapi import Bot, Dispatcher, F
 from maxapi.filters.command import CommandStart
 from maxapi.types import MessageCreated
+from maxapi.types.input_media import InputMedia
 
 from models import (
     Base,
@@ -45,6 +46,7 @@ from models import (
 )
 from deadlines import DEADLINE_RULES, compute_deadline, calendar_days_add
 from consent_texts import get_consent_text  # см. consent_texts.py
+from document_templates import generate_consent_docx, generate_medical_referral_docx
 
 load_dotenv()
 
@@ -233,6 +235,32 @@ async def _handle_set_entry_date(event: MessageCreated, raw_text: str) -> None:
     )
 
 
+async def _handle_send_document(event: MessageCreated, raw_text: str, generator_func, doc_label: str) -> None:
+    parts = raw_text.split(maxsplit=1)
+    if len(parts) != 2:
+        await event.message.answer(f"Формат: {parts[0]} <id сотрудника>. id смотрите в /incomplete.")
+        return
+
+    employee_id = parts[1].strip()
+    with Session(engine) as session:
+        employee = session.get(Employee, employee_id)
+        if employee is None:
+            await event.message.answer("Сотрудник с таким id не найден.")
+            return
+
+        try:
+            path = generator_func(employee)
+        except Exception:
+            log.exception("Не удалось сгенерировать документ (%s) для employee_id=%s", doc_label, employee_id)
+            await event.message.answer(f"Не удалось сгенерировать документ ({doc_label}). Проверьте логи.")
+            return
+
+    await event.message.answer(
+        text=f"{doc_label.capitalize()} для {employee.full_name}:",
+        attachments=[InputMedia(path=path)],
+    )
+
+
 @dp.message_created(F.message.body.text)
 async def on_text(event: MessageCreated):
     user_id = event.message.sender.user_id
@@ -289,6 +317,16 @@ async def on_text(event: MessageCreated):
 
         if raw_text.startswith("/set_entry_date"):
             await _handle_set_entry_date(event, raw_text)
+            return
+
+        if raw_text.startswith("/send_consent_doc"):
+            await _handle_send_document(event, raw_text, generate_consent_docx, "согласие на обработку ПД")
+            return
+
+        if raw_text.startswith("/send_medical_referral"):
+            await _handle_send_document(
+                event, raw_text, generate_medical_referral_docx, "направление на медкомиссию"
+            )
             return
 
 
