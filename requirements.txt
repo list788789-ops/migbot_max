@@ -5,3 +5,4 @@ aiohttp
 gspread
 google-auth
 psycopg2-binary
+python-docx
