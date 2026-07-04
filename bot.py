@@ -40,8 +40,10 @@ from models import (
     ConsentMethod,
     ConsentStatus,
     Employee,
+    NotificationSubscriber,
     Obligation,
     ObligationStatus,
+    ObligationType,
     RegistrationPeriod,
 )
 from deadlines import DEADLINE_RULES, compute_deadline, calendar_days_add
@@ -136,10 +138,26 @@ def create_obligations_for_employee(session: Session, employee: Employee) -> Non
 
 @dp.bot_started()
 async def on_bot_started(event):
+    # Регистрируем chat_id как получателя проактивных напоминаний здесь, а не в on_start —
+    # у BotStarted event.chat_id подтверждён документацией maxapi напрямую; для MessageCreated
+    # точный путь к chat_id не проверен, гадать в коде, который реально рассылает
+    # уведомления, рискованнее, чем оставить регистрацию только на этом событии.
+    with Session(engine) as session:
+        existing = (
+            session.query(NotificationSubscriber)
+            .filter_by(chat_id=str(event.chat_id))
+            .first()
+        )
+        if existing is None:
+            session.add(NotificationSubscriber(chat_id=str(event.chat_id)))
+            session.commit()
+
     await bot.send_message(chat_id=event.chat_id, text=(
         "Бот миграционного учёта.\n"
         "Команды: /add_employee — добавить сотрудника, /pending — список ожидающих согласия, "
-        "/incomplete — список без даты въезда."
+        "/incomplete — список без даты въезда, /medical_exam_result <id> <done|failed> — "
+        "результат медкомиссии.\n\n"
+        "Напоминания о горящих дедлайнах будут приходить в этот чат."
     ))
 
 
@@ -150,7 +168,8 @@ async def on_start(event: MessageCreated):
         "Доступные команды:\n"
         "/add_employee — добавить сотрудника\n"
         "/pending — сотрудники без подтверждённого согласия\n"
-        "/incomplete — сотрудники без даты въезда"
+        "/incomplete — сотрудники без даты въезда\n"
+        "/medical_exam_result <id> <done|failed> — зафиксировать результат медкомиссии"
     )
 
 
@@ -328,6 +347,56 @@ async def on_text(event: MessageCreated):
                 event, raw_text, generate_medical_referral_docx, "направление на медкомиссию"
             )
             return
+
+        if raw_text.startswith("/medical_exam_result"):
+            await _handle_medical_exam_result(event, raw_text)
+            return
+
+
+async def _handle_medical_exam_result(event: MessageCreated, raw_text: str) -> None:
+    parts = raw_text.split(maxsplit=2)
+    if len(parts) != 3 or parts[2].lower() not in ("done", "failed"):
+        await event.message.answer(
+            "Формат: /medical_exam_result <id> <done|failed>\nid смотрите в /incomplete."
+        )
+        return
+
+    _, employee_id, result = parts
+    result = result.lower()
+
+    with Session(engine) as session:
+        employee = session.get(Employee, employee_id.strip())
+        if employee is None:
+            await event.message.answer("Сотрудник с таким id не найден.")
+            return
+
+        obligation = (
+            session.query(Obligation)
+            .filter_by(employee_id=employee.id, type=ObligationType.MEDICAL_EXAM)
+            .order_by(Obligation.deadline_date.desc())
+            .first()
+        )
+        if obligation is None:
+            await event.message.answer(
+                f"У {employee.full_name} нет активного обязательства по медкомиссии — "
+                "нечего отмечать (возможно, согласие ещё не подтверждено)."
+            )
+            return
+
+        if result == "done":
+            obligation.status = ObligationStatus.DONE
+            session.add(obligation)
+            session.commit()
+            await event.message.answer(f"Медкомиссия для {employee.full_name} отмечена как пройденная.")
+        else:
+            # ВАЖНО: у Obligation нет поля для текстовой причины отказа/незачёта — при "failed"
+            # статус НЕ меняется автоматически (остаётся PENDING/OVERDUE), чтобы дедлайн не
+            # потерялся молча. Причину нужно фиксировать вне бота (нет места для неё в модели).
+            await event.message.answer(
+                f"Зафиксировано: медкомиссия для {employee.full_name} не пройдена. "
+                "Статус обязательства не изменён — дедлайн остаётся активным, "
+                "причину отказа фиксируйте отдельно (в модели нет поля для этого)."
+            )
 
 
 @dp.message_created(F.message.body.attachments)
