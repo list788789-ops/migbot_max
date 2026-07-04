@@ -4,4 +4,4 @@ python-dotenv
 aiohttp
 gspread
 google-auth
-
+psycopg2-binary
