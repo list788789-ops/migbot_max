@@ -41,8 +41,9 @@ from models import (
     Employee,
     Obligation,
     ObligationStatus,
+    RegistrationPeriod,
 )
-from deadlines import DEADLINE_RULES, compute_deadline
+from deadlines import DEADLINE_RULES, compute_deadline, calendar_days_add
 from consent_texts import get_consent_text  # см. consent_texts.py
 
 load_dotenv()
@@ -108,6 +109,25 @@ def create_obligations_for_employee(session: Session, employee: Employee) -> Non
             status=ObligationStatus.PENDING,
         )
         session.add(obligation)
+
+    # Заводим первый период учёта по правилу "90 из 180" — только для EAEU, формулировка
+    # правила подтверждена именно для этой категории. Для BELARUS механизм иной (изначальные
+    # 90 дней — это порог, после которого нужна ПЕРВАЯ регистрация, а не лимит на её действие) —
+    # переносить сюда по аналогии не стал, нужна отдельная юридическая проверка.
+    if employee.category == Category.EAEU and employee.entry_date is not None:
+        existing = (
+            session.query(RegistrationPeriod)
+            .filter_by(employee_id=employee.id, is_active=True)
+            .first()
+        )
+        if existing is None:
+            period = RegistrationPeriod(
+                employee_id=employee.id,
+                period_start=employee.entry_date,
+                period_end=calendar_days_add(employee.entry_date, 90),
+                is_active=True,
+            )
+            session.add(period)
 
     session.commit()
 
