@@ -178,6 +178,7 @@ def _build_main_menu() -> InlineKeyboardBuilder:
     builder.row(CallbackButton(text="📋 Список сотрудников", payload="menu:employees"))
     builder.row(CallbackButton(text="⏳ Без даты въезда", payload="menu:incomplete"))
     builder.row(CallbackButton(text="🗑 Удалить сотрудника (тест)", payload="menu:delete_employee"))
+    builder.row(CallbackButton(text="🖊 Ожидают согласия", payload="menu:pending_consent"))
     return builder
 
 
@@ -273,6 +274,76 @@ async def _deliver_delete_confirmation(responder: "_Responder", employee_id: str
         "(согласия, обязательства, направления)?",
         attachments=[builder.as_markup()],
     )
+
+
+async def _deliver_pending_consent_picker(responder: "_Responder") -> None:
+    """Список сотрудников со статусом DRAFT — кнопка на каждого запускает подтверждение
+    согласия методом BOT_BUTTON (тестовый шорткат, не замена сканированной подписи)."""
+    with Session(engine) as session:
+        employees = (
+            session.query(Employee)
+            .filter_by(consent_status=ConsentStatus.DRAFT)
+            .order_by(Employee.full_name)
+            .all()
+        )
+        if not employees:
+            await responder.send("Нет сотрудников, ожидающих согласия.")
+            return
+
+        builder = InlineKeyboardBuilder()
+        for emp in employees:
+            builder.row(CallbackButton(text=emp.full_name[:60], payload=f"consentpick:{emp.id}"))
+
+    await responder.send(
+        text=f"Ожидают согласия: {len(employees)}\nВыберите сотрудника:",
+        attachments=[builder.as_markup()],
+    )
+
+
+async def _deliver_consent_confirmation(responder: "_Responder", employee_id: str) -> None:
+    with Session(engine) as session:
+        employee = session.get(Employee, employee_id)
+        if employee is None:
+            await responder.send("Сотрудник не найден.")
+            return
+        full_name = employee.full_name
+
+    builder = InlineKeyboardBuilder()
+    builder.row(CallbackButton(text="✅ Подтвердить (кнопкой, тест)", payload=f"consentconfirm:{employee_id}"))
+    builder.row(CallbackButton(text="❌ Отмена", payload="delcancel"))
+
+    await responder.send(
+        text=f"Подтвердить согласие для {full_name} кнопкой? Это тестовый способ — "
+        "юридически слабее, чем сканированная подпись (ст.9 152-ФЗ требует осознанного "
+        "согласия, клик без верификации личности это не подтверждает).",
+        attachments=[builder.as_markup()],
+    )
+
+
+async def _execute_consent_confirm_by_button(responder: "_Responder", employee_id: str) -> None:
+    with Session(engine) as session:
+        employee = session.get(Employee, employee_id)
+        if employee is None:
+            await responder.send("Сотрудник не найден.")
+            return
+
+        consent = Consent(
+            employee_id=employee.id,
+            method=ConsentMethod.BOT_BUTTON,
+            proof=f"button_click:{responder.user_id()}:{datetime.utcnow().isoformat()}",
+            consent_text_version=CONSENT_TEXT_VERSION,
+        )
+        session.add(consent)
+
+        employee.consent_status = ConsentStatus.CONFIRMED
+        session.add(employee)
+        session.commit()
+        session.refresh(employee)
+
+        create_obligations_for_employee(session, employee)
+        full_name = employee.full_name
+
+    await responder.send(f"Согласие подтверждено (кнопкой) для {full_name}. Обязательства созданы.")
 
 
 async def _execute_delete_employee(responder: "_Responder", employee_id: str) -> None:
@@ -394,7 +465,21 @@ async def on_callback(event: MessageCallback):
         return
 
     if payload == "delcancel":
-        await responder.send("Удаление отменено.")
+        await responder.send("Отменено.")
+        return
+
+    if payload == "menu:pending_consent":
+        await _deliver_pending_consent_picker(responder)
+        return
+
+    if payload.startswith("consentpick:"):
+        employee_id = payload.split(":", 1)[1]
+        await _deliver_consent_confirmation(responder, employee_id)
+        return
+
+    if payload.startswith("consentconfirm:"):
+        employee_id = payload.split(":", 1)[1]
+        await _execute_consent_confirm_by_button(responder, employee_id)
         return
 
 
