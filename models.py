@@ -139,10 +139,13 @@ class Employee(Base):
     created_by: Mapped[str | None] = mapped_column(String, nullable=True)  # кто завёл (кадровик/прораб)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
-    consents: Mapped[list["Consent"]] = relationship(back_populates="employee")
-    obligations: Mapped[list["Obligation"]] = relationship(back_populates="employee")
-    documents: Mapped[list["Document"]] = relationship(back_populates="employee")
-    registration_periods: Mapped[list["RegistrationPeriod"]] = relationship(back_populates="employee")
+    consents: Mapped[list["Consent"]] = relationship(back_populates="employee", cascade="all, delete-orphan")
+    obligations: Mapped[list["Obligation"]] = relationship(back_populates="employee", cascade="all, delete-orphan")
+    documents: Mapped[list["Document"]] = relationship(back_populates="employee", cascade="all, delete-orphan")
+    registration_periods: Mapped[list["RegistrationPeriod"]] = relationship(
+        back_populates="employee", cascade="all, delete-orphan"
+    )
+    referrals: Mapped[list["Referral"]] = relationship(back_populates="employee", cascade="all, delete-orphan")
 
 
 class RegistrationPeriod(Base):
@@ -207,7 +210,7 @@ class Obligation(Base):
     )
 
     employee: Mapped["Employee"] = relationship(back_populates="obligations")
-    referrals: Mapped[list["Referral"]] = relationship(back_populates="obligation")
+    referrals: Mapped[list["Referral"]] = relationship(back_populates="obligation", cascade="all, delete-orphan")
 
 
 class Referral(Base):
@@ -223,7 +226,8 @@ class Referral(Base):
     result_date: Mapped[date | None] = mapped_column(Date, nullable=True)
 
     obligation: Mapped["Obligation"] = relationship(back_populates="referrals")
-    invoices: Mapped[list["Invoice"]] = relationship(back_populates="referral")
+    employee: Mapped["Employee"] = relationship(back_populates="referrals")
+    invoices: Mapped[list["Invoice"]] = relationship(back_populates="referral", cascade="all, delete-orphan")
 
 
 class Invoice(Base):
