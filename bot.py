@@ -32,6 +32,9 @@ from maxapi import Bot, Dispatcher, F
 from maxapi.filters.command import CommandStart
 from maxapi.types import MessageCreated
 from maxapi.types.input_media import InputMedia
+from maxapi.types.updates.message_callback import MessageCallback
+from maxapi.utils.inline_keyboard import InlineKeyboardBuilder
+from maxapi.types.attachments.buttons import CallbackButton
 
 from models import (
     Base,
@@ -154,7 +157,8 @@ async def on_bot_started(event):
 
     await bot.send_message(chat_id=event.chat_id, text=(
         "Бот миграционного учёта.\n"
-        "Команды: /add_employee — добавить сотрудника, /pending — список ожидающих согласия, "
+        "Команды: /add_employee — добавить сотрудника, /employees — список сотрудников, "
+        "/pending — список ожидающих согласия, "
         "/incomplete — список без даты въезда, /medical_exam_result <id> <done|failed> — "
         "результат медкомиссии.\n\n"
         "Напоминания о горящих дедлайнах будут приходить в этот чат."
@@ -167,6 +171,7 @@ async def on_start(event: MessageCreated):
         "Бот миграционного учёта запущен.\n"
         "Доступные команды:\n"
         "/add_employee — добавить сотрудника\n"
+        "/employees — список всех сотрудников\n"
         "/pending — сотрудники без подтверждённого согласия\n"
         "/incomplete — сотрудники без даты въезда\n"
         "/medical_exam_result <id> <done|failed> — зафиксировать результат медкомиссии"
@@ -190,9 +195,9 @@ async def on_add_employee_start(event: MessageCreated):
 
 @dp.message_created(F.message.body.text == "/incomplete")
 async def on_incomplete(event: MessageCreated):
-    """Список сотрудников без даты въезда — целевая группа для дозаполнения после переноса
-    из ручной xlsx-таблицы. Паспорт в списке нужен для идентификации: в данных есть тёзки
-    (например, две записи 'Кете'), одного ФИО недостаточно, чтобы понять, кому звонить."""
+    """Список сотрудников без даты въезда — кнопка на каждого. Клик запускает те же шаги,
+    что и /set_entry_date, но без необходимости копировать id вручную. Текст кнопки включает
+    паспорт: в данных есть тёзки (например, две записи 'Кете'), одного ФИО недостаточно."""
     with Session(engine) as session:
         employees = (
             session.query(Employee)
@@ -205,15 +210,77 @@ async def on_incomplete(event: MessageCreated):
             await event.message.answer("У всех сотрудников указана дата въезда.")
             return
 
-        lines = [f"Без даты въезда: {len(employees)}\n"]
+        builder = InlineKeyboardBuilder()
         for emp in employees:
             passport = f"{emp.passport_series or ''} {emp.passport_number or ''}".strip()
-            lines.append(
-                f"• {emp.full_name} — паспорт: {passport or 'нет данных'}\n  id={emp.id}"
-            )
-        lines.append("\nЧтобы указать дату: /set_entry_date <id> <ГГГГ-ММ-ДД>")
+            label = f"{emp.full_name} ({passport})" if passport else emp.full_name
+            # Лимит длины текста кнопки в MAX не проверен документацией — обрезаю на всякий случай.
+            builder.row(CallbackButton(text=label[:60], payload=emp.id))
 
-    await event.message.answer("\n".join(lines))
+    await event.message.answer(
+        text=f"Без даты въезда: {len(employees)}\nНажмите на сотрудника, чтобы указать дату:",
+        attachments=[builder.as_markup()],
+    )
+
+
+@dp.message_callback()
+async def on_employee_button_click(event: MessageCallback):
+    """Клик по кнопке сотрудника из /incomplete — переводит в режим ожидания даты въезда,
+    дальнейший текст ловит on_text через тот же _pending_forms, что и остальные сценарии."""
+    employee_id = event.callback.payload
+    if not employee_id:
+        return
+
+    with Session(engine) as session:
+        employee = session.get(Employee, employee_id)
+        if employee is None:
+            await event.answer(notification="Сотрудник не найден.")
+            return
+        full_name = employee.full_name
+
+    _, user_id = event.get_ids()
+    _pending_forms[user_id] = {"state": "awaiting_entry_date_button", "employee_id": employee_id}
+
+    await event.reply(text=f"Введите дату въезда для {full_name} в формате ГГГГ-ММ-ДД:")
+
+
+EMPLOYEES_PAGE_SIZE = 20  # запас на случай неизвестного лимита длины сообщения в MAX
+
+
+@dp.message_created(F.message.body.text == "/employees")
+async def on_employees(event: MessageCreated):
+    """Полный список сотрудников — сводка (имя, категория, статус согласия, ближайший
+    дедлайн), не полная карточка. Для полных данных — Google Sheets (export_to_sheets_api.py),
+    там больше полей и не нужно упираться в ограничения длины сообщения чата."""
+    with Session(engine) as session:
+        employees = session.query(Employee).order_by(Employee.full_name).all()
+
+        if not employees:
+            await event.message.answer("Сотрудников в базе нет.")
+            return
+
+        rows = []
+        for emp in employees:
+            nearest = (
+                session.query(Obligation)
+                .filter_by(employee_id=emp.id, status=ObligationStatus.PENDING)
+                .order_by(Obligation.deadline_date)
+                .first()
+            )
+            deadline_str = nearest.deadline_date.strftime("%d.%m.%Y") if nearest else "—"
+            category = emp.category.value if emp.category else "?"
+            consent = "✅" if emp.consent_status == ConsentStatus.CONFIRMED else "⏳"
+            rows.append(f"{consent} {emp.full_name} — {category}, дедлайн: {deadline_str}")
+
+    total = len(rows)
+    await event.message.answer(f"Всего сотрудников: {total}")
+
+    for i in range(0, total, EMPLOYEES_PAGE_SIZE):
+        chunk = rows[i : i + EMPLOYEES_PAGE_SIZE]
+        page_num = i // EMPLOYEES_PAGE_SIZE + 1
+        total_pages = (total + EMPLOYEES_PAGE_SIZE - 1) // EMPLOYEES_PAGE_SIZE
+        header = f"Страница {page_num}/{total_pages}:\n" if total_pages > 1 else ""
+        await event.message.answer(header + "\n".join(chunk))
 
 
 async def _handle_set_entry_date(event: MessageCreated, raw_text: str) -> None:
