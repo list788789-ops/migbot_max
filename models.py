@@ -165,6 +165,17 @@ class RegistrationPeriod(Base):
     employee: Mapped["Employee"] = relationship(back_populates="registration_periods")
 
 
+class NotificationSubscriber(Base):
+    """chat_id получателей проактивных напоминаний. Заполняется при /start —
+    без этого cron-скрипту некому слать сообщения о горящих дедлайнах."""
+
+    __tablename__ = "notification_subscribers"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    chat_id: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class Consent(Base):
     __tablename__ = "consents"
 
