@@ -28,6 +28,8 @@ from datetime import date
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Pt
+from openpyxl import Workbook
+from openpyxl.styles import Font
 
 from models import Employee
 
@@ -192,4 +194,48 @@ def generate_medical_referral_docx(employee: Employee, output_dir: str = "/tmp")
     filename = f"medical_referral_{employee.id}.docx"
     path = os.path.join(output_dir, filename)
     doc.save(path)
+    return path
+
+
+def generate_employees_xlsx(employees: list[Employee], output_dir: str = "/tmp") -> str:
+    """Полный список сотрудников таблицей — замена постраничному тексту в /employees.
+    Отдельный файл от Google Sheets: тот обновляется по крону раз в сутки командой
+    export_to_sheets_api.py, этот — генерируется по запросу с текущим состоянием БД."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Сотрудники"
+
+    headers = [
+        "ФИО", "Гражданство", "Категория", "Дата въезда", "Дата договора",
+        "Статус занятости", "Согласие", "Телефон", "Язык",
+        "Дата рождения", "Серия паспорта", "Номер паспорта", "Адрес", "Откуда въехал",
+    ]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+
+    for emp in employees:
+        ws.append([
+            emp.full_name,
+            emp.citizenship or "",
+            emp.category.value if emp.category else "",
+            emp.entry_date.strftime("%d.%m.%Y") if emp.entry_date else "",
+            emp.contract_date.strftime("%d.%m.%Y") if emp.contract_date else "",
+            emp.employment_status or "",
+            "да" if emp.consent_status.value == "confirmed" else "нет",
+            emp.phone or "",
+            emp.language or "",
+            emp.birth_date.strftime("%d.%m.%Y") if emp.birth_date else "",
+            emp.passport_series or "",
+            emp.passport_number or "",
+            emp.address or "",
+            emp.entry_country or "",
+        ])
+
+    for col in ws.columns:
+        max_len = max((len(str(c.value)) for c in col if c.value), default=10)
+        ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 40)
+
+    path = os.path.join(output_dir, "employees.xlsx")
+    wb.save(path)
     return path
