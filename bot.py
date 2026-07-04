@@ -51,7 +51,11 @@ from models import (
 )
 from deadlines import DEADLINE_RULES, compute_deadline, calendar_days_add
 from consent_texts import get_consent_text  # см. consent_texts.py
-from document_templates import generate_consent_docx, generate_medical_referral_docx
+from document_templates import (
+    generate_consent_docx,
+    generate_employees_xlsx,
+    generate_medical_referral_docx,
+)
 
 load_dotenv()
 
@@ -73,8 +77,6 @@ dp = Dispatcher()
 # Простое in-memory FSM для формы добавления сотрудника.
 # На продакшене — заменить на Redis-контекст (maxapi это поддерживает из коробки).
 _pending_forms: dict[str, dict] = {}
-
-EMPLOYEES_PAGE_SIZE = 20  # запас на случай неизвестного лимита длины сообщения в MAX
 
 
 def is_hr(phone: str | None) -> bool:
@@ -175,6 +177,7 @@ def _build_main_menu() -> InlineKeyboardBuilder:
     builder.row(CallbackButton(text="➕ Добавить сотрудника", payload="menu:add_employee"))
     builder.row(CallbackButton(text="📋 Список сотрудников", payload="menu:employees"))
     builder.row(CallbackButton(text="⏳ Без даты въезда", payload="menu:incomplete"))
+    builder.row(CallbackButton(text="🗑 Удалить сотрудника (тест)", payload="menu:delete_employee"))
     return builder
 
 
@@ -190,33 +193,20 @@ async def _start_add_employee_flow(responder: "_Responder") -> None:
 
 
 async def _deliver_employees_list(responder: "_Responder") -> None:
+    """Список сотрудников — теперь файлом xlsx, не постраничным текстом. Генерируется
+    по текущему состоянию БД на момент запроса, независимо от Google Sheets (тот
+    обновляется по крону через export_to_sheets_api.py и может отставать)."""
     with Session(engine) as session:
         employees = session.query(Employee).order_by(Employee.full_name).all()
         if not employees:
             await responder.send("Сотрудников в базе нет.")
             return
+        path = generate_employees_xlsx(employees)
 
-        rows = []
-        for emp in employees:
-            nearest = (
-                session.query(Obligation)
-                .filter_by(employee_id=emp.id, status=ObligationStatus.PENDING)
-                .order_by(Obligation.deadline_date)
-                .first()
-            )
-            deadline_str = nearest.deadline_date.strftime("%d.%m.%Y") if nearest else "—"
-            category = emp.category.value if emp.category else "?"
-            consent = "✅" if emp.consent_status == ConsentStatus.CONFIRMED else "⏳"
-            rows.append(f"{consent} {emp.full_name} — {category}, дедлайн: {deadline_str}")
-
-    total = len(rows)
-    await responder.send(f"Всего сотрудников: {total}")
-    for i in range(0, total, EMPLOYEES_PAGE_SIZE):
-        chunk = rows[i : i + EMPLOYEES_PAGE_SIZE]
-        page_num = i // EMPLOYEES_PAGE_SIZE + 1
-        total_pages = (total + EMPLOYEES_PAGE_SIZE - 1) // EMPLOYEES_PAGE_SIZE
-        header = f"Страница {page_num}/{total_pages}:\n" if total_pages > 1 else ""
-        await responder.send(header + "\n".join(chunk))
+    await responder.send(
+        text=f"Всего сотрудников: {len(employees)}",
+        attachments=[InputMedia(path=path)],
+    )
 
 
 async def _deliver_incomplete_list(responder: "_Responder") -> None:
@@ -242,6 +232,61 @@ async def _deliver_incomplete_list(responder: "_Responder") -> None:
         text=f"Без даты въезда: {count}\nНажмите на сотрудника, чтобы указать дату:",
         attachments=[builder.as_markup()],
     )
+
+
+async def _deliver_delete_picker(responder: "_Responder") -> None:
+    """Список сотрудников как кнопки для удаления. Двухшаговое подтверждение обязательно —
+    без него один клик безвозвратно удаляет сотрудника со всей историей (согласия,
+    обязательства, направления), а восстановить это средствами бота нельзя."""
+    with Session(engine) as session:
+        employees = session.query(Employee).order_by(Employee.full_name).all()
+        if not employees:
+            await responder.send("Сотрудников в базе нет.")
+            return
+
+        builder = InlineKeyboardBuilder()
+        for emp in employees:
+            passport = f"{emp.passport_series or ''} {emp.passport_number or ''}".strip()
+            label = f"{emp.full_name} ({passport})" if passport else emp.full_name
+            builder.row(CallbackButton(text=label[:60], payload=f"delpick:{emp.id}"))
+
+    await responder.send(
+        text="Выберите сотрудника для удаления (тестовая функция, действие необратимо):",
+        attachments=[builder.as_markup()],
+    )
+
+
+async def _deliver_delete_confirmation(responder: "_Responder", employee_id: str) -> None:
+    with Session(engine) as session:
+        employee = session.get(Employee, employee_id)
+        if employee is None:
+            await responder.send("Сотрудник не найден.")
+            return
+        full_name = employee.full_name
+
+    builder = InlineKeyboardBuilder()
+    builder.row(CallbackButton(text="✅ Подтвердить удаление", payload=f"delconfirm:{employee_id}"))
+    builder.row(CallbackButton(text="❌ Отмена", payload="delcancel"))
+
+    await responder.send(
+        text=f"Удалить {full_name} безвозвратно, вместе со всей историей "
+        "(согласия, обязательства, направления)?",
+        attachments=[builder.as_markup()],
+    )
+
+
+async def _execute_delete_employee(responder: "_Responder", employee_id: str) -> None:
+    with Session(engine) as session:
+        employee = session.get(Employee, employee_id)
+        if employee is None:
+            await responder.send("Сотрудник уже удалён или не найден.")
+            return
+        full_name = employee.full_name
+        session.delete(employee)  # каскад удалит consents/obligations/documents/
+        # registration_periods/referrals/invoices — см. cascade="all, delete-orphan" в models.py
+        session.commit()
+
+    await responder.send(f"Сотрудник {full_name} удалён.")
 
 
 @dp.bot_started()
@@ -332,6 +377,24 @@ async def on_callback(event: MessageCallback):
             "employee_id": employee_id,
         }
         await responder.send(f"Введите дату въезда для {full_name} в формате ГГГГ-ММ-ДД:")
+        return
+
+    if payload == "menu:delete_employee":
+        await _deliver_delete_picker(responder)
+        return
+
+    if payload.startswith("delpick:"):
+        employee_id = payload.split(":", 1)[1]
+        await _deliver_delete_confirmation(responder, employee_id)
+        return
+
+    if payload.startswith("delconfirm:"):
+        employee_id = payload.split(":", 1)[1]
+        await _execute_delete_employee(responder, employee_id)
+        return
+
+    if payload == "delcancel":
+        await responder.send("Удаление отменено.")
         return
 
 
