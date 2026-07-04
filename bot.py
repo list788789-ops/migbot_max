@@ -74,6 +74,8 @@ dp = Dispatcher()
 # На продакшене — заменить на Redis-контекст (maxapi это поддерживает из коробки).
 _pending_forms: dict[str, dict] = {}
 
+EMPLOYEES_PAGE_SIZE = 20  # запас на случай неизвестного лимита длины сообщения в MAX
+
 
 def is_hr(phone: str | None) -> bool:
     if not HR_WHITELIST:
@@ -139,124 +141,59 @@ def create_obligations_for_employee(session: Session, employee: Employee) -> Non
     session.commit()
 
 
-@dp.bot_started()
-async def on_bot_started(event):
-    # Регистрируем chat_id как получателя проактивных напоминаний здесь, а не в on_start —
-    # у BotStarted event.chat_id подтверждён документацией maxapi напрямую; для MessageCreated
-    # точный путь к chat_id не проверен, гадать в коде, который реально рассылает
-    # уведомления, рискованнее, чем оставить регистрацию только на этом событии.
-    with Session(engine) as session:
-        existing = (
-            session.query(NotificationSubscriber)
-            .filter_by(chat_id=str(event.chat_id))
-            .first()
-        )
-        if existing is None:
-            session.add(NotificationSubscriber(chat_id=str(event.chat_id)))
-            session.commit()
+class _Responder:
+    """Абстракция отправки ответа поверх двух разных API: event.message.answer()
+    у MessageCreated и bot.send_message(chat_id=...) у MessageCallback (chat_id там
+    берётся из подтверждённого документацией event.get_ids(), в отличие от MessageCreated,
+    где путь к chat_id не проверен — поэтому для него используется answer(), не send_message)."""
 
-    await bot.send_message(chat_id=event.chat_id, text=(
-        "Бот миграционного учёта.\n"
-        "Команды: /add_employee — добавить сотрудника, /employees — список сотрудников, "
-        "/pending — список ожидающих согласия, "
-        "/incomplete — список без даты въезда, /medical_exam_result <id> <done|failed> — "
-        "результат медкомиссии.\n\n"
-        "Напоминания о горящих дедлайнах будут приходить в этот чат."
-    ))
+    def __init__(self, event):
+        self._event = event
 
+    async def send(self, text: str, attachments=None):
+        if isinstance(self._event, MessageCallback):
+            chat_id, _ = self._event.get_ids()
+            if attachments:
+                await bot.send_message(chat_id=chat_id, text=text, attachments=attachments)
+            else:
+                await bot.send_message(chat_id=chat_id, text=text)
+        else:
+            if attachments:
+                await self._event.message.answer(text=text, attachments=attachments)
+            else:
+                await self._event.message.answer(text)
 
-@dp.message_created(CommandStart())
-async def on_start(event: MessageCreated):
-    await event.message.answer(
-        "Бот миграционного учёта запущен.\n"
-        "Доступные команды:\n"
-        "/add_employee — добавить сотрудника\n"
-        "/employees — список всех сотрудников\n"
-        "/pending — сотрудники без подтверждённого согласия\n"
-        "/incomplete — сотрудники без даты въезда\n"
-        "/medical_exam_result <id> <done|failed> — зафиксировать результат медкомиссии"
-    )
+    def user_id(self) -> str:
+        if isinstance(self._event, MessageCallback):
+            _, user_id = self._event.get_ids()
+            return user_id
+        return self._event.message.sender.user_id
 
 
-@dp.message_created(F.message.body.text == "/add_employee")
-async def on_add_employee_start(event: MessageCreated):
-    # Упрощённая форма без диалоговых шагов — на первом этапе принимаем данные одним сообщением.
-    # Формат (временный, до нормального FSM):
-    # ФИО; гражданство; дата_въезда(ГГГГ-ММ-ДД); дата_договора(ГГГГ-ММ-ДД); язык; телефон
-    _pending_forms[event.message.sender.user_id] = {"state": "awaiting_employee_data"}
-    await event.message.answer(
+def _build_main_menu() -> InlineKeyboardBuilder:
+    builder = InlineKeyboardBuilder()
+    builder.row(CallbackButton(text="➕ Добавить сотрудника", payload="menu:add_employee"))
+    builder.row(CallbackButton(text="📋 Список сотрудников", payload="menu:employees"))
+    builder.row(CallbackButton(text="⏳ Без даты въезда", payload="menu:incomplete"))
+    return builder
+
+
+async def _start_add_employee_flow(responder: "_Responder") -> None:
+    _pending_forms[responder.user_id()] = {"state": "awaiting_employee_data"}
+    await responder.send(
         "Отправьте данные сотрудника одной строкой через ';':\n"
         "ФИО; гражданство; дата въезда (ГГГГ-ММ-ДД); дата договора (ГГГГ-ММ-ДД); язык; телефон\n\n"
         "Пример:\nИванов Иван; Казахстан; 2026-07-01; 2026-07-03; kk; +7900...\n\n"
         "Категория по умолчанию — eaeu. Для Белоруссии напишите 'belarus' вместо гражданства-триггера "
-        "(это временный формат для MVP, потом заменить на нормальную форму с кнопками)."
+        "(это временный формат для MVP)."
     )
 
 
-@dp.message_created(F.message.body.text == "/incomplete")
-async def on_incomplete(event: MessageCreated):
-    """Список сотрудников без даты въезда — кнопка на каждого. Клик запускает те же шаги,
-    что и /set_entry_date, но без необходимости копировать id вручную. Текст кнопки включает
-    паспорт: в данных есть тёзки (например, две записи 'Кете'), одного ФИО недостаточно."""
-    with Session(engine) as session:
-        employees = (
-            session.query(Employee)
-            .filter(Employee.entry_date.is_(None))
-            .order_by(Employee.full_name)
-            .all()
-        )
-
-        if not employees:
-            await event.message.answer("У всех сотрудников указана дата въезда.")
-            return
-
-        builder = InlineKeyboardBuilder()
-        for emp in employees:
-            passport = f"{emp.passport_series or ''} {emp.passport_number or ''}".strip()
-            label = f"{emp.full_name} ({passport})" if passport else emp.full_name
-            # Лимит длины текста кнопки в MAX не проверен документацией — обрезаю на всякий случай.
-            builder.row(CallbackButton(text=label[:60], payload=emp.id))
-
-    await event.message.answer(
-        text=f"Без даты въезда: {len(employees)}\nНажмите на сотрудника, чтобы указать дату:",
-        attachments=[builder.as_markup()],
-    )
-
-
-@dp.message_callback()
-async def on_employee_button_click(event: MessageCallback):
-    """Клик по кнопке сотрудника из /incomplete — переводит в режим ожидания даты въезда,
-    дальнейший текст ловит on_text через тот же _pending_forms, что и остальные сценарии."""
-    employee_id = event.callback.payload
-    if not employee_id:
-        return
-
-    with Session(engine) as session:
-        employee = session.get(Employee, employee_id)
-        if employee is None:
-            await event.answer(notification="Сотрудник не найден.")
-            return
-        full_name = employee.full_name
-
-    _, user_id = event.get_ids()
-    _pending_forms[user_id] = {"state": "awaiting_entry_date_button", "employee_id": employee_id}
-
-    await event.reply(text=f"Введите дату въезда для {full_name} в формате ГГГГ-ММ-ДД:")
-
-
-EMPLOYEES_PAGE_SIZE = 20  # запас на случай неизвестного лимита длины сообщения в MAX
-
-
-@dp.message_created(F.message.body.text == "/employees")
-async def on_employees(event: MessageCreated):
-    """Полный список сотрудников — сводка (имя, категория, статус согласия, ближайший
-    дедлайн), не полная карточка. Для полных данных — Google Sheets (export_to_sheets_api.py),
-    там больше полей и не нужно упираться в ограничения длины сообщения чата."""
+async def _deliver_employees_list(responder: "_Responder") -> None:
     with Session(engine) as session:
         employees = session.query(Employee).order_by(Employee.full_name).all()
-
         if not employees:
-            await event.message.answer("Сотрудников в базе нет.")
+            await responder.send("Сотрудников в базе нет.")
             return
 
         rows = []
@@ -273,14 +210,160 @@ async def on_employees(event: MessageCreated):
             rows.append(f"{consent} {emp.full_name} — {category}, дедлайн: {deadline_str}")
 
     total = len(rows)
-    await event.message.answer(f"Всего сотрудников: {total}")
-
+    await responder.send(f"Всего сотрудников: {total}")
     for i in range(0, total, EMPLOYEES_PAGE_SIZE):
         chunk = rows[i : i + EMPLOYEES_PAGE_SIZE]
         page_num = i // EMPLOYEES_PAGE_SIZE + 1
         total_pages = (total + EMPLOYEES_PAGE_SIZE - 1) // EMPLOYEES_PAGE_SIZE
         header = f"Страница {page_num}/{total_pages}:\n" if total_pages > 1 else ""
-        await event.message.answer(header + "\n".join(chunk))
+        await responder.send(header + "\n".join(chunk))
+
+
+async def _deliver_incomplete_list(responder: "_Responder") -> None:
+    with Session(engine) as session:
+        employees = (
+            session.query(Employee)
+            .filter(Employee.entry_date.is_(None))
+            .order_by(Employee.full_name)
+            .all()
+        )
+        if not employees:
+            await responder.send("У всех сотрудников указана дата въезда.")
+            return
+
+        builder = InlineKeyboardBuilder()
+        for emp in employees:
+            passport = f"{emp.passport_series or ''} {emp.passport_number or ''}".strip()
+            label = f"{emp.full_name} ({passport})" if passport else emp.full_name
+            builder.row(CallbackButton(text=label[:60], payload=f"empdate:{emp.id}"))
+        count = len(employees)
+
+    await responder.send(
+        text=f"Без даты въезда: {count}\nНажмите на сотрудника, чтобы указать дату:",
+        attachments=[builder.as_markup()],
+    )
+
+
+@dp.bot_started()
+async def on_bot_started(event):
+    # Регистрируем chat_id как получателя проактивных напоминаний здесь, а не в on_start —
+    # у BotStarted event.chat_id подтверждён документацией maxapi напрямую; для MessageCreated
+    # точный путь к chat_id не проверен, гадать в коде, который реально рассылает
+    # уведомления, рискованнее, чем оставить регистрацию только на этом событии.
+    with Session(engine) as session:
+        existing = (
+            session.query(NotificationSubscriber)
+            .filter_by(chat_id=str(event.chat_id))
+            .first()
+        )
+        if existing is None:
+            session.add(NotificationSubscriber(chat_id=str(event.chat_id)))
+            session.commit()
+
+    await bot.send_message(
+        chat_id=event.chat_id,
+        text=(
+            "Бот миграционного учёта.\n"
+            "Выберите действие или используйте команды: /medical_exam_result <id> <done|failed>, "
+            "/set_entry_date <id> <ГГГГ-ММ-ДД>, /send_consent_doc <id>, /send_medical_referral <id>.\n\n"
+            "Напоминания о горящих дедлайнах будут приходить в этот чат."
+        ),
+        attachments=[_build_main_menu().as_markup()],
+    )
+
+
+@dp.message_created(CommandStart())
+async def on_start(event: MessageCreated):
+    await event.message.answer(
+        text="Бот миграционного учёта запущен. Выберите действие:",
+        attachments=[_build_main_menu().as_markup()],
+    )
+
+
+@dp.message_created(F.message.body.text == "/add_employee")
+async def on_add_employee_start(event: MessageCreated):
+    await _start_add_employee_flow(_Responder(event))
+
+
+@dp.message_created(F.message.body.text == "/employees")
+async def on_employees(event: MessageCreated):
+    await _deliver_employees_list(_Responder(event))
+
+
+@dp.message_created(F.message.body.text == "/incomplete")
+async def on_incomplete(event: MessageCreated):
+    await _deliver_incomplete_list(_Responder(event))
+
+
+@dp.message_callback()
+async def on_callback(event: MessageCallback):
+    """Единая точка входа для всех кнопок: главное меню (payload='menu:...') и выбор
+    сотрудника из /incomplete (payload='empdate:<id>'). Префиксы нужны, чтобы не перепутать
+    два типа кнопок — просто employee.id без префикса раньше не различался бы с меню."""
+    payload = event.callback.payload
+    if not payload:
+        return
+
+    responder = _Responder(event)
+
+    if payload == "menu:add_employee":
+        await _start_add_employee_flow(responder)
+        return
+
+    if payload == "menu:employees":
+        await _deliver_employees_list(responder)
+        return
+
+    if payload == "menu:incomplete":
+        await _deliver_incomplete_list(responder)
+        return
+
+    if payload.startswith("empdate:"):
+        employee_id = payload.split(":", 1)[1]
+        with Session(engine) as session:
+            employee = session.get(Employee, employee_id)
+            if employee is None:
+                await event.answer(notification="Сотрудник не найден.")
+                return
+            full_name = employee.full_name
+
+        _pending_forms[responder.user_id()] = {
+            "state": "awaiting_entry_date_button",
+            "employee_id": employee_id,
+        }
+        await responder.send(f"Введите дату въезда для {full_name} в формате ГГГГ-ММ-ДД:")
+        return
+
+
+async def _apply_entry_date(event, employee_id: str, entry_date) -> None:
+    """Общая логика установки даты въезда — используется и командой /set_entry_date,
+    и сценарием после клика по кнопке в /incomplete."""
+    with Session(engine) as session:
+        employee = session.get(Employee, employee_id.strip())
+        if employee is None:
+            await event.reply(text="Сотрудник с таким id не найден. Проверьте /incomplete.") \
+                if isinstance(event, MessageCallback) else \
+                await event.message.answer("Сотрудник с таким id не найден. Проверьте /incomplete.")
+            return
+
+        employee.entry_date = entry_date
+        session.add(employee)
+        session.commit()
+        session.refresh(employee)
+
+        # Если согласие уже было подтверждено раньше (в этой партии — маловероятно, но
+        # на будущее, если дозаполнение произойдёт уже после /confirm_consent), не оставляем
+        # obligations несозданными молча — досоздаём их сейчас же.
+        if employee.consent_status == ConsentStatus.CONFIRMED:
+            create_obligations_for_employee(session, employee)
+
+        full_name = employee.full_name
+
+    text = f"Дата въезда для {full_name} установлена: {entry_date.strftime('%d.%m.%Y')}."
+    if isinstance(event, MessageCallback):
+        await event.reply(text=text)
+    else:
+        await event.message.answer(text)
 
 
 async def _handle_set_entry_date(event: MessageCreated, raw_text: str) -> None:
@@ -299,26 +382,7 @@ async def _handle_set_entry_date(event: MessageCreated, raw_text: str) -> None:
         await event.message.answer("Не распознал дату. Формат: ГГГГ-ММ-ДД, например 2026-06-15.")
         return
 
-    with Session(engine) as session:
-        employee = session.get(Employee, employee_id.strip())
-        if employee is None:
-            await event.message.answer("Сотрудник с таким id не найден. Проверьте /incomplete.")
-            return
-
-        employee.entry_date = entry_date
-        session.add(employee)
-        session.commit()
-        session.refresh(employee)
-
-        # Если согласие уже было подтверждено раньше (в этой партии — маловероятно, но
-        # на будущее, если дозаполнение произойдёт уже после /confirm_consent), не оставляем
-        # obligations несозданными молча — досоздаём их сейчас же.
-        if employee.consent_status == ConsentStatus.CONFIRMED:
-            create_obligations_for_employee(session, employee)
-
-    await event.message.answer(
-        f"Дата въезда для {employee.full_name} установлена: {entry_date.strftime('%d.%m.%Y')}."
-    )
+    await _apply_entry_date(event, employee_id, entry_date)
 
 
 async def _handle_send_document(event: MessageCreated, raw_text: str, generator_func, doc_label: str) -> None:
@@ -351,6 +415,19 @@ async def _handle_send_document(event: MessageCreated, raw_text: str, generator_
 async def on_text(event: MessageCreated):
     user_id = event.message.sender.user_id
     form = _pending_forms.get(user_id)
+
+    if form and form.get("state") == "awaiting_entry_date_button":
+        date_s = event.message.body.text.strip()
+        try:
+            entry_date = datetime.strptime(date_s, "%Y-%m-%d").date()
+        except ValueError:
+            await event.message.answer("Не распознал дату. Формат: ГГГГ-ММ-ДД, например 2026-06-15.")
+            return
+
+        employee_id = form["employee_id"]
+        _pending_forms.pop(user_id, None)
+        await _apply_entry_date(event, employee_id, entry_date)
+        return
 
     if form and form.get("state") == "awaiting_employee_data":
         raw = event.message.body.text
