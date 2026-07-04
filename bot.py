@@ -6,12 +6,17 @@
   - добавление сотрудника (черновик, consent_status=draft) — obligations НЕ создаются
   - выдача текста согласия на языке сотрудника
   - приём скана согласия (paper_scan) -> consent_status=confirmed -> создание obligations
+  - /incomplete — список сотрудников без даты въезда (2026-07, для дозаполнения после переноса
+    из ручной xlsx-таблицы, где часть записей была без этого поля)
+  - /set_entry_date <id> <ГГГГ-ММ-ДД> — точечное дозаполнение даты въезда существующему сотруднику
 
 Сознательно НЕ реализовано на этом этапе (см. договорённости в диалоге):
   - вход самого сотрудника в бота под своим аккаунтом (bot_button consent)
   - категории patent/visa/hqs — только eaeu/belarus
   - интеграция invoices с 1С — счёт пока просто файл, без API-обмена
   - производственный календарь праздников для working_day (см. deadlines.py)
+  - дозаполнение employment_status (все 67 перенесённых записей стоят "уточнить") —
+    отдельная задача, сознательно не включена в эту итерацию
 """
 
 import asyncio
@@ -111,7 +116,8 @@ def create_obligations_for_employee(session: Session, employee: Employee) -> Non
 async def on_bot_started(event):
     await bot.send_message(chat_id=event.chat_id, text=(
         "Бот миграционного учёта.\n"
-        "Команды: /add_employee — добавить сотрудника, /pending — список ожидающих согласия."
+        "Команды: /add_employee — добавить сотрудника, /pending — список ожидающих согласия, "
+        "/incomplete — список без даты въезда."
     ))
 
 
@@ -121,7 +127,8 @@ async def on_start(event: MessageCreated):
         "Бот миграционного учёта запущен.\n"
         "Доступные команды:\n"
         "/add_employee — добавить сотрудника\n"
-        "/pending — сотрудники без подтверждённого согласия"
+        "/pending — сотрудники без подтверждённого согласия\n"
+        "/incomplete — сотрудники без даты въезда"
     )
 
 
@@ -137,6 +144,72 @@ async def on_add_employee_start(event: MessageCreated):
         "Пример:\nИванов Иван; Казахстан; 2026-07-01; 2026-07-03; kk; +7900...\n\n"
         "Категория по умолчанию — eaeu. Для Белоруссии напишите 'belarus' вместо гражданства-триггера "
         "(это временный формат для MVP, потом заменить на нормальную форму с кнопками)."
+    )
+
+
+@dp.message_created(F.message.body.text == "/incomplete")
+async def on_incomplete(event: MessageCreated):
+    """Список сотрудников без даты въезда — целевая группа для дозаполнения после переноса
+    из ручной xlsx-таблицы. Паспорт в списке нужен для идентификации: в данных есть тёзки
+    (например, две записи 'Кете'), одного ФИО недостаточно, чтобы понять, кому звонить."""
+    with Session(engine) as session:
+        employees = (
+            session.query(Employee)
+            .filter(Employee.entry_date.is_(None))
+            .order_by(Employee.full_name)
+            .all()
+        )
+
+        if not employees:
+            await event.message.answer("У всех сотрудников указана дата въезда.")
+            return
+
+        lines = [f"Без даты въезда: {len(employees)}\n"]
+        for emp in employees:
+            passport = f"{emp.passport_series or ''} {emp.passport_number or ''}".strip()
+            lines.append(
+                f"• {emp.full_name} — паспорт: {passport or 'нет данных'}\n  id={emp.id}"
+            )
+        lines.append("\nЧтобы указать дату: /set_entry_date <id> <ГГГГ-ММ-ДД>")
+
+    await event.message.answer("\n".join(lines))
+
+
+async def _handle_set_entry_date(event: MessageCreated, raw_text: str) -> None:
+    parts = raw_text.split(maxsplit=2)
+    if len(parts) != 3:
+        await event.message.answer(
+            "Формат: /set_entry_date <id> <ГГГГ-ММ-ДД>\n"
+            "id сотрудника смотрите в /incomplete."
+        )
+        return
+
+    _, employee_id, date_s = parts
+    try:
+        entry_date = datetime.strptime(date_s.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        await event.message.answer("Не распознал дату. Формат: ГГГГ-ММ-ДД, например 2026-06-15.")
+        return
+
+    with Session(engine) as session:
+        employee = session.get(Employee, employee_id.strip())
+        if employee is None:
+            await event.message.answer("Сотрудник с таким id не найден. Проверьте /incomplete.")
+            return
+
+        employee.entry_date = entry_date
+        session.add(employee)
+        session.commit()
+        session.refresh(employee)
+
+        # Если согласие уже было подтверждено раньше (в этой партии — маловероятно, но
+        # на будущее, если дозаполнение произойдёт уже после /confirm_consent), не оставляем
+        # obligations несозданными молча — досоздаём их сейчас же.
+        if employee.consent_status == ConsentStatus.CONFIRMED:
+            create_obligations_for_employee(session, employee)
+
+    await event.message.answer(
+        f"Дата въезда для {employee.full_name} установлена: {entry_date.strftime('%d.%m.%Y')}."
     )
 
 
@@ -182,8 +255,8 @@ async def on_text(event: MessageCreated):
         )
         return
 
-    # Здесь же ветка для приёма скана после /confirm_consent <id> — упрощена для скелета:
-    if raw_text := event.message.body.text:
+    raw_text = event.message.body.text
+    if raw_text:
         if raw_text.startswith("/confirm_consent"):
             try:
                 _, employee_id = raw_text.split(maxsplit=1)
@@ -192,6 +265,10 @@ async def on_text(event: MessageCreated):
                 return
             _pending_forms[user_id] = {"state": "awaiting_scan", "employee_id": employee_id}
             await event.message.answer("Пришлите файл скана подписанного согласия.")
+            return
+
+        if raw_text.startswith("/set_entry_date"):
+            await _handle_set_entry_date(event, raw_text)
             return
 
 
