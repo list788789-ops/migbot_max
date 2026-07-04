@@ -70,6 +70,8 @@ class ObligationType(str, enum.Enum):
     PATENT_PAYMENT = "patent_payment"             # не используется в MVP, зарезервировано
     EFS1_REPORT = "efs1_report"                   # ЕФС-1 в СФР — не позднее следующего рабочего дня
                                                    # после приказа о приёме / даты договора
+    REGISTRATION_RENEWAL = "registration_renewal"  # продление по правилу "90 из 180" — периодическое,
+                                                    # создаётся отдельным cron-скриптом, не разовым триггером
 
 
 class DeadlineUnit(str, enum.Enum):
@@ -140,6 +142,27 @@ class Employee(Base):
     consents: Mapped[list["Consent"]] = relationship(back_populates="employee")
     obligations: Mapped[list["Obligation"]] = relationship(back_populates="employee")
     documents: Mapped[list["Document"]] = relationship(back_populates="employee")
+    registration_periods: Mapped[list["RegistrationPeriod"]] = relationship(back_populates="employee")
+
+
+class RegistrationPeriod(Base):
+    """Периоды учёта по правилу '90 дней из скользящих 180' (см. п.9 ст.97 Договора о ЕАЭС).
+
+    Не хранит полную историю пересечений границы — только периоды, заведённые ботом.
+    Если сотрудник уже въезжал и выезжал ДО того, как попал в систему, это не учитывается
+    автоматически: при первом занесении сотрудника это нужно уточнить у кадровика вручную,
+    иначе period_end может быть посчитан оптимистичнее, чем есть на самом деле по закону."""
+
+    __tablename__ = "registration_periods"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    employee_id: Mapped[str] = mapped_column(ForeignKey("employees.id"), nullable=False)
+
+    period_start: Mapped[date] = mapped_column(Date, nullable=False)
+    period_end: Mapped[date] = mapped_column(Date, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    employee: Mapped["Employee"] = relationship(back_populates="registration_periods")
 
 
 class Consent(Base):
