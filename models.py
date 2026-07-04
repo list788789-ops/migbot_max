@@ -9,6 +9,12 @@
 - consent_status блокирует создание obligations, пока не confirmed (см. bot.py, on_consent_confirmed).
 - invoices разделяет clinic_id (куда идёт сотрудник) и payer_id (кто платит) — это разные сущности,
   заказчик услуги (ИП) не обязан совпадать с клиникой.
+
+2026-07: добавлены поля под перенос данных из ручной xlsx-таблицы (паспорт, адрес, дата рождения,
+медкомиссия, срок регистрации, страна въезда). entry_date, category, citizenship переведены в
+nullable=True — в исходной таблице 9 из 70 строк не имеют даты въезда, часть строк без гражданства/
+категории. Бизнес-логика, которая от них зависит (расчёт obligations), должна сама проверять None
+и не создавать дедлайны для неполных карточек, а не полагаться на NOT NULL в БД.
 """
 
 from __future__ import annotations
@@ -99,10 +105,10 @@ class Employee(Base):
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
     full_name: Mapped[str] = mapped_column(String, nullable=False)
-    citizenship: Mapped[str] = mapped_column(String, nullable=False)
-    category: Mapped[Category] = mapped_column(Enum(Category), nullable=False, default=Category.EAEU)
+    citizenship: Mapped[str | None] = mapped_column(String, nullable=True)
+    category: Mapped[Category | None] = mapped_column(Enum(Category), nullable=True)
 
-    entry_date: Mapped[date] = mapped_column(Date, nullable=False)
+    entry_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     contract_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     contract_end_date: Mapped[date | None] = mapped_column(Date, nullable=True)
 
@@ -112,6 +118,19 @@ class Employee(Base):
     consent_status: Mapped[ConsentStatus] = mapped_column(
         Enum(ConsentStatus), default=ConsentStatus.DRAFT, nullable=False
     )
+
+    # --- поля, перенесённые из ручной xlsx-таблицы (2026-07) ---
+    birth_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    passport_series: Mapped[str | None] = mapped_column(String, nullable=True)
+    passport_number: Mapped[str | None] = mapped_column(String, nullable=True)
+    address: Mapped[str | None] = mapped_column(Text, nullable=True)
+    entry_country: Mapped[str | None] = mapped_column(String, nullable=True)  # "откуда въехал"
+    # Свободный текст, не дата: в таблице это либо дата+заметка ("25.07.2026 Хостел"), либо пусто.
+    # Не приводим к Date намеренно — иначе теряем текстовую часть без явного запроса на это.
+    registration_deadline_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Тоже свободный текст ("срочно надо делать") — статус медкомиссии ещё не формализован в enum.
+    medical_exam_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    employment_status: Mapped[str | None] = mapped_column(String, nullable=True)
 
     created_by: Mapped[str | None] = mapped_column(String, nullable=True)  # кто завёл (кадровик/прораб)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
