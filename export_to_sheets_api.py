@@ -9,6 +9,9 @@
 Как и CSV-версия — это односторонний экспорт БД -> Sheets. Правки в самой
 таблице не попадают обратно в БД и будут перезаписаны при следующем запуске.
 
+2026-07: добавлены колонки паспорта, даты рождения, адреса и страны въезда —
+эти поля уже есть в Employee (см. models.py), но раньше не выгружались в Sheets.
+
 Запуск: python export_to_sheets_api.py
 Для автообновления — повесить на крон (напр. раз в день) на том же хостинге,
 где крутится bot.py, т.к. именно там есть сеть и доступ к прод-БД.
@@ -39,6 +42,7 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 HEADERS = [
     "ФИО", "Гражданство", "Категория", "Дата въезда", "Дата договора",
     "Статус занятости", "Согласие получено", "Ближайший дедлайн", "Телефон", "Язык",
+    "Дата рождения", "Серия паспорта", "Номер паспорта", "Адрес", "Откуда въехал",
 ]
 
 
@@ -68,6 +72,11 @@ def fetch_rows():
                 nearest_deadline.strftime("%d.%m.%Y") if nearest_deadline else "",
                 emp.phone or "",
                 emp.language,
+                emp.birth_date.strftime("%d.%m.%Y") if emp.birth_date else "",
+                emp.passport_series or "",
+                emp.passport_number or "",
+                emp.address or "",
+                emp.entry_country or "",
             ])
     return rows
 
