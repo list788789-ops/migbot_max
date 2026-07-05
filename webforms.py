@@ -49,7 +49,7 @@ import os
 from datetime import date, datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -141,55 +141,46 @@ PAGE_HEAD = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
 <style>
+:root{{--ink:#111214;--sub:#5b626b;--line:#e6e9ee;--line-2:#eef1f4;--accent:#2f80ed;--accent-ink:#1c63c4;
+--red-bg:#fdecec;--red-ink:#c0392b;--amber-bg:#fdf3e2;--amber-ink:#a5720a;--green-bg:#eaf6f0;--green-ink:#1f7a55;
+--serif:Georgia,"Times New Roman",serif;--sans:-apple-system,Segoe UI,Roboto,Arial,sans-serif}}
 *{{box-sizing:border-box}}
-body{{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:720px;margin:0 auto;
-padding:16px;background:#f2f2f2;color:#2b2b2b}}
-header.org{{background:#0072bc;color:#ffffff;border-radius:2px;padding:16px 18px;margin-bottom:16px;
-border-left:6px solid #f7a600}}
-header.org .org-name{{font-size:13px;opacity:.9;letter-spacing:.02em}}
-header.org .page-title{{font-size:20px;font-weight:600;margin-top:2px}}
-h1{{font-size:20px;color:#2b2b2b;font-weight:600}}
-h2{{font-size:13px;margin:0 0 10px 0;color:#0072bc;text-transform:uppercase;letter-spacing:.05em;
-border-bottom:2px solid #f7a600;padding-bottom:6px;font-weight:700}}
-section{{background:#ffffff;border-radius:2px;padding:14px;margin-bottom:14px;
-border:1px solid #d5d5d5}}
-.card{{background:#fafafa;border-radius:2px;padding:12px;margin-bottom:8px;
-border:1px solid #e0e0e0;border-left:3px solid #f7a600;font-weight:600;color:#2b2b2b}}
+body{{font-family:var(--sans);max-width:720px;margin:0 auto;padding:16px;background:#fff;color:var(--ink)}}
+header.org{{background:#fff;border:0;border-bottom:1px solid var(--line);border-radius:0;padding:14px 4px 16px;margin-bottom:8px}}
+header.org .org-name{{font-size:13px;color:var(--sub);letter-spacing:.01em}}
+header.org .page-title{{font-family:var(--serif);font-size:26px;font-weight:700;letter-spacing:-.02em;margin-top:2px}}
+h1{{font-family:var(--serif);font-size:24px;font-weight:700;letter-spacing:-.02em}}
+h2{{font-size:12px;margin:0 0 12px;color:var(--sub);text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid var(--line-2);padding-bottom:8px;font-weight:700}}
+section{{background:#fff;border:1px solid var(--line);border-radius:16px;padding:16px;margin-bottom:14px}}
+.card{{background:#fff;border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:10px;font-weight:600;color:var(--ink)}}
 .card:last-child{{margin-bottom:0}}
-.card .muted-line{{font-weight:400;color:#6b6b6b}}
-a.btn,button{{display:inline-block;background:#f7a600;color:#1a1a1a;text-decoration:none;
-padding:14px 20px;min-height:48px;line-height:20px;border-radius:2px;border:none;font-size:16px;
-font-family:inherit;font-weight:600;letter-spacing:.01em;margin-top:8px;margin-right:8px;cursor:pointer}}
-a.btn.secondary,button.secondary{{background:#ffffff;color:#0072bc;border:2px solid #0072bc}}
-input[type=date],input[type=text],input[type=password]{{width:100%;padding:12px;
-font-size:16px;font-family:inherit;border:1px solid #b8b8b8;border-radius:2px;
-margin:6px 0 12px 0;background:#ffffff;color:#2b2b2b}}
-.badge{{display:inline-block;padding:3px 10px;border-radius:2px;font-size:12px;color:#ffffff;
-font-weight:600;margin:2px 4px 2px 0}}
-.badge.red{{background:#c0392b}} .badge.orange{{background:#f7a600;color:#1a1a1a}} .badge.green{{background:#2e7d32}}
-.muted{{color:#6b6b6b;font-size:13px}}
-.warning-banner{{background:#fff3cd;border:1px solid #f0ad4e;border-left:4px solid #c0392b;
-border-radius:2px;padding:12px 14px;margin-bottom:14px;font-weight:600;color:#7a4a00}}
-nav{{margin-bottom:16px;background:#ffffff;border:1px solid #d5d5d5;padding:6px 10px}}
-nav a{{color:#0072bc;text-decoration:none;margin-right:16px;font-size:14px;padding:6px 0;
-display:inline-block;font-weight:600}}
+.card .muted-line{{font-weight:400;color:var(--sub)}}
+a.btn,button{{display:inline-block;background:var(--accent);color:#fff;text-decoration:none;padding:14px 20px;min-height:48px;line-height:20px;border-radius:12px;border:none;font-size:16px;font-family:var(--sans);font-weight:600;margin:8px 8px 0 0;cursor:pointer}}
+a.btn.secondary,button.secondary{{background:#fff;color:var(--accent-ink);border:1px solid var(--accent)}}
+input[type=date],input[type=text],input[type=password]{{width:100%;padding:12px;font-size:16px;font-family:inherit;border:1px solid #d9dde3;border-radius:12px;margin:6px 0 12px;background:#fff;color:var(--ink)}}
+input:focus{{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px #2f80ed22}}
+.badge{{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:600;margin:2px 4px 2px 0}}
+.badge.red{{background:var(--red-bg);color:var(--red-ink)}}
+.badge.orange{{background:var(--amber-bg);color:var(--amber-ink)}}
+.badge.green{{background:var(--green-bg);color:var(--green-ink)}}
+.muted{{color:var(--sub);font-size:13px}}
+.warning-banner{{background:var(--amber-bg);border:1px solid #f0c674;border-left:4px solid var(--amber-ink);border-radius:12px;padding:12px 14px;margin-bottom:14px;font-weight:600;color:#7a4a00}}
+nav{{margin-bottom:16px;background:#fff;border:1px solid var(--line);border-radius:12px;padding:4px 8px;display:flex;gap:2px;overflow-x:auto}}
+nav a{{color:var(--sub);text-decoration:none;font-size:15px;padding:10px 12px;white-space:nowrap;font-weight:600;border-radius:8px}}
+nav a:hover{{color:var(--ink);background:#f5f7f9}}
 form.inline{{display:inline}}
-fieldset{{border:1px solid #d5d5d5;border-radius:2px;padding:12px;margin-bottom:14px}}
-fieldset legend{{font-size:12px;color:#0072bc;text-transform:uppercase;letter-spacing:.04em;
-font-weight:700;padding:0 6px}}
-
+fieldset{{border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:14px}}
+fieldset legend{{font-size:12px;color:var(--accent-ink);text-transform:uppercase;letter-spacing:.04em;font-weight:700;padding:0 6px}}
 @media (min-width:760px){{
   body{{max-width:1080px;padding:24px 32px}}
-  header.org{{padding:20px 28px}}
-  header.org .page-title{{font-size:23px}}
-  section.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));
-  gap:12px;align-items:start}}
+  header.org .page-title{{font-size:30px}}
+  section.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;align-items:start}}
   section.grid.wide{{grid-template-columns:repeat(auto-fill,minmax(340px,1fr))}}
+  section.grid h2{{grid-column:1/-1}}
   section.grid .card{{margin-bottom:0}}
   section.narrow{{max-width:440px;margin:0 auto}}
   section.card-form{{max-width:640px;margin:0 auto}}
-  a.btn:hover,button:hover{{opacity:.85}}
-  nav a:hover{{text-decoration:underline}}
+  a.btn:hover,button:hover{{opacity:.9}}
 }}
 </style></head><body>
 <header class="org">
@@ -217,19 +208,23 @@ LOGIN_HEAD = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Вход</title>
 <style>
-*{{box-sizing:border-box}}
-body.login-page{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
-background:#f2f2f2;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;padding:16px}}
-.login-card{{background:#ffffff;border:1px solid #d5d5d5;border-top:4px solid #f7a600;
-border-radius:2px;padding:28px 24px;width:280px}}
-.login-card h1{{font-size:19px;margin:0 0 2px 0;color:#0072bc;font-weight:700}}
-.login-card .subtitle{{font-size:12px;color:#6b6b6b;margin:0 0 18px 0}}
-.login-card input{{width:100%;padding:12px;font-size:16px;border:1px solid #b8b8b8;border-radius:2px;
-margin:6px 0 12px 0;background:#ffffff;font-family:inherit}}
-.login-card button{{width:100%;background:#f7a600;color:#1a1a1a;border:none;padding:15px;
-min-height:50px;border-radius:2px;font-size:16px;font-weight:600;cursor:pointer;font-family:inherit}}
-.login-card a.btn{{display:inline-block;margin-top:12px;color:#0072bc;text-decoration:underline;
-font-size:13px}}
+:root{--accent:#2f80ed;--ink:#111214;--sub:#5b626b;--serif:Georgia,"Times New Roman",serif;--sans:-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+*{box-sizing:border-box}
+body.login-page{margin:0;min-height:100dvh;display:flex;flex-direction:column;justify-content:flex-start;background:url('/login-bg.svg') no-repeat center bottom / cover, #fff;font-family:var(--sans);color:var(--ink)}
+.auth{width:100%;max-width:440px;margin:0 auto;padding:56px 24px 40px}
+.auth h1{font-family:var(--serif);font-weight:700;letter-spacing:-.02em;font-size:clamp(2.25rem,6vw,3.25rem);line-height:1.03;margin:0 0 .3em}
+.auth .subtitle{font-family:var(--serif);font-weight:400;color:var(--sub);font-size:clamp(1.125rem,2.5vw,1.375rem);margin:0 0 1.75rem}
+.auth-row{display:flex;gap:10px;flex-wrap:wrap;align-items:stretch}
+.auth input{flex:1 1 45%;min-width:130px;font-family:var(--sans);font-size:16px;padding:14px 16px;border:1px solid #d9dde3;border-radius:12px;background:#fff;margin:0}
+.auth input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px #2f80ed22}
+.auth button{flex:1 1 100%;border:0;border-radius:12px;background:var(--accent);color:#fff;font:16px/1 var(--sans);padding:15px 20px;min-height:50px;cursor:pointer}
+.auth .err{color:#c0392b;font-size:14px;margin:0 0 12px}
+.auth a.btn{display:inline-block;margin-top:14px;color:var(--accent);text-decoration:underline;font-size:14px}
+@media(min-width:520px){ .auth button{flex:0 0 auto} }
+@media(min-width:768px){
+  body.login-page{justify-content:center;background-position:right bottom;background-size:min(46vw,600px) auto}
+  .auth{padding:0 24px}
+}
 </style></head>
 <body class="login-page">
 """
@@ -237,16 +232,16 @@ font-size:13px}}
 
 @app.get("/login", response_class=HTMLResponse)
 def login_form():
-    return LOGIN_HEAD + f"""
-<div class="login-card">
+    return LOGIN_HEAD + """
+<form class="auth" method="post" action="/login" autocomplete="on">
 <h1>Миграционный учёт</h1>
-<p class="subtitle">{ORG_NAME}</p>
-<form method="post" action="/login">
-<input type="text" name="username" placeholder="Логин" required>
-<input type="password" name="password" placeholder="Пароль" required>
+<p class="subtitle">Рабочее место кадровика</p>
+<div class="auth-row">
+<input type="text" name="username" placeholder="Логин" autocomplete="username" required>
+<input type="password" name="password" placeholder="Пароль" autocomplete="current-password" required>
 <button type="submit">Войти</button>
-</form>
 </div>
+</form>
 </body></html>"""
 
 
@@ -258,12 +253,44 @@ def login_submit(request: Request, username: str = Form(...), password: str = Fo
     return HTMLResponse(
         LOGIN_HEAD
         + """
-<div class="login-card">
-<h1>Неверный логин или пароль</h1>
-<a class="btn" href="/login">Назад</a>
+<div class="auth">
+<h1>Миграционный учёт</h1>
+<p class="err">Неверный логин или пароль</p>
+<a class="btn" href="/login">← Назад</a>
 </div>
 </body></html>""",
         status_code=401,
+    )
+
+
+LOGIN_BG_SVG = """<svg viewBox="0 0 430 760" preserveAspectRatio="xMidYMid slice" xmlns="http://www.w3.org/2000/svg">
+<g fill="none" stroke="#dce1e8" stroke-width="1">
+<path d="M-40 300 Q215 280 470 300"/><path d="M-40 360 Q215 340 470 360"/>
+<path d="M-40 420 Q215 400 470 420"/><path d="M-40 480 Q215 460 470 480"/>
+<path d="M-40 540 Q215 520 470 540"/><path d="M-40 600 Q215 580 470 600"/>
+<path d="M-40 660 Q215 640 470 660"/><path d="M-40 720 Q215 700 470 720"/>
+<path d="M60 760 Q120 500 175 250"/><path d="M150 760 Q180 500 205 250"/>
+<path d="M240 760 Q235 500 235 250"/><path d="M330 760 Q290 500 265 250"/>
+<path d="M420 760 Q350 500 295 250"/></g>
+<g stroke="#c7cfd9" stroke-width="1"><path d="M231 300 L239 300 M231 360 L239 360 M231 420 L239 420 M231 480 L239 480 M231 600 L239 600 M231 660 L239 660 M231 720 L239 720"/></g>
+<g fill="none" stroke="#d3dae2" stroke-width="1">
+<path d="M120 760 C150 660 120 600 175 545 C215 505 205 460 250 430"/>
+<path d="M170 560 l-6 -4 M158 588 l-6 -4 M150 618 l-6 -4 M146 650 l-6 -4"/></g>
+<g stroke="#c7cfd9" fill="none" stroke-width="1"><path d="M392 300 L392 330 M392 300 L387 309 M392 300 L397 309"/></g>
+<text x="388" y="292" font-family="-apple-system,system-ui,sans-serif" font-size="10" fill="#aeb5be">С</text>
+<g stroke="#2f80ed" fill="none" stroke-width="1.4"><circle cx="235" cy="540" r="7"/><path d="M235 522 L235 558 M217 540 L253 540"/></g>
+<circle cx="235" cy="540" r="2.4" fill="#2f80ed"/>
+<text x="248" y="536" font-family="-apple-system,system-ui,sans-serif" font-size="11" fill="#9aa0a8">Белокаменка</text>
+<text x="248" y="551" font-family="-apple-system,system-ui,sans-serif" font-size="10" fill="#b6bcc4">69°14′ N · 33°17′ E</text>
+</svg>"""
+
+
+@app.get("/login-bg.svg")
+def login_bg():
+    return Response(
+        content=LOGIN_BG_SVG,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=86400"},
     )
 
 
