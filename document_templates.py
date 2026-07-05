@@ -25,6 +25,14 @@
 медосмотр — был в бумажном шаблоне (Приложение №1 к договору №176), но отсутствовал
 в генераторе; документ обрывался на пункте 10.
 
+2026-07: добавлен ТЕСТОВЫЙ режим TEST_ALLOW_MISSING_FIELDS — если включён, генератор
+НЕ поднимает ValueError при незаполненных полях, а подставляет прочерк "—" и добавляет
+явное предупреждение внутрь самого документа (чтобы черновик нельзя было спутать
+с юридически валидным документом, если он случайно попадёт клинике или сотруднику).
+Это временное послабление ТОЛЬКО для тестирования потока — флаг должен быть выключен
+(или переменная удалена) до реальной работы с сотрудниками. Один флаг на оба генератора,
+чтобы не потерять место, где включали, при отключении.
+
 Требуемые переменные окружения:
   COMPANY_NAME             — полное наименование юрлица-работодателя
   COMPANY_INN              — ИНН
@@ -39,6 +47,8 @@
   PAYER_SIGNATORY_NAME     — ФИО подписанта со стороны заказчика для блока подписи
                              (напр. "С. Ю. Буц") — если не задано, используется PAYER_NAME
   PAYER_PHONE              — телефон заказчика
+  TEST_ALLOW_MISSING_FIELDS — "true"/"1" чтобы разрешить генерацию с прочерками вместо
+                             незаполненных полей (ТОЛЬКО для теста, см. выше)
 """
 
 import os
@@ -60,6 +70,30 @@ COMPANY_ADDRESS = os.environ.get("COMPANY_LEGAL_ADDRESS", "[юридически
 HR_SIGNATORY_NAME = os.environ.get("HR_SIGNATORY_NAME", "[ФИО подписанта не указано]")
 HR_SIGNATORY_POSITION = os.environ.get("HR_SIGNATORY_POSITION", "[должность не указана]")
 
+# ТЕСТОВЫЙ флаг — см. заголовок файла. Читается один раз при импорте модуля;
+# если меняешь переменную окружения на Railway, нужен рестарт сервиса, чтобы применилось.
+TEST_ALLOW_MISSING_FIELDS = os.environ.get("TEST_ALLOW_MISSING_FIELDS", "false").strip().lower() in (
+    "1", "true", "yes",
+)
+
+DASH = "—"
+
+# Поля, обязательные для обоих документов — вынесены в константы, чтобы webforms.py/bot.py
+# могли получить список отсутствующих полей ДО генерации (для баннера/сообщения), не только
+# через перехват ValueError.
+CONSENT_REQUIRED_FIELDS = {
+    "birth_date": "дата рождения",
+    "passport_series": "серия паспорта",
+    "passport_number": "номер паспорта",
+    "address": "адрес места пребывания",
+}
+MEDICAL_REFERRAL_REQUIRED_FIELDS = {
+    "birth_date": "дата рождения",
+    "passport_series": "серия паспорта",
+    "passport_number": "номер паспорта",
+    "address": "адрес места пребывания",
+}
+
 
 def _set_default_style(doc: Document) -> None:
     style = doc.styles["Normal"]
@@ -69,35 +103,80 @@ def _set_default_style(doc: Document) -> None:
 
 def _passport_str(employee: Employee) -> str:
     passport = f"{employee.passport_series or ''} {employee.passport_number or ''}".strip()
-    return passport or "[паспортные данные не указаны]"
+    return passport or DASH
 
 
-def _require_fields(employee: Employee, field_labels: dict[str, str]) -> None:
-    """Поднимает ValueError с точным списком незаполненных полей, вместо того чтобы
-    молча вставить в документ текст-плейсхолдер. field_labels: {атрибут: человекочитаемое имя}."""
-    missing = [
+def _date_or_dash(d: date | None) -> str:
+    return d.strftime("%d.%m.%Y") if d else DASH
+
+
+def _text_or_dash(value: str | None) -> str:
+    return value if value else DASH
+
+
+def _missing_fields(employee: Employee, field_labels: dict[str, str]) -> list[str]:
+    """Возвращает список человекочитаемых имён незаполненных полей, ничего не бросая.
+    Использовать это, когда нужен просто список (баннер в UI, сообщение бота) —
+    без побочного эффекта в виде исключения."""
+    return [
         label for attr, label in field_labels.items()
         if getattr(employee, attr) in (None, "")
     ]
-    if missing:
+
+
+def check_consent_fields(employee: Employee) -> list[str]:
+    """Список отсутствующих полей для согласия — вызывать из webforms.py/bot.py
+    до генерации, если нужно показать баннер независимо от режима TEST_ALLOW_MISSING_FIELDS."""
+    return _missing_fields(employee, CONSENT_REQUIRED_FIELDS)
+
+
+def check_medical_referral_fields(employee: Employee) -> list[str]:
+    """То же самое для направления на медосмотр."""
+    return _missing_fields(employee, MEDICAL_REFERRAL_REQUIRED_FIELDS)
+
+
+def _require_fields(employee: Employee, field_labels: dict[str, str]) -> list[str]:
+    """Обычный режим: поднимает ValueError с точным списком недостающих полей, вместо
+    того чтобы молча вставить в документ текст-плейсхолдер.
+
+    Тестовый режим (TEST_ALLOW_MISSING_FIELDS=true): НЕ поднимает исключение, а
+    возвращает список отсутствующих полей — вызывающий генератор обязан сам подставить
+    прочерки в текст документа и добавить предупреждение (см. generate_*_docx ниже).
+    """
+    missing = _missing_fields(employee, field_labels)
+    if missing and not TEST_ALLOW_MISSING_FIELDS:
         raise ValueError(
             f"Нельзя сгенерировать документ для {employee.full_name} — "
             f"не заполнены поля: {', '.join(missing)}. "
             f"Заполните их в карточке сотрудника перед генерацией."
         )
+    return missing
+
+
+def _add_test_warning_paragraph(doc: Document, missing: list[str]) -> None:
+    """Явное предупреждение прямо в теле документа, если он сгенерирован в тестовом
+    режиме с прочерками. Цель — чтобы черновик нельзя было перепутать с юридически
+    валидным документом, если он случайно уйдёт клинике или сотруднику на подпись."""
+    warning = doc.add_paragraph()
+    run = warning.add_run(
+        "⚠ ТЕСТОВЫЙ ЧЕРНОВИК — не заполнены поля: "
+        + ", ".join(missing)
+        + ". Документ не имеет юридической силы, пока эти поля не указаны в карточке "
+        "сотрудника и документ не перегенерирован."
+    )
+    run.bold = True
+    doc.add_paragraph()
 
 
 def generate_consent_docx(employee: Employee, output_dir: str = "/tmp") -> str:
     """Согласие на обработку персональных данных — отдельный документ (152-ФЗ)."""
-    _require_fields(employee, {
-        "birth_date": "дата рождения",
-        "passport_series": "серия паспорта",
-        "passport_number": "номер паспорта",
-        "address": "адрес места пребывания",
-    })
+    missing = _require_fields(employee, CONSENT_REQUIRED_FIELDS)
 
     doc = Document()
     _set_default_style(doc)
+
+    if missing:
+        _add_test_warning_paragraph(doc, missing)
 
     title = doc.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -107,8 +186,8 @@ def generate_consent_docx(employee: Employee, output_dir: str = "/tmp") -> str:
 
     doc.add_paragraph()
 
-    birth = employee.birth_date.strftime("%d.%m.%Y")
-    address = employee.address
+    birth = _date_or_dash(employee.birth_date)
+    address = _text_or_dash(employee.address)
 
     body = (
         f"Я, {employee.full_name}, {birth} года рождения, "
@@ -193,15 +272,13 @@ def generate_medical_referral_docx(employee: Employee, output_dir: str = "/tmp")
     Дата приёма, номер кабинета и время намеренно оставлены пустыми полями для ручного
     заполнения — это отдельный процесс согласования с клиникой, бот не может знать
     расписание клиники заранее и не должен его придумывать."""
-    _require_fields(employee, {
-        "birth_date": "дата рождения",
-        "passport_series": "серия паспорта",
-        "passport_number": "номер паспорта",
-        "address": "адрес места пребывания",
-    })
+    missing = _require_fields(employee, MEDICAL_REFERRAL_REQUIRED_FIELDS)
 
     doc = Document()
     _set_default_style(doc)
+
+    if missing:
+        _add_test_warning_paragraph(doc, missing)
 
     day, month, year = _contract_header_parts()
     header = doc.add_paragraph()
@@ -223,22 +300,22 @@ def generate_medical_referral_docx(employee: Employee, output_dir: str = "/tmp")
     doc.add_paragraph("наименование медицинской организации (МО)")
 
     name_parts = employee.full_name.split()
-    surname = name_parts[0] if name_parts else "[фамилия не указана]"
-    first_name = name_parts[1] if len(name_parts) > 1 else "[имя не указано]"
-    patronymic = name_parts[2] if len(name_parts) > 2 else "[отчество не указано]"
+    surname = name_parts[0] if name_parts else DASH
+    first_name = name_parts[1] if len(name_parts) > 1 else DASH
+    patronymic = name_parts[2] if len(name_parts) > 2 else DASH
 
     doc.add_paragraph(f"1. Фамилия {surname}")
     doc.add_paragraph(f"Имя {first_name}")
     doc.add_paragraph(f"Отчество {patronymic}")
 
-    birth = employee.birth_date.strftime("%d.%m.%Y")
+    birth = _date_or_dash(employee.birth_date)
     doc.add_paragraph(f"2. Дата рождения (число, месяц, год) {birth}")
 
-    doc.add_paragraph(f"3. Адрес (по месту проживания) {employee.address}")
+    doc.add_paragraph(f"3. Адрес (по месту проживания) {_text_or_dash(employee.address)}")
 
     doc.add_paragraph(
-        f"4. Серия паспорта {employee.passport_series} "
-        f"Номер паспорта {employee.passport_number}"
+        f"4. Серия паспорта {_text_or_dash(employee.passport_series)} "
+        f"Номер паспорта {_text_or_dash(employee.passport_number)}"
     )
 
     doc.add_paragraph(f"5. Место работы {PAYER_NAME}")
