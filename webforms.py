@@ -75,6 +75,7 @@ from document_templates import (
     CLINIC_CONTRACT_DATE,
     CLINIC_CONTRACT_NUMBER,
     CLINIC_NAME as REFERRAL_CLINIC_NAME,
+    CLINIC_SHORT_NAME as REFERRAL_CLINIC_SHORT_NAME,
     MEDICAL_SERVICE_TEXT,
     PAYER_NAME as REFERRAL_PAYER_NAME,
     PAYER_PHONE,
@@ -1046,7 +1047,7 @@ def _render_referral_preview(emp: Employee, obligation_id: str, missing_fields: 
 <br>
 <table style="width:100%">
 <tr><td><strong>От Исполнителя:</strong></td><td><strong>От Заказчика:</strong></td></tr>
-<tr><td>{REFERRAL_CLINIC_NAME}</td><td>Индивидуальный предприниматель</td></tr>
+<tr><td>{REFERRAL_CLINIC_SHORT_NAME}</td><td>Индивидуальный предприниматель</td></tr>
 <tr><td>Главный врач</td><td>&nbsp;</td></tr>
 <tr><td>_____________________ {CLINIC_CHIEF_DOCTOR_NAME}<br>м.п.</td>
 <td>_____________________ {PAYER_SIGNATORY_NAME}<br>м.п.</td></tr>
