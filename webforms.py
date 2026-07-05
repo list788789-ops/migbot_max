@@ -55,7 +55,17 @@ from models import (
     Referral,
 )
 from obligations import create_obligations_for_employee
-from document_templates import generate_medical_referral_docx
+from document_templates import (
+    CLINIC_CHIEF_DOCTOR_NAME,
+    CLINIC_CONTRACT_DATE,
+    CLINIC_CONTRACT_NUMBER,
+    CLINIC_NAME as REFERRAL_CLINIC_NAME,
+    MEDICAL_SERVICE_TEXT,
+    PAYER_NAME as REFERRAL_PAYER_NAME,
+    PAYER_PHONE,
+    PAYER_SIGNATORY_NAME,
+    generate_medical_referral_docx,
+)
 
 MSK = timezone(timedelta(hours=3))  # то же смещение, что в bot.py — для единообразия timestamp'ов proof
 
@@ -717,6 +727,10 @@ def medical_refer(
 
     try:
         path = generate_medical_referral_docx(emp)
+    except ValueError as e:
+        # ValueError — сигнал от _require_fields в document_templates.py о конкретных
+        # незаполненных полях, а не непредвиденная ошибка. Показываем текст как есть.
+        raise HTTPException(400, str(e))
     except Exception:
         raise HTTPException(500, "Не удалось сгенерировать направление. Проверьте логи сервиса.")
 
