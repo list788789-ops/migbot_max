@@ -234,7 +234,8 @@ label{{font-size:13px;color:var(--sub)}}
 .muted{{color:var(--sub);font-size:13px}}
 .warning-banner{{background:var(--amber-bg);border:1px solid #f0c674;border-left:4px solid var(--amber-ink);border-radius:12px;padding:12px 14px;margin-bottom:14px;font-weight:600;color:#7a4a00}}
 nav{{margin-bottom:16px;background:#fff;border:1px solid var(--line);border-radius:12px;padding:4px 8px;display:flex;flex-wrap:wrap;gap:2px}}
-nav a{{color:var(--sub);text-decoration:none;font-size:15px;padding:10px 12px;white-space:nowrap;font-weight:600;border-radius:8px}}
+nav a{{color:var(--sub);text-decoration:none;font-size:15px;padding:10px 12px 8px;white-space:nowrap;font-weight:600;border-radius:8px 8px 0 0;border-bottom:2px solid transparent}}
+nav a.active{{color:var(--ink);border-bottom-color:var(--accent)}}
 nav a:hover{{color:var(--ink);background:#f5f7f9}}
 form.inline{{display:inline}}
 fieldset{{border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:14px}}
@@ -257,18 +258,25 @@ fieldset legend{{font-size:12px;color:var(--accent-ink);text-transform:uppercase
 </header>
 """
 PAGE_FOOT = "</body></html>"
-NAV = (
-    '<nav>'
-    '<a href="/">Рабочий стол</a>'
-    '<a href="/employees">Сотрудники</a>'
-    '<a href="/medical">Медкомиссия</a>'
-    '<a href="/logout">Выйти</a>'
-    '</nav>'
-)
+def _nav(active: str = "") -> str:
+    """active: 'home' | 'employees' | 'medical' — подсвечивает корневой раздел.
+    Карточка/форма сотрудника -> 'employees'; направление/результат -> 'medical'.
+    Пустое (напр. экран подтверждения) — ничего не подсвечивается, это норм."""
+    items = [
+        ("home", "/", "Рабочий стол"),
+        ("employees", "/employees", "Сотрудники"),
+        ("medical", "/medical", "Медкомиссия"),
+        ("", "/logout", "Выйти"),
+    ]
+    links = "".join(
+        f'<a href="{href}"{" class=\"active\"" if key and key == active else ""}>{label}</a>'
+        for key, href, label in items
+    )
+    return f"<nav>{links}</nav>"
 
 
-def _render(title: str, body: str) -> str:
-    return PAGE_HEAD.format(title=title, org_name=ORG_NAME) + NAV + body + PAGE_FOOT
+def _render(title: str, body: str, active: str = "") -> str:
+    return PAGE_HEAD.format(title=title, org_name=ORG_NAME) + _nav(active) + body + PAGE_FOOT
 
 
 LOGIN_HEAD = """<!doctype html>
@@ -495,7 +503,7 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
 
 {recompute_section}
 """
-    return _render("Рабочий стол", body)
+    return _render("Рабочий стол", body, active="home")
 
 
 # --- Сотрудники: список + единая карточка ------------------------------------
@@ -562,6 +570,7 @@ def employees_list(request: Request, db: Session = Depends(get_db)):
         f'<h1>Сотрудники ({len(employees)})</h1>'
         f'<p><a class="btn" href="/employees/new">+ Добавить сотрудника</a></p>'
         f'{active_section}{awaiting_section}',
+        active="employees",
     )
 
 
@@ -643,7 +652,7 @@ def _new_employee_form_html(values: dict, error: str = "") -> str:
 def employee_new_form(request: Request):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
-    return _render("Новый сотрудник", _new_employee_form_html({}))
+    return _render("Новый сотрудник", _new_employee_form_html({}), active="employees")
 
 
 @app.post("/employees/new")
@@ -706,7 +715,7 @@ def employee_create(
             cd = val
 
     if errors:
-        return HTMLResponse(_render("Новый сотрудник", _new_employee_form_html(values, ", ".join(errors))))
+        return HTMLResponse(_render("Новый сотрудник", _new_employee_form_html(values, ", ".join(errors)), active="employees"))
 
     emp = Employee(
         full_name=fn,
@@ -805,7 +814,7 @@ value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
 
 <a class="btn secondary" href="/employees">← Ко всем сотрудникам</a>
 </section>"""
-    return _render(emp.full_name, body + SAVE_FORM_JS)
+    return _render(emp.full_name, body + SAVE_FORM_JS, active="employees")
 
 
 @app.post("/employees/{employee_id}/entry_date")
@@ -1204,7 +1213,7 @@ def medical_list(request: Request, db: Session = Depends(get_db)):
 {''.join(awaiting_row(r) for r in awaiting_result) or '<p class="muted">Нет ожидающих результата.</p>'}
 </section>
 """
-    return _render("Медкомиссия", body)
+    return _render("Медкомиссия", body, active="medical")
 
 
 @app.post("/medical/{employee_id}/refer")
@@ -1375,7 +1384,7 @@ def _render_referral_preview(emp: Employee, obligation_id: str, missing_fields: 
 </table>
 </section>
 """
-    return _render("Направление на медосмотр", body)
+    return _render("Направление на медосмотр", body, active="medical")
 
 
 @app.post("/medical/{employee_id}/result")
