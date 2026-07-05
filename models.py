@@ -6,7 +6,7 @@
   даже если сейчас используется только 'eaeu'. Это дёшево сейчас и дорого добавлять потом.
 - obligations.deadline_unit различает calendar/working дни — ЕАЭС считается в календарных днях (30),
   уведомление о договоре — в рабочих (3). Смешение этих единиц — источник ошибок в дедлайнах.
-- consent_status блокирует создание obligations, пока не confirmed (см. bot.py, on_consent_confirmed).
+- consent_status блокирует создание obligations, пока не confirmed (см. obligations.py).
 - invoices разделяет clinic_id (куда идёт сотрудник) и payer_id (кто платит) — это разные сущности,
   заказчик услуги (ИП) не обязан совпадать с клиникой.
 
@@ -15,6 +15,12 @@
 nullable=True — в исходной таблице 9 из 70 строк не имеют даты въезда, часть строк без гражданства/
 категории. Бизнес-логика, которая от них зависит (расчёт obligations), должна сама проверять None
 и не создавать дедлайны для неполных карточек, а не полагаться на NOT NULL в БД.
+
+2026-07 (второе изменение): добавлены address_since (Employee) и is_current (Obligation) —
+поддержка версионирования обязательств при смене места пребывания. Эти колонки добавлены
+в уже существующие таблицы вручную через ALTER TABLE (см. obligations.py) — Base.metadata.create_all
+не добавляет колонки в существующие таблицы, только создаёт отсутствующие таблицы целиком.
+Если разворачиваешь БД с нуля — create_all создаст обе колонки автоматически, ALTER TABLE не нужен.
 """
 
 from __future__ import annotations
@@ -136,6 +142,14 @@ class Employee(Base):
     medical_exam_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     employment_status: Mapped[str | None] = mapped_column(String, nullable=True)
 
+    # --- поле для версионирования REGISTRATION при смене места пребывания (2026-07) ---
+    # Дата, с которой действует ТЕКУЩЕЕ значение address. Это trigger_field для второго
+    # правила REGISTRATION в deadlines.py — по закону смена адреса требует новой постановки
+    # на учёт с тем же сроком, что при первичном въезде (см. комментарий в deadlines.py).
+    # NULL означает "адрес не менялся с момента первичного въезда" — правило просто
+    # пропускается в create_obligations_for_employee, как и любое другое пустое trigger_field.
+    address_since: Mapped[date | None] = mapped_column(Date, nullable=True)
+
     created_by: Mapped[str | None] = mapped_column(String, nullable=True)  # кто завёл (кадровик/прораб)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -208,6 +222,13 @@ class Obligation(Base):
     status: Mapped[ObligationStatus] = mapped_column(
         Enum(ObligationStatus), default=ObligationStatus.PENDING, nullable=False
     )
+
+    # Версионирование (2026-07): True — это актуальная запись для (employee_id, type).
+    # При создании новой версии (смена адреса, исправление даты и т.п.) старая помечается
+    # False, а не удаляется — история остаётся в базе. Все запросы, считающие "активные"
+    # или "просроченные" обязательства, ДОЛЖНЫ фильтровать is_current=True, иначе старые
+    # версии задваивают списки. См. create_obligations_for_employee в obligations.py.
+    is_current: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     employee: Mapped["Employee"] = relationship(back_populates="obligations")
     referrals: Mapped[list["Referral"]] = relationship(back_populates="obligation", cascade="all, delete-orphan")
