@@ -1156,7 +1156,7 @@ def medical_list(request: Request, db: Session = Depends(get_db)):
             f'<form class="inline" method="post" action="/medical/{r.employee_id}/result">'
             f'<input type="hidden" name="result" value="done">'
             f'<button type="submit">✅ Пройдено</button></form>'
-            f'<form class="inline" method="post" action="/medical/{r.employee_id}/result" onsubmit="return confirm(&#39;Удалить направление и вернуть сотрудника в очередь на выписку? Действие необратимо.&#39;)"'
+            f'<form class="inline" method="post" action="/medical/{r.employee_id}/result" onsubmit="return confirm(&#39;Удалить направление и вернуть сотрудника в очередь на выписку? Действие необратимо.&#39;)">'
             f'<input type="hidden" name="result" value="failed">'
             f'<button type="submit" class="secondary">❌ Не пройдено</button></form>'
             f'</div>'
