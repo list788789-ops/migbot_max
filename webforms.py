@@ -290,12 +290,29 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
         .order_by(Obligation.deadline_date)
     ).all()
 
+    OBLIGATION_LABELS = {
+        ObligationType.REGISTRATION: "постановка на учёт",
+        ObligationType.CONTRACT_NOTICE: "уведомление о договоре",
+        ObligationType.CONTRACT_TERMINATION_NOTICE: "уведомление о расторжении",
+        ObligationType.MEDICAL_EXAM: "медосмотр",
+        ObligationType.EFS1_REPORT: "ЕФС-1",
+        ObligationType.REGISTRATION_RENEWAL: "продление регистрации",
+        ObligationType.PATENT_PAYMENT: "оплата патента",
+    }
+
     def obl_row(o: Obligation) -> str:
         emp_name = o.employee.full_name if o.employee else "?"
         badge = "red" if o.deadline_date < today else "orange"
+        # medical_exam решается в разделе Медкомиссия (направление/результат), остальные типы
+        # (registration, contract_notice, efs1_report) — правкой соответствующей даты в карточке
+        # сотрудника, откуда их дедлайн и считается.
+        action_url = "/medical" if o.type == ObligationType.MEDICAL_EXAM else f"/employees/{o.employee_id}"
+        action_label = "Открыть медкомиссию" if o.type == ObligationType.MEDICAL_EXAM else "Открыть карточку"
+        type_label = OBLIGATION_LABELS.get(o.type, o.type.value)
         return (
-            f'<div class="card">{emp_name} — {o.type.value}<br>'
-            f'<span class="badge {badge}">{o.deadline_date.isoformat()}</span></div>'
+            f'<div class="card">{emp_name} — {type_label}<br>'
+            f'<span class="badge {badge}">{o.deadline_date.isoformat()}</span><br>'
+            f'<a class="btn" href="{action_url}">{action_label}</a></div>'
         )
 
     # Сотрудники, у которых не хватает хотя бы одного из ключевых полей карточки —
