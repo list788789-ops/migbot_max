@@ -80,6 +80,13 @@ dp = Dispatcher()
 # На продакшене — заменить на Redis-контекст (maxapi это поддерживает из коробки).
 _pending_forms: dict[str, dict] = {}
 
+# (user_id, prefix) -> message_id открытого списка-пикера. Нужен, чтобы после подтверждения
+# редактировать ИМЕННО этот список (убирая одного сотрудника), а не удалять его целиком.
+# In-memory: переживёт до рестарта процесса, после рестарта старые списки просто перестанут
+# обновляться editом (упадут в except при попытке отредактировать несуществующий message_id
+# в памяти — на практике это будет KeyError при .get, обработано ниже как "просто отправить заново").
+_open_pickers: dict[tuple[str, str], str] = {}
+
 
 def is_hr(phone: str | None) -> bool:
     if not HR_WHITELIST:
@@ -158,14 +165,19 @@ class _Responder:
         if isinstance(self._event, MessageCallback):
             chat_id, _ = self._event.get_ids()
             if attachments:
-                await bot.send_message(chat_id=chat_id, text=text, attachments=attachments)
+                sent = await bot.send_message(chat_id=chat_id, text=text, attachments=attachments)
             else:
-                await bot.send_message(chat_id=chat_id, text=text)
+                sent = await bot.send_message(chat_id=chat_id, text=text)
         else:
             if attachments:
-                await self._event.message.answer(text=text, attachments=attachments)
+                sent = await self._event.message.answer(text=text, attachments=attachments)
             else:
-                await self._event.message.answer(text)
+                sent = await self._event.message.answer(text)
+        # send_message/answer возвращают объект с .id (см. wiki maxapi: SendedMessage.id) —
+        # не проверено на реальном инстансе, что answer() возвращает то же самое, что
+        # send_message; если это не так, редактирование списка после подтверждения не сработает
+        # и молча упадёт в исключение при вызове bot.edit_message ниже.
+        return getattr(sent, "id", None)
 
     def user_id(self) -> str:
         if isinstance(self._event, MessageCallback):
@@ -252,14 +264,34 @@ def _picker_employees(session: Session, prefix: str) -> list[Employee]:
     return []
 
 
-async def _deliver_picker(responder: "_Responder", prefix: str, page: int = 0) -> None:
-    """Общий постраничный список сотрудников-кнопок для empdate/delpick/consentpick.
-    Единая точка на случай, если лимит MAX по рядам/кнопкам снова изменится или
-    обнаружится, что 25 — тоже недостаточный запас."""
+async def _deliver_picker(
+    responder: "_Responder", prefix: str, page: int = 0, edit: bool = False, only_if_open: bool = False
+) -> None:
+    """Общий постраничный список сотрудников-кнопок для empdate/delpick/consentpick/contractdate.
+    Если edit=True и для (user_id, prefix) уже есть открытый список — редактируем его на месте
+    (bot.edit_message), а не отправляем новое сообщение. Так после подтверждения действия
+    список остаётся на экране, просто без обработанного сотрудника, вместо полного удаления
+    и замены единственной строкой результата.
+
+    only_if_open=True: если список не был открыт (например, дата введена через /set_entry_date,
+    а не через кнопку) — ничего не отправляем, не заводим список, который никто не открывал."""
+    key = (responder.user_id(), prefix)
+    if only_if_open and key not in _open_pickers:
+        return
+
     with Session(engine) as session:
         employees = _picker_employees(session, prefix)
+
         if not employees:
-            await responder.send("Список пуст.")
+            text = "Список пуст."
+            if edit and key in _open_pickers:
+                try:
+                    await bot.edit_message(message_id=_open_pickers[key], text=text, attachments=[])
+                except Exception:
+                    log.exception("Не удалось отредактировать пустой список (prefix=%s)", prefix)
+                _open_pickers.pop(key, None)
+            else:
+                await responder.send(text)
             return
 
         total = len(employees)
@@ -286,7 +318,20 @@ async def _deliver_picker(responder: "_Responder", prefix: str, page: int = 0) -
     if total_pages > 1:
         header += f"\nСтраница {page + 1}/{total_pages}"
 
-    await responder.send(text=header, attachments=[builder.as_markup()])
+    if edit and key in _open_pickers:
+        try:
+            await bot.edit_message(
+                message_id=_open_pickers[key], text=header, attachments=[builder.as_markup()]
+            )
+            return
+        except Exception:
+            # Сообщение могло устареть/быть удалено вручную — откатываемся на отправку нового,
+            # не проваливаем действие целиком.
+            log.exception("Не удалось отредактировать список (prefix=%s), отправляю заново", prefix)
+
+    message_id = await responder.send(text=header, attachments=[builder.as_markup()])
+    if message_id:
+        _open_pickers[key] = message_id
 
 
 async def _deliver_delete_confirmation(responder: "_Responder", employee_id: str) -> None:
@@ -299,7 +344,7 @@ async def _deliver_delete_confirmation(responder: "_Responder", employee_id: str
 
     builder = InlineKeyboardBuilder()
     builder.row(CallbackButton(text="✅ Подтвердить удаление", payload=f"delconfirm:{employee_id}"))
-    builder.row(CallbackButton(text="❌ Отмена", payload="delcancel"))
+    builder.row(CallbackButton(text="❌ Отмена", payload="cancel:delpick"))
 
     await responder.send(
         text=f"Удалить {full_name} безвозвратно, вместе со всей историей "
@@ -318,7 +363,7 @@ async def _deliver_consent_confirmation(responder: "_Responder", employee_id: st
 
     builder = InlineKeyboardBuilder()
     builder.row(CallbackButton(text="✅ Подтвердить (кнопкой, тест)", payload=f"consentconfirm:{employee_id}"))
-    builder.row(CallbackButton(text="❌ Отмена", payload="delcancel"))
+    builder.row(CallbackButton(text="❌ Отмена", payload="cancel:consentpick"))
 
     await responder.send(
         text=f"Подтвердить согласие для {full_name} кнопкой? Это тестовый способ — "
@@ -444,7 +489,7 @@ async def on_callback(event: MessageCallback):
 
     if payload.startswith("page:"):
         _, prefix, page_s = payload.split(":", 2)
-        await _deliver_picker(responder, prefix, page=int(page_s))
+        await _deliver_picker(responder, prefix, page=int(page_s), edit=True, only_if_open=True)
         return
 
     if payload.startswith("empdate:"):
@@ -460,7 +505,8 @@ async def on_callback(event: MessageCallback):
             "state": "awaiting_entry_date_button",
             "employee_id": employee_id,
         }
-        await event.message.delete()  # убираем список — дата будет введена текстом дальше
+        # Список НЕ удаляем и не трогаем — после ввода даты он обновится через edit
+        # в _apply_entry_date, и сотрудник исчезнет из него сам собой (условие фильтра).
         await responder.send(f"Введите дату въезда для {full_name} в формате ГГГГ-ММ-ДД:")
         return
 
@@ -481,7 +527,6 @@ async def on_callback(event: MessageCallback):
             "state": "awaiting_contract_date_button",
             "employee_id": employee_id,
         }
-        await event.message.delete()
         await responder.send(f"Введите дату договора для {full_name} в формате ГГГГ-ММ-ДД:")
         return
 
@@ -491,19 +536,20 @@ async def on_callback(event: MessageCallback):
 
     if payload.startswith("delpick:"):
         employee_id = payload.split(":", 1)[1]
-        await event.message.delete()  # список сотрудников больше не нужен на этом шаге
+        # Список НЕ удаляем — подтверждение отправляется отдельным сообщением поверх него.
         await _deliver_delete_confirmation(responder, employee_id)
         return
 
     if payload.startswith("delconfirm:"):
         employee_id = payload.split(":", 1)[1]
-        await event.message.delete()  # диалог подтверждения — сотрудник и так исчезнет из списков
+        await event.message.delete()  # убираем только диалог подтверждения
         await _execute_delete_employee(responder, employee_id)
+        await _deliver_picker(responder, "delpick", edit=True, only_if_open=True)  # список обновится без этого сотрудника
         return
 
-    if payload == "delcancel":
-        await event.message.delete()
-        await responder.send("Отменено.")
+    if payload.startswith("cancel:"):
+        prefix = payload.split(":", 1)[1]
+        await event.message.delete()  # убираем диалог подтверждения; список не менялся, не трогаем
         return
 
     if payload == "menu:pending_consent":
@@ -512,14 +558,14 @@ async def on_callback(event: MessageCallback):
 
     if payload.startswith("consentpick:"):
         employee_id = payload.split(":", 1)[1]
-        await event.message.delete()  # список ожидающих согласия больше не нужен на этом шаге
         await _deliver_consent_confirmation(responder, employee_id)
         return
 
     if payload.startswith("consentconfirm:"):
         employee_id = payload.split(":", 1)[1]
-        await event.message.delete()  # диалог подтверждения — сотрудник уйдёт из DRAFT-списка сам
+        await event.message.delete()  # убираем только диалог подтверждения
         await _execute_consent_confirm_by_button(responder, employee_id)
+        await _deliver_picker(responder, "consentpick", edit=True, only_if_open=True)  # список обновится без сотрудника
         return
 
 
@@ -552,6 +598,10 @@ async def _apply_entry_date(event, employee_id: str, entry_date) -> None:
         await event.reply(text=text)
     else:
         await event.message.answer(text)
+
+    # Список "Без даты въезда" мог быть открыт (клик по кнопке) — обновляем его,
+    # сотрудник уходит из списка сам за счёт фильтра entry_date.is_(None).
+    await _deliver_picker(_Responder(event), "empdate", edit=True, only_if_open=True)
 
 
 async def _handle_set_entry_date(event: MessageCreated, raw_text: str) -> None:
@@ -601,6 +651,8 @@ async def _apply_contract_date(event, employee_id: str, contract_date) -> None:
         await event.reply(text=text)
     else:
         await event.message.answer(text)
+
+    await _deliver_picker(_Responder(event), "contractdate", edit=True, only_if_open=True)
 
 
 async def _handle_set_contract_date(event: MessageCreated, raw_text: str) -> None:
