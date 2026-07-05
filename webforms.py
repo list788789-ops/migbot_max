@@ -469,6 +469,7 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
     body = f"""
 {test_banner}
 <h1>Задачи</h1>
+<p><a class="btn" href="/employees/new">+ Добавить сотрудника</a></p>
 
 <section class="grid">
 <h2>Просрочено ({len(overdue)})</h2>
