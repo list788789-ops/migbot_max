@@ -68,6 +68,7 @@ from models import (
     ObligationStatus,
     ObligationType,
     Referral,
+    RegistrationStatus,
     SystemFlag,
 )
 from obligations import create_obligations_for_employee
@@ -427,8 +428,8 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
         badges = []
         if e.entry_date is None:
             badges.append('<span class="badge red">нет даты въезда</span>')
-        if e.entry_country is None:
-            badges.append('<span class="badge orange">нет места въезда</span>')
+        if e.registration_status is None:
+            badges.append('<span class="badge red">статус учёта не задан</span>')
         if e.contract_date is None:
             badges.append('<span class="badge orange">нет даты договора</span>')
         if e.consent_status == ConsentStatus.DRAFT:
@@ -805,6 +806,12 @@ def employee_card(employee_id: str, request: Request, db: Session = Depends(get_
         "Оклад в рублях (только оклад, без районного коэффициента — он добавляется в договоре "
         "отдельно, 1,500). Идёт в документ как есть, не проверяется."
     )
+    help_status = _help(
+        "Первичный учёт — сотрудник впервые встаёт на учёт в РФ: регистрация, медосмотр и "
+        "дактилоскопия считаются от даты въезда. Ранее стоял на учёте — приехал на вахту из "
+        "другого региона РФ: регистрация от прибытия (даты адреса), медосмотр и дактилоскопия "
+        "заново НЕ требуются. Пустой статус блокирует создание обязательств."
+    )
 
     # Блок трудового договора. Без табельного номера генерация заблокирована — иначе номер
     # договора соберётся как "БК-ПСМ-" без хвоста. Кнопка неактивна, показываем причину.
@@ -844,6 +851,39 @@ onsubmit="return confirm(&#39;Отменить договор? Дата дого
 </form>
 {_cancel}"""
 
+    # Секция статуса учёта. Отдельная форма со своим confirm — смена пересоздаёт
+    # обязательства по новому статусу, это не рутинное сохранение, мешать с saveform нельзя.
+    _rs = emp.registration_status
+    _rs_val = _rs.value if _rs is not None else ""
+    def _opt(v, label):
+        sel = " selected" if _rs_val == v else ""
+        return f'<option value="{v}"{sel}>{label}</option>'
+    if _rs is None:
+        _status_warn = (
+            '<p><span class="badge red">Статус учёта не задан</span></p>'
+            '<p class="muted">Пока статус не выбран, обязательства НЕ создаются '
+            '(ни регистрация, ни медосмотр, ни уведомления). Выберите статус.</p>'
+        )
+    else:
+        _status_warn = ""
+    _confirm = (
+        "return confirm(&#39;Сменить статус учёта? Обязательства будут пересозданы: "
+        "лишние незакрытые удалены, недостающие добавлены. Выполненные останутся.&#39;)"
+    )
+    _sel_empty = " selected" if _rs_val == "" else ""
+    status_block = (
+        _status_warn + help_status
+        + f'<form method="post" action="/employees/{emp.id}/registration_status" onsubmit="{_confirm}">'
+        + '<label>Статус миграционного учёта</label>'
+        + '<select name="registration_status">'
+        + f'<option value=""{_sel_empty}>— не задан —</option>'
+        + _opt("primary", "Первичный учёт (сроки от даты въезда)")
+        + _opt("prior", "Ранее стоял на учёте в РФ (сроки от прибытия на вахту)")
+        + '</select>'
+        + '<button type="submit" class="btn-full">Сохранить статус</button>'
+        + '</form>'
+    )
+
     if emp.consent_status == ConsentStatus.CONFIRMED:
         consent_block = '<p><span class="badge green">Согласие подтверждено</span></p>'
     else:
@@ -877,11 +917,6 @@ value="{emp.dactyloscopy_date.isoformat() if emp.dactyloscopy_date else ''}">
 {help_dact}
 </fieldset>
 
-<fieldset>
-<legend>Место въезда</legend>
-<input type="text" name="entry_country" value="{emp.entry_country or ''}">
-{help_country}
-</fieldset>
 
 <fieldset>
 <legend>Место пребывания</legend>
@@ -906,6 +941,11 @@ value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
 <fieldset>
 <legend>Согласие на обработку ПД</legend>
 {consent_block}
+</fieldset>
+
+<fieldset>
+<legend>Статус миграционного учёта</legend>
+{status_block}
 </fieldset>
 
 <fieldset>
@@ -1455,6 +1495,76 @@ def employee_labor_contract(
 
 
 @app.post("/employees/{employee_id}/labor_contract/cancel")
+@app.post("/employees/{employee_id}/registration_status")
+def employee_registration_status(
+    employee_id: str,
+    request: Request,
+    registration_status: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    """Смена статуса учёта. Пишет статус и ПЕРЕСОЗДАЁТ обязательства под него:
+    - create_obligations_for_employee создаёт недостающие по новому статусу (если согласие есть);
+    - лишние НЕ выполненные (PENDING) обязательства, которые новый статус делает ненужными,
+      удаляются. Выполненные (DONE) НЕ трогаются — след исполнения.
+    PRIMARY->PRIOR: сносятся PENDING медосмотр, дактилоскопия, регистрация-от-въезда.
+    PRIOR->PRIMARY: create_obligations досоздаёт медосмотр/дактилоскопию (ничего не сносим).
+    Пустой статус: обязательства не создаются (гейт в obligations), существующие PENDING
+    не трогаем — просто перестаёт быть валидным для новых расчётов."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    raw = (registration_status or "").strip()
+    if raw == "":
+        emp.registration_status = None
+    elif raw == RegistrationStatus.PRIMARY.value:
+        emp.registration_status = RegistrationStatus.PRIMARY
+    elif raw == RegistrationStatus.PRIOR.value:
+        emp.registration_status = RegistrationStatus.PRIOR
+    else:
+        raise HTTPException(400, "Недопустимый статус учёта")
+    db.commit()
+    db.refresh(emp)
+
+    # PRIOR делает лишними обязательства, привязанные к факту въезда — снять их PENDING.
+    if emp.registration_status == RegistrationStatus.PRIOR:
+        entry_bound = (
+            ObligationType.MEDICAL_EXAM,
+            ObligationType.DACTYLOSCOPY,
+        )
+        obs = db.scalars(
+            select(Obligation)
+            .where(Obligation.employee_id == emp.id)
+            .where(Obligation.type.in_(entry_bound))
+            .where(Obligation.is_current == True)  # noqa: E712
+            .where(Obligation.status == ObligationStatus.PENDING)
+        ).all()
+        for o in obs:
+            db.delete(o)
+        # регистрация-от-въезда (trigger_date == entry_date) тоже лишняя при PRIOR
+        if emp.entry_date is not None:
+            reg_entry = db.scalars(
+                select(Obligation)
+                .where(Obligation.employee_id == emp.id)
+                .where(Obligation.type == ObligationType.REGISTRATION)
+                .where(Obligation.trigger_date == emp.entry_date)
+                .where(Obligation.is_current == True)  # noqa: E712
+                .where(Obligation.status == ObligationStatus.PENDING)
+            ).all()
+            for o in reg_entry:
+                db.delete(o)
+        db.commit()
+
+    # создать недостающие по новому статусу (сама функция гейтит по статусу и согласию)
+    if emp.registration_status is not None and emp.consent_status == ConsentStatus.CONFIRMED:
+        create_obligations_for_employee(db, emp)
+
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+
 def employee_labor_contract_cancel(
     employee_id: str,
     request: Request,
