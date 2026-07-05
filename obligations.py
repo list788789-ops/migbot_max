@@ -30,7 +30,15 @@ import logging
 
 from sqlalchemy.orm import Session
 
-from models import Category, Employee, Obligation, ObligationStatus, RegistrationPeriod
+from models import (
+    Category,
+    Employee,
+    Obligation,
+    ObligationStatus,
+    ObligationType,
+    RegistrationPeriod,
+    RegistrationStatus,
+)
 from deadlines import DEADLINE_RULES, compute_deadline, calendar_days_add
 
 log = logging.getLogger("obligations")
@@ -48,7 +56,27 @@ def create_obligations_for_employee(session: Session, employee: Employee) -> Non
         )
         return
 
+    # Гейт статуса учёта (2026-07). Пустой статус БЛОКИРУЕТ создание любых обязательств —
+    # кадровик обязан явно выбрать первичный/повторный (решение зафиксировано). Пустой НЕ
+    # трактуется как первичный: иначе тихо создавались бы обязательства до осознанного выбора.
+    # В карточке/списке webforms показывает громкую пометку "статус не задан".
+    if employee.registration_status is None:
+        log.warning(
+            "Статус учёта не задан (employee_id=%s) — обязательства НЕ создаются до заполнения",
+            employee.id,
+        )
+        return
+
     for rule in rules:
+        # PRIOR (ранее стоял на учёте): регистрация считается от прибытия на вахту
+        # (trigger_field=address_since), а обязательства, привязанные к ФАКТУ ВЪЕЗДА
+        # (trigger_field=entry_date) — регистрация-от-въезда, медосмотр, дактилоскопия —
+        # ЗАНОВО НЕ создаются (пройдены на прежнем месте). Пропускаем такие правила.
+        if (
+            employee.registration_status == RegistrationStatus.PRIOR
+            and rule["trigger_field"] == "entry_date"
+        ):
+            continue
         trigger_date = getattr(employee, rule["trigger_field"])
         if trigger_date is None:
             log.warning(
@@ -81,6 +109,16 @@ def create_obligations_for_employee(session: Session, employee: Employee) -> Non
 
         deadline_date = compute_deadline(trigger_date, rule["deadline_value"], rule["deadline_unit"])
 
+        # Гейт дактилоскопии (2026-07): DACTYLOSCOPY — разовая обязанность. Если сотрудник
+        # её уже прошёл (employee.dactyloscopy_date заполнена), создаём запись СРАЗУ закрытой
+        # (DONE), а не PENDING — иначе она повиснет ложной задачей у того, кто всё сделал.
+        # Кто не прошёл (в т.ч. существующие сотрудники с пустой датой) — PENDING, честно
+        # горит от entry_date+30. Дальнейшее закрытие — через мини-форму dactyloscopy_date
+        # в webforms.py. Для остальных типов статус всегда PENDING, как и раньше.
+        status = ObligationStatus.PENDING
+        if rule["type"] == ObligationType.DACTYLOSCOPY and employee.dactyloscopy_date is not None:
+            status = ObligationStatus.DONE
+
         # Версионирование: новое обязательство того же типа означает, что предыдущее
         # (например, регистрация по старому адресу) больше не актуально — сменился адрес,
         # исправили дату, и т.п. Старые записи НЕ удаляются и не перезаписываются (нужна
@@ -102,7 +140,7 @@ def create_obligations_for_employee(session: Session, employee: Employee) -> Non
             deadline_value=rule["deadline_value"],
             deadline_unit=rule["deadline_unit"],
             deadline_date=deadline_date,
-            status=ObligationStatus.PENDING,
+            status=status,
             is_current=True,
         )
         session.add(obligation)
