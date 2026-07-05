@@ -22,6 +22,19 @@
 чтобы webforms.py (веб-формы кадровика) могла вызывать ту же функцию, не дублируя логику
 дедлайнов и не импортируя bot.py целиком (это создало бы второй Bot()/Dispatcher в чужом
 процессе). Если меняешь правила создания obligations — правь только obligations.py.
+
+2026-07: _handle_send_document исправлена в двух местах:
+  1. Раньше ValueError от _require_fields (document_templates.py) тонул в общем
+     "except Exception: ...Проверьте логи" — кадровик в чате не видел, какого именно
+     поля не хватает, хотя document_templates.py явно требует показывать текст этого
+     исключения. Теперь ValueError перехватывается отдельно и его текст уходит в чат.
+  2. Добавлена проверка отсутствующих полей ДО генерации (check_consent_fields /
+     check_medical_referral_fields) — как в webforms.py. В тестовом режиме
+     (TEST_ALLOW_MISSING_FIELDS=true, флаг живёт в document_templates.py) документ всё
+     равно генерируется с прочерками, но к сообщению в чате добавляется тот же
+     текст-баннер, что и в docx/HTML-превью веб-форм. В MAX нет способа показать
+     произвольный HTML внутри чата (только текст/файлы/кнопки), поэтому здесь это
+     текстовый эквивалент HTML-превью, а не сам HTML.
 """
 
 import asyncio
@@ -58,6 +71,9 @@ from models import (
 from obligations import create_obligations_for_employee
 from consent_texts import get_consent_text  # см. consent_texts.py
 from document_templates import (
+    TEST_ALLOW_MISSING_FIELDS,
+    check_consent_fields,
+    check_medical_referral_fields,
     generate_consent_docx,
     generate_employees_xlsx,
     generate_medical_referral_docx,
@@ -629,7 +645,30 @@ async def _handle_set_contract_date(event: MessageCreated, raw_text: str) -> Non
     await _apply_contract_date(event, employee_id, contract_date)
 
 
-async def _handle_send_document(event: MessageCreated, raw_text: str, generator_func, doc_label: str) -> None:
+async def _handle_send_document(
+    event: MessageCreated,
+    raw_text: str,
+    generator_func,
+    doc_label: str,
+    check_func=None,
+) -> None:
+    """check_func: функция (employee) -> list[str] отсутствующих полей, напр.
+    check_consent_fields / check_medical_referral_fields из document_templates.py.
+
+    2026-07: раньше при незаполненных полях generate_*_docx поднимал ValueError, но
+    этот блок ловил его через общий except Exception и показывал только "Проверьте
+    логи" — точный список полей терялся. Теперь:
+      - список отсутствующих полей запрашивается ЗАРАНЕЕ (check_func), не только через
+        перехват исключения;
+      - в обычном режиме (TEST_ALLOW_MISSING_FIELDS=false) при непустом списке
+        генерация даже не запускается — кадровик сразу видит, чего не хватает;
+      - ValueError от самого генератора (на случай прямого вызова без check_func,
+        либо иной причины) перехватывается ОТДЕЛЬНО от прочих исключений, и его текст
+        уходит в чат, а не проглатывается;
+      - если сработал тестовый обход (TEST_ALLOW_MISSING_FIELDS=true и missing непуст),
+        к сообщению с файлом добавляется текстовое предупреждение — это MAX-эквивалент
+        HTML-баннера в веб-формах, потому что мессенджер не рендерит произвольный HTML
+        в чате, только текст/файлы/кнопки."""
     parts = raw_text.split(maxsplit=1)
     if len(parts) != 2:
         await event.message.answer(f"Формат: {parts[0]} <id сотрудника>. id смотрите в /incomplete.")
@@ -642,15 +681,39 @@ async def _handle_send_document(event: MessageCreated, raw_text: str, generator_
             await event.message.answer("Сотрудник с таким id не найден.")
             return
 
+        missing = check_func(employee) if check_func else []
+        if missing and not TEST_ALLOW_MISSING_FIELDS:
+            await event.message.answer(
+                f"Нельзя сгенерировать документ для {employee.full_name} — "
+                f"не заполнены поля: {', '.join(missing)}. "
+                f"Заполните их через веб-форму кадровика или командами "
+                f"(/set_entry_date, /set_contract_date и т.п.) перед генерацией."
+            )
+            return
+
         try:
             path = generator_func(employee)
+        except ValueError as e:
+            # Точный текст ошибки от _require_fields — раньше тонул в except Exception ниже.
+            await event.message.answer(str(e))
+            return
         except Exception:
             log.exception("Не удалось сгенерировать документ (%s) для employee_id=%s", doc_label, employee_id)
             await event.message.answer(f"Не удалось сгенерировать документ ({doc_label}). Проверьте логи.")
             return
 
+        full_name = employee.full_name
+
+    warning = ""
+    if missing and TEST_ALLOW_MISSING_FIELDS:
+        warning = (
+            f"\n\n⚠ ТЕСТОВЫЙ ЧЕРНОВИК — не заполнены поля: {', '.join(missing)}. "
+            "Документ не имеет юридической силы, пока эти поля не указаны и документ "
+            "не перегенерирован."
+        )
+
     await event.message.answer(
-        text=f"{doc_label.capitalize()} для {employee.full_name}:",
+        text=f"{doc_label.capitalize()} для {full_name}:{warning}",
         attachments=[InputMedia(path=path)],
     )
 
@@ -744,12 +807,16 @@ async def on_text(event: MessageCreated):
             return
 
         if raw_text.startswith("/send_consent_doc"):
-            await _handle_send_document(event, raw_text, generate_consent_docx, "согласие на обработку ПД")
+            await _handle_send_document(
+                event, raw_text, generate_consent_docx, "согласие на обработку ПД",
+                check_func=check_consent_fields,
+            )
             return
 
         if raw_text.startswith("/send_medical_referral"):
             await _handle_send_document(
-                event, raw_text, generate_medical_referral_docx, "направление на медкомиссию"
+                event, raw_text, generate_medical_referral_docx, "направление на медкомиссию",
+                check_func=check_medical_referral_fields,
             )
             return
 
