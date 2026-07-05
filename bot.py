@@ -17,6 +17,11 @@
   - производственный календарь праздников для working_day (см. deadlines.py)
   - дозаполнение employment_status (все 67 перенесённых записей стоят "уточнить") —
     отдельная задача, сознательно не включена в эту итерацию
+
+2026-07: create_obligations_for_employee() вынесена в obligations.py — импортируется оттуда,
+чтобы webforms.py (веб-формы кадровика) могла вызывать ту же функцию, не дублируя логику
+дедлайнов и не импортируя bot.py целиком (это создало бы второй Bot()/Dispatcher в чужом
+процессе). Если меняешь правила создания obligations — правь только obligations.py.
 """
 
 import asyncio
@@ -49,9 +54,8 @@ from models import (
     Obligation,
     ObligationStatus,
     ObligationType,
-    RegistrationPeriod,
 )
-from deadlines import DEADLINE_RULES, compute_deadline, calendar_days_add
+from obligations import create_obligations_for_employee
 from consent_texts import get_consent_text  # см. consent_texts.py
 from document_templates import (
     generate_consent_docx,
@@ -92,64 +96,6 @@ def is_hr(phone: str | None) -> bool:
     if not HR_WHITELIST:
         return True  # whitelist пуст на этапе разработки — не блокируем
     return phone in HR_WHITELIST
-
-
-def create_obligations_for_employee(session: Session, employee: Employee) -> None:
-    """Вызывается ТОЛЬКО после consent_status=confirmed. Без согласия obligations не создаются —
-    это тот самый gate, который обсуждался как обязательное условие."""
-    rules = DEADLINE_RULES.get(employee.category, [])
-    if not rules:
-        log.warning(
-            "Нет правил дедлайнов для категории %s (employee_id=%s) — obligations не созданы",
-            employee.category,
-            employee.id,
-        )
-        return
-
-    for rule in rules:
-        trigger_date = getattr(employee, rule["trigger_field"])
-        if trigger_date is None:
-            log.warning(
-                "Поле %s пустое у employee_id=%s — пропускаю obligation %s",
-                rule["trigger_field"],
-                employee.id,
-                rule["type"],
-            )
-            continue
-
-        deadline_date = compute_deadline(trigger_date, rule["deadline_value"], rule["deadline_unit"])
-
-        obligation = Obligation(
-            employee_id=employee.id,
-            type=rule["type"],
-            trigger_date=trigger_date,
-            deadline_value=rule["deadline_value"],
-            deadline_unit=rule["deadline_unit"],
-            deadline_date=deadline_date,
-            status=ObligationStatus.PENDING,
-        )
-        session.add(obligation)
-
-    # Заводим первый период учёта по правилу "90 из 180" — только для EAEU, формулировка
-    # правила подтверждена именно для этой категории. Для BELARUS механизм иной (изначальные
-    # 90 дней — это порог, после которого нужна ПЕРВАЯ регистрация, а не лимит на её действие) —
-    # переносить сюда по аналогии не стал, нужна отдельная юридическая проверка.
-    if employee.category == Category.EAEU and employee.entry_date is not None:
-        existing = (
-            session.query(RegistrationPeriod)
-            .filter_by(employee_id=employee.id, is_active=True)
-            .first()
-        )
-        if existing is None:
-            period = RegistrationPeriod(
-                employee_id=employee.id,
-                period_start=employee.entry_date,
-                period_end=calendar_days_add(employee.entry_date, 90),
-                is_active=True,
-            )
-            session.add(period)
-
-    session.commit()
 
 
 class _Responder:
