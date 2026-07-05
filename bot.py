@@ -22,7 +22,9 @@
 import asyncio
 import logging
 import os
-from datetime import datetime, UTC
+from datetime import datetime, timezone, timedelta
+
+MSK = timezone(timedelta(hours=3))  # Мурманская обл. — московское время, без перехода на летнее с 2014
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
@@ -336,7 +338,7 @@ async def _execute_consent_confirm_by_button(responder: "_Responder", employee_i
         consent = Consent(
             employee_id=employee.id,
             method=ConsentMethod.BOT_BUTTON,
-            proof=f"button_click:{responder.user_id()}:{datetime.now(UTC).isoformat()}",
+            proof=f"button_click:{responder.user_id()}:{datetime.now(MSK).isoformat()}",
             consent_text_version=CONSENT_TEXT_VERSION,
         )
         session.add(consent)
