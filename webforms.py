@@ -90,6 +90,18 @@ from document_templates import (
     generate_labor_contract_docx,
     CONTRACT_NUMBER_PREFIX,
     EMPLOYER_NAME_SHORT,
+    EMPLOYER_NAME_FULL,
+    EMPLOYER_DIRECTOR_FULL,
+    EMPLOYER_DIRECTOR_SHORT,
+    EMPLOYER_INN,
+    EMPLOYER_KPP,
+    EMPLOYER_LEGAL_ADDRESS,
+    EMPLOYER_ACTUAL_ADDRESS,
+    EMPLOYER_PHONE,
+    EMPLOYER_SUBDIVISION,
+    WORKPLACE_ADDRESS,
+    DISTRICT_COEFFICIENT,
+    SITE_ADDRESS as CONTRACT_SITE_ADDRESS,
 )
 
 MSK = timezone(timedelta(hours=3))  # то же смещение, что в bot.py — для единообразия timestamp'ов proof
@@ -234,7 +246,7 @@ select{{min-height:48px;-webkit-appearance:none;appearance:none;background-image
 .field-help summary::-webkit-details-marker{{display:none}}
 .field-help .i{{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;border:1.5px solid var(--accent);color:var(--accent-ink);font-size:12px;font-style:italic;font-weight:700;line-height:1}}
 .field-help p{{margin:6px 0 0;color:var(--sub);font-size:13px;font-weight:400;line-height:1.4}}
-.btn-full{{width:100%;text-align:center;margin:12px 0 4px 0}}
+.btn-full{{width:100%;text-align:center;margin:0 0 14px 0}}
 input:focus{{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px #4a90e222}}
 label{{font-size:13px;color:var(--sub)}}
 .badge{{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:600;margin:2px 4px 2px 0}}
@@ -833,15 +845,24 @@ def employee_card(employee_id: str, request: Request, db: Session = Depends(get_
         # Кнопка отмены — только если договор уже заключён (стоит дата). Отмена откатывает
         # contract_date и снимает НЕ выполненные обязательства от договора (МВД/ЕФС-1);
         # выполненные (DONE) сохраняются как след исполнения.
+        # Скачать и отменить доступны только ПОСЛЕ заключения (стоит contract_date).
         if emp.contract_date is not None:
-            _cancel = f'''
+            _post = f'''
 <p class="muted">Договор заключён {emp.contract_date.strftime("%d.%m.%Y")}.</p>
+<form method="post" action="/employees/{emp.id}/labor_contract/download">
+<input type="hidden" name="position" value="Монтажник">
+<input type="hidden" name="salary" value="30000">
+<button type="submit" class="btn-full">Скачать .docx</button>
+</form>
 <form method="post" action="/employees/{emp.id}/labor_contract/cancel"
 onsubmit="return confirm(&#39;Отменить договор? Дата договора будет снята, а незакрытые обязательства (уведомление МВД, ЕФС-1) удалены. Выполненные останутся.&#39;)">
 <button type="submit" class="secondary btn-full">Отменить договор</button>
 </form>'''
         else:
-            _cancel = ""
+            _post = ""
+        # До заключения: форма с предпросмотром и заключением. Предпросмотр (formaction preview)
+        # ничего не пишет — только показывает HTML по введённым данным. Заключение пишет дату
+        # и создаёт обязательства. Скачивание доступно только после заключения (блок _post).
         contract_block = f"""
 <p class="muted">Номер договора: {_contract_no}. Дата по умолчанию — сегодня; можно изменить.</p>
 {help_contract}
@@ -854,9 +875,10 @@ onsubmit="return confirm(&#39;Отменить договор? Дата дого
 {help_salary}
 <label>Дата договора</label>
 <input type="date" name="contract_date" max="{today_s}" value="{today_s}">
-<button type="submit" class="btn-full">Заключить трудовой договор (скачать .docx)</button>
+<button type="submit" formaction="/employees/{emp.id}/labor_contract/preview" class="secondary btn-full">Предпросмотр</button>
+<button type="submit" onsubmit="return true" class="btn-full">Заключить трудовой договор</button>
 </form>
-{_cancel}"""
+{_post}"""
 
     # Секция статуса учёта. Отдельная форма со своим confirm — смена пересоздаёт
     # обязательства по новому статусу, это не рутинное сохранение, мешать с saveform нельзя.
@@ -1468,11 +1490,9 @@ def employee_labor_contract(
     contract_date: date = Form(...),
     db: Session = Depends(get_db),
 ):
-    """Заключение трудового договора: пишет contract_date в карточку (создаёт обязательства
-    по уведомлению МВД и ЕФС-1, если согласие подтверждено), генерирует docx и отдаёт на
-    скачивание. Блокируется при пустом табельном (номер договора собрать нельзя).
-    Должность и оклад берутся из формы как есть — НЕ проверяются (тестовый режим), задача
-    вынести их в поля модели записана в бэклоге."""
+    """Заключение договора: пишет contract_date (создаёт обязательства МВД/ЕФС-1 при согласии),
+    возвращает в карточку. Docx скачивается ОТДЕЛЬНО после заключения (роут /download).
+    Блокируется при пустом статусе учёта и пустом табельном. Должность/оклад из формы как есть."""
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
 
@@ -1485,25 +1505,107 @@ def employee_labor_contract(
     if not (emp.tab_number or "").strip():
         raise HTTPException(400, "У сотрудника нет табельного номера — номер договора собрать нельзя.")
 
-    # Дата договора создаёт обязательства (симметрично contract_date в /save и bot.py):
-    # ставим всегда (перезаключение = новая дата), затем пересоздаём обязательства при согласии.
+    # Заключение: фиксируем дату договора (создаёт обязательства МВД/ЕФС-1 при согласии) и
+    # возвращаем в карточку. Скачивание .docx — отдельной кнопкой ПОСЛЕ заключения (роут
+    # /download). Так «Заключить» — это акт фиксации, а не выдача файла: кадровик сперва
+    # смотрит предпросмотр, заключает, потом скачивает.
     emp.contract_date = contract_date
     db.commit()
     db.refresh(emp)
     if emp.consent_status == ConsentStatus.CONFIRMED:
         create_obligations_for_employee(db, emp)
 
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+
+@app.post("/employees/{employee_id}/labor_contract/cancel")
+def _render_labor_contract_preview(emp, position, salary, contract_date_str, tab):
+    """HTML-предпросмотр трудового договора. Зеркалит текст generate_labor_contract_docx
+    в document_templates.py. Меняешь текст там — поменяй и здесь, иначе предпросмотр
+    разойдётся с .docx. Вид «похожий», не пиксель-в-пиксель (решение пользователя)."""
+    import html as _h
+    contract_no = f"{CONTRACT_NUMBER_PREFIX}{tab}" if tab else "—"
+    s = (salary or "").strip().replace(" ", "")
+    salary_fmt = f"{int(s):,}".replace(",", " ") if s.isdigit() else (salary or "—")
+    pos = _h.escape((position or "").strip() or "—")
+    body = f"""
+<div style="max-width:760px">
+<h1 style="text-align:center;font-size:18px">ТРУДОВОЙ ДОГОВОР № {_h.escape(contract_no)}</h1>
+<p style="display:flex;justify-content:space-between"><span>г. Москва</span><span>{_h.escape(contract_date_str)}</span></p>
+<p>{_h.escape(EMPLOYER_NAME_FULL)}, именуемое «Работодатель», в лице Генерального директора
+{_h.escape(EMPLOYER_DIRECTOR_FULL)}, действующего на основании Устава, с одной стороны, и
+{_h.escape(emp.full_name)}, именуемый «Работник», с другой стороны, заключили настоящий договор:</p>
+<h3>1. Предмет и срок</h3>
+<p>1.1. Работник принимается в {_h.escape(EMPLOYER_SUBDIVISION)} {_h.escape(EMPLOYER_NAME_SHORT)}
+на должность {pos} с {_h.escape(contract_date_str)}.</p>
+<p>1.3. Место работы: {_h.escape(WORKPLACE_ADDRESS)}</p>
+<p>1.5. Срок — неопределённый.</p>
+<h3>3. Оплата труда</h3>
+<p>3.1. Оклад: {_h.escape(salary_fmt)} руб.; Районный коэффициент: {_h.escape(DISTRICT_COEFFICIENT)}.</p>
+<h3>8. Адреса и подписи</h3>
+<p>Работник: {_h.escape(emp.full_name)}, {emp.birth_date.strftime("%d.%m.%Y") if emp.birth_date else "—"} г.р.<br>
+Паспорт: {_h.escape((emp.passport_series or "") + " " + (emp.passport_number or ""))}, выдан: —<br>
+Адрес: {_h.escape(CONTRACT_SITE_ADDRESS)}</p>
+<p>Работодатель: {_h.escape(EMPLOYER_NAME_FULL)}<br>
+ИНН {_h.escape(str(EMPLOYER_INN))} КПП {_h.escape(str(EMPLOYER_KPP))}<br>
+{_h.escape(EMPLOYER_LEGAL_ADDRESS)}<br>Телефон: {_h.escape(EMPLOYER_PHONE)}</p>
+<p>Генеральный директор _______________ {_h.escape(EMPLOYER_DIRECTOR_SHORT)}</p>
+</div>
+<p class="muted">Это предпросмотр (упрощённый вид). Полный документ — в скачанном .docx после заключения.</p>
+<div style="display:flex;gap:8px;flex-wrap:wrap">
+<a class="btn secondary" href="/employees/{emp.id}">← Назад к карточке</a>
+<button class="btn" onclick="window.print()">Печать</button>
+</div>"""
+    return _render("Предпросмотр договора", body, active="employees")
+
+
+@app.post("/employees/{employee_id}/labor_contract/preview")
+def employee_labor_contract_preview(
+    employee_id: str,
+    request: Request,
+    position: str = Form("Монтажник"),
+    salary: str = Form("30000"),
+    contract_date: date = Form(...),
+    db: Session = Depends(get_db),
+):
+    """Предпросмотр договора. НИЧЕГО не пишет в БД (не заключает). Показывает HTML по данным
+    формы. Доступен до заключения — иначе кадровик не смог бы проверить документ глазами."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+    tab = (emp.tab_number or "").strip()
+    return HTMLResponse(_render_labor_contract_preview(
+        emp, position, salary, contract_date.strftime("%d.%m.%Y"), tab))
+
+
+@app.post("/employees/{employee_id}/labor_contract/download")
+def employee_labor_contract_download(
+    employee_id: str,
+    request: Request,
+    position: str = Form("Монтажник"),
+    salary: str = Form("30000"),
+    db: Session = Depends(get_db),
+):
+    """Скачивание .docx. Доступно ТОЛЬКО после заключения (contract_date стоит) — иначе 400.
+    Не пишет в БД, только генерирует файл по уже зафиксированной дате договора."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+    if emp.contract_date is None:
+        raise HTTPException(400, "Договор не заключён — сначала нажмите «Заключить».")
     try:
         path = generate_labor_contract_docx(emp, position=position, salary=salary,
-                                            contract_date=contract_date)
+                                            contract_date=emp.contract_date)
     except Exception:
         raise HTTPException(500, "Не удалось сгенерировать договор. Проверьте логи сервиса.")
-
     filename = f"Трудовой_договор_{emp.full_name.replace(' ', '_')}.docx"
     return FileResponse(path, filename=filename)
 
 
-@app.post("/employees/{employee_id}/labor_contract/cancel")
 @app.post("/employees/{employee_id}/registration_status")
 def employee_registration_status(
     employee_id: str,
