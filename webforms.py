@@ -59,14 +59,17 @@ from models import (
     Consent,
     ConsentMethod,
     ConsentStatus,
+    DeadlineUnit,
     Employee,
     ExamStatus,
     Obligation,
     ObligationStatus,
     ObligationType,
     Referral,
+    SystemFlag,
 )
 from obligations import create_obligations_for_employee
+from deadlines import lead_days_for
 from document_templates import (
     CLINIC_CHIEF_DOCTOR_NAME,
     CLINIC_CONTRACT_DATE,
@@ -134,6 +137,38 @@ def _logged_in(request: Request) -> bool:
     return bool(request.session.get("logged_in"))
 
 
+def _obligation_status(o, today):
+    """(chip_class, label, bucket). bucket: 'overdue' | 'soon' | 'ok'.
+    Порог 'скоро' берётся из deadlines.lead_days_for (один источник со сроком).
+    Короткоплечие (WORKING_DAY: переезд/уведомление/ЕФС-1) — born-amber: 'soon'
+    с момента создания, пока не сделаны. Единая точка окраски для дашборда и списка."""
+    days = (o.deadline_date - today).days
+    if days < 0:
+        return ("red", f"просрочено на {-days} дн", "overdue")
+    cat = o.employee.category if o.employee else None
+    if o.deadline_unit == DeadlineUnit.WORKING_DAY:
+        soon = True
+    else:
+        soon = days <= lead_days_for(cat, o.type, o.deadline_unit)
+    if soon:
+        label = "сегодня" if days == 0 else ("завтра" if days == 1 else f"через {days} дн")
+        return ("orange", label, "soon")
+    return ("green", "в норме", "ok")
+
+
+# Человекочитаемые названия типов обязанностей — один источник для дашборда и списка.
+OBLIGATION_LABELS = {
+    ObligationType.REGISTRATION: "постановка на учёт",
+    ObligationType.CONTRACT_NOTICE: "уведомление о договоре",
+    ObligationType.CONTRACT_TERMINATION_NOTICE: "уведомление о расторжении",
+    ObligationType.MEDICAL_EXAM: "медосмотр",
+    ObligationType.EFS1_REPORT: "ЕФС-1",
+    ObligationType.DACTYLOSCOPY: "дактилоскопия",
+    ObligationType.REGISTRATION_RENEWAL: "продление регистрации",
+    ObligationType.PATENT_PAYMENT: "оплата патента",
+}
+
+
 # --- Простая HTML-обёртка без отдельных файлов шаблонов ---------------------
 
 PAGE_HEAD = """<!doctype html>
@@ -143,7 +178,8 @@ PAGE_HEAD = """<!doctype html>
 <style>
 :root{{--ink:#111214;--sub:#5b626b;--line:#e6e9ee;--line-2:#eef1f4;--accent:#2f80ed;--accent-ink:#1c63c4;
 --red-bg:#fdecec;--red-ink:#c0392b;--amber-bg:#fdf3e2;--amber-ink:#a5720a;--green-bg:#eaf6f0;--green-ink:#1f7a55;
---serif:Georgia,"Times New Roman",serif;--sans:-apple-system,Segoe UI,Roboto,Arial,sans-serif}}
+--neutral-bg:#eef1f4;--neutral-ink:#55606b;--serif:Georgia,"Times New Roman",serif;
+--sans:-apple-system,Segoe UI,Roboto,Arial,sans-serif}}
 *{{box-sizing:border-box}}
 body{{font-family:var(--sans);max-width:720px;margin:0 auto;padding:16px;background:#fff;color:var(--ink)}}
 header.org{{background:#fff;border:0;border-bottom:1px solid var(--line);border-radius:0;padding:14px 4px 16px;margin-bottom:8px}}
@@ -159,10 +195,12 @@ a.btn,button{{display:inline-block;background:var(--accent);color:#fff;text-deco
 a.btn.secondary,button.secondary{{background:#fff;color:var(--accent-ink);border:1px solid var(--accent)}}
 input[type=date],input[type=text],input[type=password]{{width:100%;padding:12px;font-size:16px;font-family:inherit;border:1px solid #d9dde3;border-radius:12px;margin:6px 0 12px;background:#fff;color:var(--ink)}}
 input:focus{{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px #2f80ed22}}
+label{{font-size:13px;color:var(--sub)}}
 .badge{{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:600;margin:2px 4px 2px 0}}
 .badge.red{{background:var(--red-bg);color:var(--red-ink)}}
 .badge.orange{{background:var(--amber-bg);color:var(--amber-ink)}}
 .badge.green{{background:var(--green-bg);color:var(--green-ink)}}
+.badge.neutral{{background:var(--neutral-bg);color:var(--neutral-ink)}}
 .muted{{color:var(--sub);font-size:13px}}
 .warning-banner{{background:var(--amber-bg);border:1px solid #f0c674;border-left:4px solid var(--amber-ink);border-radius:12px;padding:12px 14px;margin-bottom:14px;font-weight:600;color:#7a4a00}}
 nav{{margin-bottom:16px;background:#fff;border:1px solid var(--line);border-radius:12px;padding:4px 8px;display:flex;gap:2px;overflow-x:auto}}
@@ -287,11 +325,8 @@ LOGIN_BG_SVG = """<svg viewBox="0 0 430 760" preserveAspectRatio="xMidYMid slice
 
 @app.get("/login-bg.svg")
 def login_bg():
-    return Response(
-        content=LOGIN_BG_SVG,
-        media_type="image/svg+xml",
-        headers={"Cache-Control": "public, max-age=86400"},
-    )
+    return Response(content=LOGIN_BG_SVG, media_type="image/svg+xml",
+                    headers={"Cache-Control": "public, max-age=86400"})
 
 
 @app.get("/logout")
@@ -307,39 +342,23 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
 
-    today = date.today()
-    soon = today + timedelta(days=7)
+    today = datetime.now(MSK).date()  # МСК, не UTC — иначе граница "сегодня" съезжает у полуночи
 
-    overdue = db.scalars(
+    # Все активные несделанные обязательства; раскладываем по статусу в Python, потому что
+    # порог "скоро" теперь per-type (deadlines.lead_days_for), а не плоские 7 дней —
+    # одним SQL-диапазоном его не выразить.
+    _pending = db.scalars(
         select(Obligation)
         .where(Obligation.is_current == True)  # noqa: E712 — SQLAlchemy требует именно так, не `is True`
         .where(Obligation.status == ObligationStatus.PENDING)
-        .where(Obligation.deadline_date < today)
         .order_by(Obligation.deadline_date)
     ).all()
-
-    due_soon = db.scalars(
-        select(Obligation)
-        .where(Obligation.is_current == True)  # noqa: E712
-        .where(Obligation.status == ObligationStatus.PENDING)
-        .where(Obligation.deadline_date >= today)
-        .where(Obligation.deadline_date <= soon)
-        .order_by(Obligation.deadline_date)
-    ).all()
-
-    OBLIGATION_LABELS = {
-        ObligationType.REGISTRATION: "постановка на учёт",
-        ObligationType.CONTRACT_NOTICE: "уведомление о договоре",
-        ObligationType.CONTRACT_TERMINATION_NOTICE: "уведомление о расторжении",
-        ObligationType.MEDICAL_EXAM: "медосмотр",
-        ObligationType.EFS1_REPORT: "ЕФС-1",
-        ObligationType.REGISTRATION_RENEWAL: "продление регистрации",
-        ObligationType.PATENT_PAYMENT: "оплата патента",
-    }
+    overdue = [o for o in _pending if _obligation_status(o, today)[2] == "overdue"]
+    due_soon = [o for o in _pending if _obligation_status(o, today)[2] == "soon"]
 
     def obl_row(o: Obligation) -> str:
         emp_name = o.employee.full_name if o.employee else "?"
-        badge = "red" if o.deadline_date < today else "orange"
+        chip_class, chip_label, _ = _obligation_status(o, today)
         # medical_exam решается в разделе Медкомиссия (направление/результат), остальные типы
         # (registration, contract_notice, efs1_report) — правкой соответствующей даты в карточке
         # сотрудника, откуда их дедлайн и считается.
@@ -348,7 +367,7 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
         type_label = OBLIGATION_LABELS.get(o.type, o.type.value)
         return (
             f'<div class="card">{emp_name} — {type_label}<br>'
-            f'<span class="badge {badge}">{o.deadline_date.isoformat()}</span><br>'
+            f'<span class="badge {chip_class}">до {o.deadline_date.strftime("%d.%m.%Y")} · {chip_label}</span><br>'
             f'<a class="btn" href="{action_url}">{action_label}</a></div>'
         )
 
@@ -400,6 +419,22 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
         if TEST_ALLOW_MISSING_FIELDS else ""
     )
 
+    if db.get(SystemFlag, "dactyloscopy_backfill_done") is not None:
+        recompute_section = (
+            '<section><h2>Разовая операция</h2>'
+            '<div class="card"><span class="badge green">Прогон дактилоскопии выполнен</span>'
+            '<div class="muted-line">Кнопку и эту секцию можно удалить отдельной правкой '
+            '(см. TODO в models.py у таблицы SystemFlag).</div></div></section>'
+        )
+    else:
+        recompute_section = (
+            '<section><h2>Разовая операция</h2>'
+            '<div class="card">Создать обязанности дактилоскопии для существующих сотрудников — '
+            'разово, для тех, кто заведён до добавления правила. Запускать один раз.'
+            '<form method="post" action="/admin/recompute-dactyloscopy">'
+            '<button type="submit">Запустить прогон</button></form></div></section>'
+        )
+
     body = f"""
 {test_banner}
 <h1>Задачи</h1>
@@ -425,6 +460,8 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
 Ждут результата: {len(awaiting_result)}<br>
 <a class="btn" href="/medical">Открыть раздел</a></div>
 </section>
+
+{recompute_section}
 """
     return _render("Рабочий стол", body)
 
@@ -436,22 +473,42 @@ def employees_list(request: Request, db: Session = Depends(get_db)):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
 
+    today = datetime.now(MSK).date()
     employees = db.scalars(select(Employee).order_by(Employee.full_name)).all()
 
-    def status_badge(e: Employee) -> str:
+    def nearest_pending(e: Employee):
+        obs = [o for o in e.obligations if o.is_current and o.status == ObligationStatus.PENDING]
+        return min(obs, key=lambda o: o.deadline_date) if obs else None
+
+    def row(e: Employee) -> str:
+        cit = e.citizenship or "—"
+        if e.consent_status != ConsentStatus.CONFIRMED:
+            chip = '<span class="badge neutral">без согласия</span>'
+            ob_line = '<div class="muted-line">обязанности создаются после согласия</div>'
+        else:
+            o = nearest_pending(e)
+            if o is None:
+                chip = '<span class="badge green">в норме</span>'
+                ob_line = '<div class="muted-line">нет активных сроков</div>'
+            else:
+                cls, lbl, _ = _obligation_status(o, today)
+                type_label = OBLIGATION_LABELS.get(o.type, o.type.value)
+                chip = f'<span class="badge {cls}">{lbl}</span>'
+                ob_line = (
+                    f'<div class="muted-line">{type_label} · '
+                    f'до {o.deadline_date.strftime("%d.%m.%Y")}</div>'
+                )
         return (
-            '<span class="badge green">согласие ✓</span>'
-            if e.consent_status == ConsentStatus.CONFIRMED
-            else '<span class="badge red">без согласия</span>'
+            f'<div class="card">{e.full_name} {chip}<br>'
+            f'<span class="muted-line">{cit}</span>{ob_line}'
+            f'<a class="btn" href="/employees/{e.id}">Открыть карточку</a></div>'
         )
 
-    rows = "".join(
-        f'<div class="card">{e.full_name}<br>{status_badge(e)}<br>'
-        f'<a class="btn" href="/employees/{e.id}">Открыть карточку</a></div>'
-        for e in employees
-    ) or '<p class="muted">Сотрудников в базе нет.</p>'
-
-    return _render("Сотрудники", f"<h1>Сотрудники ({len(employees)})</h1><section class=\"grid\">{rows}</section>")
+    rows = "".join(row(e) for e in employees) or '<p class="muted">Сотрудников в базе нет.</p>'
+    return _render(
+        "Сотрудники",
+        f'<h1>Сотрудники ({len(employees)})</h1><section class="grid">{rows}</section>',
+    )
 
 
 @app.get("/employees/{employee_id}", response_class=HTMLResponse)
@@ -463,7 +520,7 @@ def employee_card(employee_id: str, request: Request, db: Session = Depends(get_
     if emp is None:
         raise HTTPException(404, "Сотрудник не найден")
 
-    today_s = date.today().isoformat()
+    today_s = datetime.now(MSK).date().isoformat()
 
     if emp.consent_status == ConsentStatus.CONFIRMED:
         consent_block = '<p><span class="badge green">Согласие подтверждено</span></p>'
@@ -485,6 +542,17 @@ def employee_card(employee_id: str, request: Request, db: Session = Depends(get_
 <form method="post" action="/employees/{emp.id}/entry_date">
 <input type="date" name="entry_date" required max="{today_s}"
 value="{emp.entry_date.isoformat() if emp.entry_date else ''}">
+<button type="submit">Сохранить</button>
+</form>
+</fieldset>
+
+<fieldset>
+<legend>Дактилоскопия («грин карта»)</legend>
+<p class="muted">Дата прохождения дактилоскопии и фотографирования. Заполнение закрывает
+обязанность. Пусто — обязанность горит от даты въезда + 30 дней.</p>
+<form method="post" action="/employees/{emp.id}/dactyloscopy_date">
+<input type="date" name="dactyloscopy_date" required max="{today_s}"
+value="{emp.dactyloscopy_date.isoformat() if emp.dactyloscopy_date else ''}">
 <button type="submit">Сохранить</button>
 </form>
 </fieldset>
@@ -669,6 +737,70 @@ def employee_consent_confirm_submit(employee_id: str, request: Request, db: Sess
     create_obligations_for_employee(db, emp)
 
     return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+
+@app.post("/employees/{employee_id}/dactyloscopy_date")
+def employee_dactyloscopy_date_submit(
+    employee_id: str,
+    request: Request,
+    dactyloscopy_date: date = Form(...),
+    db: Session = Depends(get_db),
+):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    emp.dactyloscopy_date = dactyloscopy_date
+
+    # Заполнение даты = дактилоскопия пройдена: закрываем текущую обязанность в DONE.
+    # Симметрично тому, как медосмотр закрывается результатом. Если обязанности ещё нет
+    # (согласие не подтверждено), просто сохраняем дату — при последующем создании
+    # obligations гейт в obligations.py сделает её сразу DONE.
+    dact = db.scalars(
+        select(Obligation)
+        .where(Obligation.employee_id == emp.id)
+        .where(Obligation.type == ObligationType.DACTYLOSCOPY)
+        .where(Obligation.is_current == True)  # noqa: E712
+    ).first()
+    if dact is not None:
+        dact.status = ObligationStatus.DONE
+        db.add(dact)
+
+    db.commit()
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+
+@app.post("/admin/recompute-dactyloscopy")
+def admin_recompute_dactyloscopy(request: Request, db: Session = Depends(get_db)):
+    """Разовый прогон: создаёт недостающие обязанности (в т.ч. дактилоскопию) для уже
+    заведённых ПОДТВЕРЖДЁННЫХ сотрудников — иначе новое правило оживёт только у тех, чью
+    карточку тронут после деплоя. Защищён флагом system_flags: повторный запуск ничего не
+    делает (плюс идемпотентность самой create_obligations_for_employee).
+    TODO удалить этот эндпоинт и таблицу SystemFlag после успешного прогона."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    if db.get(SystemFlag, "dactyloscopy_backfill_done") is not None:
+        return RedirectResponse("/", status_code=303)
+
+    confirmed = db.scalars(
+        select(Employee).where(Employee.consent_status == ConsentStatus.CONFIRMED)
+    ).all()
+    for emp in confirmed:
+        create_obligations_for_employee(db, emp)  # сама коммитит и идемпотентна
+
+    db.add(
+        SystemFlag(
+            key="dactyloscopy_backfill_done",
+            value=f"{len(confirmed)} сотрудников; {datetime.now(MSK).isoformat()}",
+            updated_at=datetime.now(MSK),
+        )
+    )
+    db.commit()
+    return RedirectResponse("/", status_code=303)
 
 
 # --- Медкомиссия ---------------------------------------------------------
