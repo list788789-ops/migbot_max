@@ -777,7 +777,7 @@ async def _handle_medical_exam_result(event: MessageCreated, raw_text: str) -> N
 
         obligation = (
             session.query(Obligation)
-            .filter_by(employee_id=employee.id, type=ObligationType.MEDICAL_EXAM)
+            .filter_by(employee_id=employee.id, type=ObligationType.MEDICAL_EXAM, is_current=True)
             .order_by(Obligation.deadline_date.desc())
             .first()
         )
