@@ -92,7 +92,9 @@ MEDICAL_REFERRAL_REQUIRED_FIELDS = {
     "birth_date": "дата рождения",
     "passport_series": "серия паспорта",
     "passport_number": "номер паспорта",
-    "address": "адрес места пребывания",
+    # address убран (2026-07): п.3 направления берёт SITE_ADDRESS (константа площадки),
+    # employee.address в направление больше не идёт, поэтому его пустота не должна
+    # блокировать генерацию. В согласии employee.address по-прежнему используется.
 }
 
 
@@ -249,6 +251,13 @@ PAYER_NAME = os.environ.get("PAYER_NAME", "ИП Буц С.Ю.")
 PAYER_SIGNATORY_NAME = os.environ.get("PAYER_SIGNATORY_NAME", "С. Ю. Буц")
 PAYER_PHONE = os.environ.get("PAYER_PHONE", "+7 (985) 415-54-20")
 
+# Адрес площадки — идёт в п.3 направления вместо employee.address (у всех вахтовиков
+# один адрес проживания). Только для НАПРАВЛЕНИЯ; в согласии (152-ФЗ) остаётся личный
+# employee.address. Переопределяется env, если площадка сменится.
+SITE_ADDRESS = os.environ.get(
+    "SITE_ADDRESS", "Мурманская обл., Кольский р-н, с. Белокаменка, зд. 1А, 184664"
+)
+
 MEDICAL_SERVICE_TEXT = (
     "Медицинское освидетельствование на наличие или отсутствие инфекционных заболеваний, "
     "представляющих опасность для окружающих и являющихся основанием для отказа в выдаче "
@@ -322,7 +331,7 @@ def generate_medical_referral_docx(employee: Employee, output_dir: str = "/tmp")
     birth = _date_or_dash(employee.birth_date)
     doc.add_paragraph(f"2. Дата рождения (число, месяц, год) {birth}")
 
-    doc.add_paragraph(f"3. Адрес (по месту проживания) {_text_or_dash(employee.address)}")
+    doc.add_paragraph(f"3. Адрес (по месту проживания) {SITE_ADDRESS}")
 
     doc.add_paragraph(
         f"4. Серия паспорта {_text_or_dash(employee.passport_series)} "
