@@ -86,6 +86,9 @@ from document_templates import (
     TEST_ALLOW_MISSING_FIELDS,
     check_medical_referral_fields,
     generate_medical_referral_docx,
+    generate_labor_contract_docx,
+    CONTRACT_NUMBER_PREFIX,
+    EMPLOYER_NAME_SHORT,
 )
 
 MSK = timezone(timedelta(hours=3))  # то же смещение, что в bot.py — для единообразия timestamp'ов proof
@@ -750,6 +753,30 @@ def employee_card(employee_id: str, request: Request, db: Session = Depends(get_
 
     today_s = datetime.now(MSK).date().isoformat()
 
+    # Блок трудового договора. Без табельного номера генерация заблокирована — иначе номер
+    # договора соберётся как "БК-ПСМ-" без хвоста. Кнопка неактивна, показываем причину.
+    if not (emp.tab_number or "").strip():
+        contract_block = (
+            '<p class="muted">Нельзя заключить договор: у сотрудника нет табельного номера. '
+            'Он идёт в номер договора (' + CONTRACT_NUMBER_PREFIX + '{таб}). '
+            'Присвойте табельный номер.</p>'
+        )
+    else:
+        _contract_no = CONTRACT_NUMBER_PREFIX + emp.tab_number.strip()
+        contract_block = f"""
+<p class="muted">Номер договора: {_contract_no}. Дата по умолчанию — сегодня; можно изменить.
+Заключение проставит дату договора в карточку и создаст обязательства (уведомление МВД, ЕФС-1).
+Должность и оклад заполняются здесь и в документ идут как есть (не проверяются).</p>
+<form method="post" action="/employees/{emp.id}/labor_contract">
+<label>Должность</label>
+<input type="text" name="position" value="Монтажник">
+<label>Оклад (руб.)</label>
+<input type="text" name="salary" value="30000">
+<label>Дата договора</label>
+<input type="date" name="contract_date" max="{today_s}" value="{today_s}">
+<button type="submit">Заключить трудовой договор (скачать .docx)</button>
+</form>"""
+
     if emp.consent_status == ConsentStatus.CONFIRMED:
         consent_block = '<p><span class="badge green">Согласие подтверждено</span></p>'
     else:
@@ -810,6 +837,11 @@ value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
 <fieldset>
 <legend>Согласие на обработку ПД</legend>
 {consent_block}
+</fieldset>
+
+<fieldset>
+<legend>Трудовой договор ({EMPLOYER_NAME_SHORT})</legend>
+{contract_block}
 </fieldset>
 
 <a class="btn secondary" href="/employees">← Ко всем сотрудникам</a>
@@ -1308,6 +1340,48 @@ def medical_referral_download(
         raise HTTPException(500, "Не удалось сгенерировать направление. Проверьте логи сервиса.")
 
     filename = f"Направление_{emp.full_name.replace(' ', '_')}.docx"
+    return FileResponse(path, filename=filename)
+
+
+@app.post("/employees/{employee_id}/labor_contract")
+def employee_labor_contract(
+    employee_id: str,
+    request: Request,
+    position: str = Form("Монтажник"),
+    salary: str = Form("30000"),
+    contract_date: date = Form(...),
+    db: Session = Depends(get_db),
+):
+    """Заключение трудового договора: пишет contract_date в карточку (создаёт обязательства
+    по уведомлению МВД и ЕФС-1, если согласие подтверждено), генерирует docx и отдаёт на
+    скачивание. Блокируется при пустом табельном (номер договора собрать нельзя).
+    Должность и оклад берутся из формы как есть — НЕ проверяются (тестовый режим), задача
+    вынести их в поля модели записана в бэклоге."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    if not (emp.tab_number or "").strip():
+        raise HTTPException(400, "У сотрудника нет табельного номера — номер договора собрать нельзя.")
+
+    # Дата договора создаёт обязательства (симметрично contract_date в /save и bot.py):
+    # ставим всегда (перезаключение = новая дата), затем пересоздаём обязательства при согласии.
+    emp.contract_date = contract_date
+    db.commit()
+    db.refresh(emp)
+    if emp.consent_status == ConsentStatus.CONFIRMED:
+        create_obligations_for_employee(db, emp)
+
+    try:
+        path = generate_labor_contract_docx(emp, position=position, salary=salary,
+                                            contract_date=contract_date)
+    except Exception:
+        raise HTTPException(500, "Не удалось сгенерировать договор. Проверьте логи сервиса.")
+
+    filename = f"Трудовой_договор_{emp.full_name.replace(' ', '_')}.docx"
     return FileResponse(path, filename=filename)
 
 
