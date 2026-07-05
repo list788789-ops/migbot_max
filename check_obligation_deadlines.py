@@ -8,7 +8,8 @@ check_registration_renewals.py: встроить в процесс бота зн
 
 Настройка в Railway: New -> Cron Job Service, команда —
   python check_obligation_deadlines.py
-расписание — например "0 6 * * *" (каждый день в 06:00 UTC).
+расписание — например "0 6 * * *" (06:00 UTC = 09:00 МСК — Railway всегда планирует
+cron по UTC, часовой пояс расписания не настраивается, пересчёт делать вручную).
 
 Требует MAX_BOT_TOKEN в окружении — этот скрипт сам создаёт Bot() для отправки
 сообщений, независимо от процесса bot.py.
@@ -16,7 +17,7 @@ check_registration_renewals.py: встроить в процесс бота зн
 
 import asyncio
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
@@ -26,6 +27,8 @@ from maxapi import Bot
 from models import Employee, NotificationSubscriber, Obligation, ObligationStatus
 
 load_dotenv()
+
+MSK = timezone(timedelta(hours=3))  # Мурманская обл. — московское время, без перехода на летнее с 2014
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 WARNING_DAYS = int(os.environ.get("DEADLINE_WARNING_DAYS", "3"))
@@ -43,7 +46,9 @@ OBLIGATION_LABELS = {
 
 async def send_reminders():
     engine = create_engine(DATABASE_URL)
-    today = date.today()
+    # date.today() зависит от системного часового пояса контейнера (на Railway обычно UTC) —
+    # берём дату явно по МСК, иначе у полуночи МСК/UTC возможен сдвиг на день в сравнениях дедлайнов.
+    today = datetime.now(MSK).date()
     warning_threshold = today + timedelta(days=WARNING_DAYS)
 
     with Session(engine) as session:
