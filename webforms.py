@@ -987,7 +987,7 @@ def medical_list(request: Request, db: Session = Depends(get_db)):
             f'<form class="inline" method="post" action="/medical/{r.employee_id}/result">'
             f'<input type="hidden" name="result" value="done">'
             f'<button type="submit">✅ Пройдено</button></form>'
-            f'<form class="inline" method="post" action="/medical/{r.employee_id}/result">'
+            f'<form class="inline" method="post" action="/medical/{r.employee_id}/result" onsubmit="return confirm(&#39;Удалить направление и вернуть сотрудника в очередь на выписку? Действие необратимо.&#39;)"'
             f'<input type="hidden" name="result" value="failed">'
             f'<button type="submit" class="secondary">❌ Не пройдено</button></form>'
             f'</div>'
@@ -1213,15 +1213,26 @@ def medical_result(
     if referral is None:
         raise HTTPException(404, "Нет направления, ожидающего результата, для этого сотрудника")
 
+    if result == "failed":
+        # ВРЕМЕННО (тест): "не пройдено/не явился" = удаляем текущее направление, чтобы
+        # сотрудник вернулся в список "Выписать направление" (фильтр need_referral —
+        # "нет связанного Referral"). Обязательство медосмотра остаётся PENDING, дедлайн жив.
+        # ВНИМАНИЕ: cascade="all, delete-orphan" на Referral.invoices — удаление сносит и
+        # связанные Invoice. Для теста приемлемо (счетов ещё нет). Позже заменить на статус
+        # ExamStatus.CANCELLED с сохранением истории и счёта — отложенная задача.
+        db.delete(referral)
+        db.commit()
+        return RedirectResponse("/medical", status_code=303)
+
+    # result == "done": медосмотр пройден — направление завершается, обязательство закрывается.
     referral.exam_status = ExamStatus.COMPLETED
     referral.result_date = date.today()
     db.add(referral)
 
-    if result == "done":
-        obligation = db.get(Obligation, referral.obligation_id)
-        if obligation is not None:
-            obligation.status = ObligationStatus.DONE
-            db.add(obligation)
+    obligation = db.get(Obligation, referral.obligation_id)
+    if obligation is not None:
+        obligation.status = ObligationStatus.DONE
+        db.add(obligation)
 
     db.commit()
     return RedirectResponse("/medical", status_code=303)
