@@ -76,6 +76,11 @@ class ObligationType(str, enum.Enum):
     PATENT_PAYMENT = "patent_payment"             # не используется в MVP, зарезервировано
     EFS1_REPORT = "efs1_report"                   # ЕФС-1 в СФР — не позднее следующего рабочего дня
                                                    # после приказа о приёме / даты договора
+    DACTYLOSCOPY = "dactyloscopy"                 # дактилоскопия + фотографирование ("грин карта") —
+                                                   # разовая, 30 календарных дней с даты въезда
+                                                   # (п.13 ст.5 №115-ФЗ). Закрывается внесением
+                                                   # employee.dactyloscopy_date. Фотографирование —
+                                                   # та же процедура и карта, отдельным типом НЕ заводится.
     REGISTRATION_RENEWAL = "registration_renewal"  # продление по правилу "90 из 180" — периодическое,
                                                     # создаётся отдельным cron-скриптом, не разовым триггером
 
@@ -150,6 +155,17 @@ class Employee(Base):
     # пропускается в create_obligations_for_employee, как и любое другое пустое trigger_field.
     address_since: Mapped[date | None] = mapped_column(Date, nullable=True)
 
+    # --- дата прохождения дактилоскопии (2026-07) ---
+    # NULL = не пройдена: обязанность DACTYLOSCOPY активна и горит от entry_date+30.
+    # Заполнено = пройдена: обработчик в webforms.py переводит текущую DACTYLOSCOPY в DONE.
+    # Это НЕ trigger_field (триггер — entry_date), а поле ЗАКРЫТИЯ обязанности, по аналогии
+    # с тем, как медосмотр закрывается результатом Referral. Дата разовая: карта на 10 лет,
+    # ежегодного повтора нет. Точная дата у уже прошедших может быть неизвестна — для закрытия
+    # достаточно любой корректной; юридически разовую карту по дате мы не обязаны хранить.
+    # На боевой БД колонку добавить вручную (create_all не меняет существующие таблицы):
+    #   ALTER TABLE employees ADD COLUMN dactyloscopy_date DATE;
+    dactyloscopy_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+
     created_by: Mapped[str | None] = mapped_column(String, nullable=True)  # кто завёл (кадровик/прораб)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -180,6 +196,23 @@ class RegistrationPeriod(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
     employee: Mapped["Employee"] = relationship(back_populates="registration_periods")
+
+
+class SystemFlag(Base):
+    """Разовые системные флаги, не привязанные к конкретному сотруднику.
+
+    TODO удалить после разового прогона бэкфилла дактилоскопии:
+    сейчас используется только флаг key="dactyloscopy_backfill_done" — эндпоинт
+    /admin/recompute-dactyloscopy в webforms.py ставит его после успешного прогона
+    create_obligations_for_employee по всем подтверждённым сотрудникам, чтобы
+    правило DACTYLOSCOPY создало обязанности задним числом для уже заведённых людей.
+    После прогона эндпоинт и эту таблицу можно убрать отдельной правкой."""
+
+    __tablename__ = "system_flags"
+
+    key: Mapped[str] = mapped_column(String, primary_key=True)
+    value: Mapped[str | None] = mapped_column(String, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class NotificationSubscriber(Base):
