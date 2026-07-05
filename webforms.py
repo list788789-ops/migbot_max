@@ -57,6 +57,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.sessions import SessionMiddleware
 
 from models import (
+    Category,
     Consent,
     ConsentMethod,
     ConsentStatus,
@@ -77,6 +78,7 @@ from document_templates import (
     CLINIC_CONTRACT_NUMBER,
     CLINIC_NAME as REFERRAL_CLINIC_NAME,
     CLINIC_SHORT_NAME as REFERRAL_CLINIC_SHORT_NAME,
+    SITE_ADDRESS,
     MEDICAL_SERVICE_TEXT,
     PAYER_NAME as REFERRAL_PAYER_NAME,
     PAYER_PHONE,
@@ -536,8 +538,175 @@ def employees_list(request: Request, db: Session = Depends(get_db)):
     rows = "".join(row(e) for e in employees) or '<p class="muted">Сотрудников в базе нет.</p>'
     return _render(
         "Сотрудники",
-        f'<h1>Сотрудники ({len(employees)})</h1><section class="grid">{rows}</section>',
+        f'<h1>Сотрудники ({len(employees)})</h1>'
+        f'<p><a class="btn" href="/employees/new">+ Добавить сотрудника</a></p>'
+        f'<section class="grid">{rows}</section>',
     )
+
+
+# --- Создание нового сотрудника ---------------------------------------------
+# Гражданство выбирается из стран ЕАЭС; категория ВЫВОДИТСЯ из него (не отдельное поле),
+# чтобы исключить рассинхрон "Казахстан + BELARUS". Беларусь -> BELARUS, остальные -> EAEU.
+CITIZENSHIP_OPTIONS = ["Казахстан", "Киргизия", "Армения", "Беларусь"]
+CITIZENSHIP_TO_CATEGORY = {"Беларусь": Category.BELARUS}  # default -> EAEU
+
+
+def _category_for_citizenship(citizenship: str) -> Category:
+    return CITIZENSHIP_TO_CATEGORY.get((citizenship or "").strip(), Category.EAEU)
+
+
+def _new_employee_form_html(values: dict, error: str = "") -> str:
+    v = values
+    cit_sel = v.get("citizenship", "Казахстан")
+    opts = "".join(
+        f'<option value="{c}"{" selected" if c == cit_sel else ""}>{c}</option>'
+        for c in CITIZENSHIP_OPTIONS
+    )
+    err = f'<div class="warning-banner">Заполни обязательные поля: {html.escape(error)}</div>' if error else ""
+    return f"""
+<h1>Новый сотрудник</h1>
+<section class="card-form">
+{err}
+<form method="post" action="/employees/new">
+
+<fieldset>
+<legend>ФИО (обязательно)</legend>
+<input type="text" name="full_name" value="{html.escape(v.get('full_name',''))}">
+</fieldset>
+
+<fieldset>
+<legend>Гражданство (обязательно)</legend>
+<select name="citizenship">{opts}</select>
+<p class="muted">Категория учёта определяется автоматически: Беларусь — 90 дней, остальные ЕАЭС — 30.</p>
+</fieldset>
+
+<fieldset>
+<legend>Дата рождения (обязательно)</legend>
+<input type="date" name="birth_date" max="{datetime.now(MSK).date().isoformat()}" value="{html.escape(v.get('birth_date',''))}">
+</fieldset>
+
+<fieldset>
+<legend>Паспорт (обязательно)</legend>
+<label>Серия</label>
+<input type="text" name="passport_series" value="{html.escape(v.get('passport_series','ID'))}">
+<label>Номер</label>
+<input type="text" name="passport_number" value="{html.escape(v.get('passport_number',''))}">
+<p class="muted">Для нац. удостоверения РК серия «ID». Для загранпаспорта — впиши свою серию.</p>
+</fieldset>
+
+<fieldset>
+<legend>Дата въезда (необязательно)</legend>
+<input type="date" name="entry_date" max="{datetime.now(MSK).date().isoformat()}" value="{html.escape(v.get('entry_date',''))}">
+<p class="muted">Пусто — если сотрудник ещё не прибыл. Дедлайны начнут считаться после ввода даты въезда.</p>
+</fieldset>
+
+<fieldset>
+<legend>Дата договора (необязательно)</legend>
+<input type="date" name="contract_date" max="{datetime.now(MSK).date().isoformat()}" value="{html.escape(v.get('contract_date',''))}">
+</fieldset>
+
+<fieldset>
+<legend>Телефон (необязательно)</legend>
+<input type="text" name="phone" value="{html.escape(v.get('phone',''))}">
+</fieldset>
+
+<button type="submit">Создать</button>
+</form>
+<p class="muted">Адрес пребывания проставится автоматически (адрес площадки). Согласие на обработку ПД
+подтверждается отдельно в карточке — до этого обязательства не создаются.</p>
+<a class="btn secondary" href="/employees">← Ко всем сотрудникам</a>
+</section>"""
+
+
+@app.get("/employees/new", response_class=HTMLResponse)
+def employee_new_form(request: Request):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    return _render("Новый сотрудник", _new_employee_form_html({}))
+
+
+@app.post("/employees/new")
+def employee_create(
+    request: Request,
+    full_name: str = Form(""),
+    citizenship: str = Form("Казахстан"),
+    birth_date: str = Form(""),
+    passport_series: str = Form("ID"),
+    passport_number: str = Form(""),
+    entry_date: str = Form(""),
+    contract_date: str = Form(""),
+    phone: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    values = {
+        "full_name": full_name, "citizenship": citizenship, "birth_date": birth_date,
+        "passport_series": passport_series, "passport_number": passport_number,
+        "entry_date": entry_date, "contract_date": contract_date, "phone": phone,
+    }
+
+    def _pdate(s):
+        s = (s or "").strip()
+        return date.fromisoformat(s) if s else None
+
+    errors = []
+    fn = full_name.strip()
+    if not fn:
+        errors.append("ФИО")
+    cit = citizenship.strip()
+    if cit not in CITIZENSHIP_OPTIONS:
+        errors.append("гражданство")
+    try:
+        bd = _pdate(birth_date)
+    except ValueError:
+        bd = None
+    if bd is None:
+        errors.append("дата рождения")
+    ps = passport_series.strip()
+    if not ps:
+        errors.append("серия паспорта")
+    pn = passport_number.strip()
+    if not pn:
+        errors.append("номер паспорта")
+
+    # необязательные даты: если введены с ошибкой формата — тоже ошибка
+    ed = cd = None
+    for label, raw, setter in (("дата въезда", entry_date, "ed"), ("дата договора", contract_date, "cd")):
+        try:
+            val = _pdate(raw)
+        except ValueError:
+            errors.append(f"{label} (неверный формат)")
+            val = None
+        if setter == "ed":
+            ed = val
+        else:
+            cd = val
+
+    if errors:
+        return HTMLResponse(_render("Новый сотрудник", _new_employee_form_html(values, ", ".join(errors))))
+
+    emp = Employee(
+        full_name=fn,
+        citizenship=cit,
+        category=_category_for_citizenship(cit),
+        birth_date=bd,
+        passport_series=ps,
+        passport_number=pn,
+        entry_date=ed,
+        contract_date=cd,
+        phone=(phone.strip() or None),
+        address=SITE_ADDRESS,          # адрес площадки по умолчанию
+        # address_since НЕ ставим: первый адрес, не переезд — обязательство регистрации не плодим
+        consent_status=ConsentStatus.DRAFT,  # согласие отдельно; до него obligations не создаются
+        created_by=WEBFORMS_USER,
+        language="ru",
+    )
+    db.add(emp)
+    db.commit()
+    db.refresh(emp)
+    return RedirectResponse(f"/employees/{emp.id}", status_code=303)
 
 
 @app.get("/employees/{employee_id}", response_class=HTMLResponse)
@@ -1195,9 +1364,13 @@ def medical_result(
     result: str = Form(...),
     db: Session = Depends(get_db),
 ):
-    """Симметрично /medical_exam_result в bot.py: при 'failed' статус Obligation НЕ меняется
-    (в модели нет поля для причины отказа, дедлайн должен остаться активным) — см. комментарий
-    в _handle_medical_exam_result в bot.py, это не упрощение, а то же самое решение."""
+    """result='done': медосмотр пройден — направление -> COMPLETED, обязательство -> DONE.
+    result='failed': ВРЕМЕННОЕ тестовое поведение — направление УДАЛЯЕТСЯ, сотрудник
+    возвращается в очередь на выписку, обязательство остаётся PENDING (дедлайн жив).
+    ВНИМАНИЕ: это РАСХОДИТСЯ с bot.py (_handle_medical_exam_result, где 'failed' лишь
+    оставляет статус без изменений). Расхождение осознанное и временное — позже 'failed'
+    заменяется на статус ExamStatus.CANCELLED с сохранением истории, и обе точки (bot.py и
+    webforms.py) снова синхронизируются. См. отложенную задачу по полноценной истории."""
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
 
