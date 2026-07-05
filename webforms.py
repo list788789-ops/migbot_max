@@ -227,6 +227,12 @@ section{{background:#fff;border:1px solid var(--line);border-radius:16px;padding
 a.btn,button{{display:inline-block;background:var(--accent);color:#fff;text-decoration:none;padding:14px 20px;min-height:48px;line-height:20px;border-radius:12px;border:none;font-size:16px;font-family:var(--sans);font-weight:600;margin:8px 8px 0 0;cursor:pointer}}
 a.btn.secondary,button.secondary{{background:#fff;color:var(--accent-ink);border:1px solid var(--accent)}}
 input[type=date],input[type=text],input[type=password]{{width:100%;padding:12px;font-size:16px;font-family:inherit;border:1px solid #d9dde3;border-radius:12px;margin:6px 0 12px;background:#fff;color:var(--ink)}}
+.field-help{{margin:2px 0 8px}}
+.field-help summary{{list-style:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;color:var(--accent-ink);font-size:13px;font-weight:600}}
+.field-help summary::-webkit-details-marker{{display:none}}
+.field-help .i{{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;border:1.5px solid var(--accent);color:var(--accent-ink);font-size:12px;font-style:italic;font-weight:700;line-height:1}}
+.field-help p{{margin:6px 0 0;color:var(--sub);font-size:13px;font-weight:400;line-height:1.4}}
+.btn-full{{width:100%;text-align:center}}
 input:focus{{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px #4a90e222}}
 label{{font-size:13px;color:var(--sub)}}
 .badge{{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:600;margin:2px 4px 2px 0}}
@@ -743,6 +749,15 @@ def employee_create(
 
 
 @app.get("/employees/{employee_id}", response_class=HTMLResponse)
+def _help(text: str) -> str:
+    """Значок-справка (i) с раскрытием по тапу. Надёжно на мобильном (нативный <details>,
+    без JS и без title, который на телефоне не показывается)."""
+    return (
+        '<details class="field-help"><summary><span class="i">i</span> справка</summary>'
+        f'<p>{html.escape(text)}</p></details>'
+    )
+
+
 def employee_card(employee_id: str, request: Request, db: Session = Depends(get_db)):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
@@ -752,6 +767,44 @@ def employee_card(employee_id: str, request: Request, db: Session = Depends(get_
         raise HTTPException(404, "Сотрудник не найден")
 
     today_s = datetime.now(MSK).date().isoformat()
+
+    # Тексты справок у полей карточки (значок i с раскрытием). Коротко: что это и что делает.
+    help_entry = _help(
+        "Дата въезда в РФ по миграционной карте/штампу. От неё считаются сроки: регистрация "
+        "(30 дней), медосмотр (30 дней), дактилоскопия (30 дней). Пусто — сотрудник ещё не "
+        "прибыл, сроки не идут."
+    )
+    help_dact = _help(
+        "Дата прохождения дактилоскопии и фотографирования («грин карта»). Заполнение закрывает "
+        "обязанность. Пусто — обязанность горит от даты въезда + 30 дней. Изменение потребует "
+        "подтверждения (закроет обязательство)."
+    )
+    help_country = _help(
+        "Государство, из которого сотрудник въехал в РФ. Информационное поле, на сроки не влияет."
+    )
+    help_address = _help(
+        "Фактическое место пребывания. Смена адреса на другой создаёт новое обязательство по "
+        "постановке на учёт (срок — как при первичном въезде). Первый ввод адреса обязательство "
+        "не создаёт. «Дата, с которой действует адрес» нужна только при смене."
+    )
+    help_contract_date = _help(
+        "Дата заключения трудового договора. Создаёт обязательства: уведомление МВД (3 рабочих "
+        "дня) и ЕФС-1 в СФР (1 рабочий день). Обычно проставляется автоматически при заключении "
+        "договора ниже, но можно ввести вручную."
+    )
+    help_contract = _help(
+        "Заключение проставит дату договора в карточку и создаст обязательства (уведомление МВД, "
+        "ЕФС-1). Скачается .docx с реквизитами ООО «ТРЕСТСТРОЙМОНТАЖ». Номер договора — из "
+        "табельного. «Кем/когда выдан паспорт» в документе — прочерк, заполняется вручную."
+    )
+    help_position = _help(
+        "Должность работника для договора. Идёт в документ как есть, не проверяется. По умолчанию "
+        "«Монтажник» — измените под конкретного работника."
+    )
+    help_salary = _help(
+        "Оклад в рублях (только оклад, без районного коэффициента — он добавляется в договоре "
+        "отдельно, 1,500). Идёт в документ как есть, не проверяется."
+    )
 
     # Блок трудового договора. Без табельного номера генерация заблокирована — иначе номер
     # договора соберётся как "БК-ПСМ-" без хвоста. Кнопка неактивна, показываем причину.
@@ -763,19 +816,33 @@ def employee_card(employee_id: str, request: Request, db: Session = Depends(get_
         )
     else:
         _contract_no = CONTRACT_NUMBER_PREFIX + emp.tab_number.strip()
+        # Кнопка отмены — только если договор уже заключён (стоит дата). Отмена откатывает
+        # contract_date и снимает НЕ выполненные обязательства от договора (МВД/ЕФС-1);
+        # выполненные (DONE) сохраняются как след исполнения.
+        if emp.contract_date is not None:
+            _cancel = f'''
+<p class="muted">Договор заключён {emp.contract_date.strftime("%d.%m.%Y")}.</p>
+<form method="post" action="/employees/{emp.id}/labor_contract/cancel"
+onsubmit="return confirm(&#39;Отменить договор? Дата договора будет снята, а незакрытые обязательства (уведомление МВД, ЕФС-1) удалены. Выполненные останутся.&#39;)">
+<button type="submit" class="secondary btn-full">Отменить договор</button>
+</form>'''
+        else:
+            _cancel = ""
         contract_block = f"""
-<p class="muted">Номер договора: {_contract_no}. Дата по умолчанию — сегодня; можно изменить.
-Заключение проставит дату договора в карточку и создаст обязательства (уведомление МВД, ЕФС-1).
-Должность и оклад заполняются здесь и в документ идут как есть (не проверяются).</p>
+<p class="muted">Номер договора: {_contract_no}. Дата по умолчанию — сегодня; можно изменить.</p>
+{help_contract}
 <form method="post" action="/employees/{emp.id}/labor_contract">
 <label>Должность</label>
 <input type="text" name="position" value="Монтажник">
+{help_position}
 <label>Оклад (руб.)</label>
 <input type="text" name="salary" value="30000">
+{help_salary}
 <label>Дата договора</label>
 <input type="date" name="contract_date" max="{today_s}" value="{today_s}">
-<button type="submit">Заключить трудовой договор (скачать .docx)</button>
-</form>"""
+<button type="submit" class="btn-full">Заключить трудовой договор (скачать .docx)</button>
+</form>
+{_cancel}"""
 
     if emp.consent_status == ConsentStatus.CONFIRMED:
         consent_block = '<p><span class="badge green">Согласие подтверждено</span></p>'
@@ -799,20 +866,21 @@ def employee_card(employee_id: str, request: Request, db: Session = Depends(get_
 <legend>Дата въезда</legend>
 <input type="date" name="entry_date" max="{today_s}"
 value="{emp.entry_date.isoformat() if emp.entry_date else ''}">
+{help_entry}
 </fieldset>
 
 <fieldset>
 <legend>Дактилоскопия («грин карта»)</legend>
-<p class="muted">Дата прохождения. Заполнение закрывает обязанность. Пусто — обязанность
-горит от даты въезда + 30 дней.</p>
 <input type="date" name="dactyloscopy_date" max="{today_s}"
 data-orig="{emp.dactyloscopy_date.isoformat() if emp.dactyloscopy_date else ''}"
 value="{emp.dactyloscopy_date.isoformat() if emp.dactyloscopy_date else ''}">
+{help_dact}
 </fieldset>
 
 <fieldset>
 <legend>Место въезда</legend>
 <input type="text" name="entry_country" value="{emp.entry_country or ''}">
+{help_country}
 </fieldset>
 
 <fieldset>
@@ -822,16 +890,17 @@ value="{emp.dactyloscopy_date.isoformat() if emp.dactyloscopy_date else ''}">
 <input type="text" name="address" data-orig="{emp.address or ''}" value="{emp.address or ''}">
 <label>Дата, с которой действует этот адрес</label>
 <input type="date" name="address_since" max="{today_s}" value="{today_s}">
-<p class="muted">Смена адреса создаёт новое обязательство по регистрации. Первый ввод — нет.</p>
+{help_address}
 </fieldset>
 
 <fieldset>
 <legend>Дата договора</legend>
 <input type="date" name="contract_date" max="{today_s}"
 value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
+{help_contract_date}
 </fieldset>
 
-<button type="submit">Сохранить</button>
+<button type="submit" class="btn-full">Сохранить</button>
 </form>
 
 <fieldset>
@@ -1383,6 +1452,41 @@ def employee_labor_contract(
 
     filename = f"Трудовой_договор_{emp.full_name.replace(' ', '_')}.docx"
     return FileResponse(path, filename=filename)
+
+
+@app.post("/employees/{employee_id}/labor_contract/cancel")
+def employee_labor_contract_cancel(
+    employee_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Отмена договора: откатывает contract_date в NULL и снимает НЕ выполненные обязательства,
+    порождённые договором (CONTRACT_NOTICE — уведомление МВД, EFS1_REPORT — ЕФС-1). Выполненные
+    (DONE) НЕ трогаются — они след того, что документы подавались в срок, стирать нельзя.
+    Само поле contract_date общее с ручным вводом в карточке, отмена его тоже обнулит."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    emp.contract_date = None
+
+    # снять только PENDING обязательства от договора; DONE оставить
+    contract_types = (ObligationType.CONTRACT_NOTICE, ObligationType.EFS1_REPORT)
+    obs = db.scalars(
+        select(Obligation)
+        .where(Obligation.employee_id == emp.id)
+        .where(Obligation.type.in_(contract_types))
+        .where(Obligation.is_current == True)  # noqa: E712
+        .where(Obligation.status == ObligationStatus.PENDING)
+    ).all()
+    for o in obs:
+        db.delete(o)
+
+    db.commit()
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
 
 
 def _render_referral_preview(emp: Employee, obligation_id: str, missing_fields: list[str] | None = None) -> str:
