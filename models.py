@@ -166,6 +166,13 @@ class Employee(Base):
     #   ALTER TABLE employees ADD COLUMN dactyloscopy_date DATE;
     dactyloscopy_date: Mapped[date | None] = mapped_column(Date, nullable=True)
 
+    # Табельный номер (2026-07). Присваивается работнику при трудоустройстве, ведётся во
+    # внешнем табеле. Идёт в номер трудового договора (формат "БК-ПСМ-{tab_number}").
+    # Заполняется разовым SQL-импортом из табеля по ФИО; у новых — вручную по мере оформления.
+    # На боевой БД добавить колонку вручную (create_all не меняет существующие таблицы):
+    #   ALTER TABLE employees ADD COLUMN tab_number VARCHAR;
+    tab_number: Mapped[str | None] = mapped_column(String, nullable=True)
+
     created_by: Mapped[str | None] = mapped_column(String, nullable=True)  # кто завёл (кадровик/прораб)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
