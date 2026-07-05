@@ -749,7 +749,6 @@ def employee_create(
     return RedirectResponse(f"/employees/{emp.id}", status_code=303)
 
 
-@app.get("/employees/{employee_id}", response_class=HTMLResponse)
 def _help(text: str) -> str:
     """Значок-справка (i) с раскрытием по тапу. Надёжно на мобильном (нативный <details>,
     без JS и без title, который на телефоне не показывается)."""
@@ -759,6 +758,7 @@ def _help(text: str) -> str:
     )
 
 
+@app.get("/employees/{employee_id}", response_class=HTMLResponse)
 def employee_card(employee_id: str, request: Request, db: Session = Depends(get_db)):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
@@ -813,9 +813,15 @@ def employee_card(employee_id: str, request: Request, db: Session = Depends(get_
         "заново НЕ требуются. Пустой статус блокирует создание обязательств."
     )
 
-    # Блок трудового договора. Без табельного номера генерация заблокирована — иначе номер
-    # договора соберётся как "БК-ПСМ-" без хвоста. Кнопка неактивна, показываем причину.
-    if not (emp.tab_number or "").strip():
+    # Блок трудового договора. Предусловия: (1) задан статус учёта — от него зависят
+    # обязательства, договор без статуса заключать нельзя; (2) есть табельный номер — иначе
+    # номер договора соберётся как "БК-ПСМ-" без хвоста. Проверяем статус первым.
+    if emp.registration_status is None:
+        contract_block = (
+            '<p class="muted">Нельзя заключить договор: не задан статус миграционного учёта. '
+            'Сначала выберите статус выше — от него зависит расчёт обязательств.</p>'
+        )
+    elif not (emp.tab_number or "").strip():
         contract_block = (
             '<p class="muted">Нельзя заключить договор: у сотрудника нет табельного номера. '
             'Он идёт в номер договора (' + CONTRACT_NUMBER_PREFIX + '{таб}). '
@@ -1473,6 +1479,8 @@ def employee_labor_contract(
     if emp is None:
         raise HTTPException(404, "Сотрудник не найден")
 
+    if emp.registration_status is None:
+        raise HTTPException(400, "Не задан статус миграционного учёта — сначала выберите статус.")
     if not (emp.tab_number or "").strip():
         raise HTTPException(400, "У сотрудника нет табельного номера — номер договора собрать нельзя.")
 
