@@ -16,18 +16,22 @@
 либо periodic job), спроектировать отдельно.
 
 2026-07: добавлено ВТОРОЕ правило REGISTRATION с trigger_field="address_since". Смена
-места пребывания в России — отдельное юридическое событие, а не только первичный въезд:
-миграционный учёт аннулируется при обращении о постановке на учёт по новому месту
-пребывания (109-ФЗ), и процедура/срок те же, что при первичном въезде (п.6 ст.97 Договора
-о ЕАЭС). Оба правила одного типа (entry_date И address_since) намеренно живут в одном
-списке — create_obligations_for_employee в obligations.py дедуплицирует и версионирует
-по (employee_id, type, trigger_date), а не по правилу, так что наличие двух правил одного
-типа не создаёт конфликтов. MEDICAL_EXAM НЕ дублируется на address_since — медосмотр
-привязан к факту въезда, не к месту пребывания, смена адреса его не ретриггерит.
+места пребывания в России — отдельное юридическое событие. ИСПРАВЛЕНО (2026-07): срок
+переезда НЕ равен первичному въезду. Льгота ЕАЭС (30 суток, п.6 ст.97 Договора) действует
+ТОЛЬКО на первичный въезд; переезд внутри РФ — 7 рабочих дней независимо от гражданства
+(п.3.1 ст.20 №109-ФЗ), а при заселении на вахту/в общежитие — 1 рабочий день с прибытия.
+Площадка Белокаменка = вахта, поэтому у EAEU здесь стоит 1 рабочий день. Оба правила одного
+типа (entry_date И address_since) намеренно живут в одном списке — create_obligations_for_employee
+в obligations.py дедуплицирует и версионирует по (employee_id, type, trigger_date), а не по
+правилу, так что наличие двух правил одного типа не создаёт конфликтов. MEDICAL_EXAM и
+DACTYLOSCOPY НЕ дублируются на address_since — они привязаны к факту въезда, не к месту
+пребывания, смена адреса их не ретриггерит.
 
-[Вероятно] 90-дневный срок для Белоруссии при смене адреса — расширение по аналогии с
-первичным въездом, а не отдельно подтверждённое источником правило для этого конкретного
-случая. Перепроверить у юриста перед продакшеном, как и остальные сроки ниже.
+ИСПРАВЛЕНО (2026-07): у Белоруссии address_since тоже была ошибка — стояло 90 календарных
+по аналогии с въездом. Переезд по РФ — 7 рабочих дней независимо от гражданства (то же
+109-ФЗ). Заменено на 7 рабочих. Вахтовое правило 1 дня на Белоруссию НЕ распространяю —
+это специфика площадки на ЕАЭС-казахах, отдельного основания для белорусов нет. Категория
+не используется, но раз правило есть — оно должно быть верным, а не миной на будущее.
 
 Источники на момент составления (проверять перед продакшеном у юриста):
 - ЕАЭС: 30 суток (календарных) с даты въезда — п.6 ст.97 Договора о ЕАЭС от 29.05.2014
@@ -35,14 +39,22 @@
 - Медосвидетельствование: справка нужна, если с даты въезда прошло больше 30 календарных дней
 - ЕФС-1: не позднее следующего рабочего дня после приказа о приёме/даты договора —
   пп.2 п.5 ст.11 ФЗ №27-ФЗ "О персонифицированном учёте"
-- Смена места пребывания = новая постановка на учёт, тот же срок, что при въезде — 109-ФЗ,
-  see комментарий выше
+- Смена места пребывания = новая постановка на учёт. Срок НЕ равен въезду: 7 рабочих дней
+  (п.3.1 ст.20 №109-ФЗ), для вахты/общежития — 1 рабочий день. Льгота ЕАЭС только на въезд.
+- Дактилоскопия + фотографирование: разовая, 30 календарных дней с даты въезда —
+  п.13 ст.5 №115-ФЗ (Информация МВД от 20.05.2025). Карта на 10 лет, ежегодного повтора нет.
 """
 
 from models import Category, DeadlineUnit, ObligationType
 
-# category -> list of (obligation_type, trigger_field, deadline_value, deadline_unit)
+# category -> list of (obligation_type, trigger_field, deadline_value, deadline_unit, lead_days)
 # trigger_field — какое поле employee считать точкой отсчёта
+# lead_days — за сколько дней до дедлайна чип желтеет и уходит проактивное уведомление.
+#   ОДНО число и для чипа, и для крона (не разъезжаются). Для правил в РАБОЧИХ днях
+#   (переезд/уведомление/ЕФС-1) обязанность born-amber: жёлтая с создания независимо от
+#   lead_days — их окно короче любого порога, а раскладка 'дней до' над выходными ненадёжна.
+#   Числовой lead_days содержателен только для 30-дневных календарных (7/14/14).
+#   Порог берётся из этих же правил через lead_days_for() — один источник со сроком.
 DEADLINE_RULES: dict[Category, list[dict]] = {
     Category.EAEU: [
         {
@@ -50,30 +62,48 @@ DEADLINE_RULES: dict[Category, list[dict]] = {
             "trigger_field": "entry_date",
             "deadline_value": 30,
             "deadline_unit": DeadlineUnit.CALENDAR_DAY,
+            "lead_days": 7,
         },
         {
+            # Смена места пребывания. НЕ льгота ЕАЭС (она только на первичный въезд).
+            # Вахта (Белокаменка) = 1 рабочий день с прибытия. Born-amber: жёлтая с создания.
             "type": ObligationType.REGISTRATION,
             "trigger_field": "address_since",
-            "deadline_value": 30,
-            "deadline_unit": DeadlineUnit.CALENDAR_DAY,
+            "deadline_value": 1,
+            "deadline_unit": DeadlineUnit.WORKING_DAY,
+            "lead_days": 1,
         },
         {
             "type": ObligationType.CONTRACT_NOTICE,
             "trigger_field": "contract_date",
             "deadline_value": 3,
             "deadline_unit": DeadlineUnit.WORKING_DAY,
+            "lead_days": 3,
         },
         {
             "type": ObligationType.MEDICAL_EXAM,
             "trigger_field": "entry_date",
             "deadline_value": 30,
             "deadline_unit": DeadlineUnit.CALENDAR_DAY,
+            "lead_days": 14,
         },
         {
             "type": ObligationType.EFS1_REPORT,
             "trigger_field": "contract_date",
             "deadline_value": 1,
             "deadline_unit": DeadlineUnit.WORKING_DAY,
+            "lead_days": 1,
+        },
+        {
+            # Дактилоскопия + фотографирование ("грин карта"). Разовая, 30 календарных дней
+            # с даты въезда (п.13 ст.5 №115-ФЗ) — тот же триггер и срок, что медосмотр.
+            # Закрывается внесением employee.dactyloscopy_date (webforms переводит в DONE).
+            # НЕ годичная: карта на 10 лет, ежегодного пересчёта быть не должно.
+            "type": ObligationType.DACTYLOSCOPY,
+            "trigger_field": "entry_date",
+            "deadline_value": 30,
+            "deadline_unit": DeadlineUnit.CALENDAR_DAY,
+            "lead_days": 14,
         },
     ],
     Category.BELARUS: [
@@ -82,29 +112,54 @@ DEADLINE_RULES: dict[Category, list[dict]] = {
             "trigger_field": "entry_date",
             "deadline_value": 90,
             "deadline_unit": DeadlineUnit.CALENDAR_DAY,
+            "lead_days": 7,
         },
         {
+            # ИСПРАВЛЕНО с 90 календарных: переезд по РФ — 7 рабочих дней независимо от
+            # гражданства (п.3.1 ст.20 №109-ФЗ). Вахтовое правило 1 дня сюда не переносим.
             "type": ObligationType.REGISTRATION,
             "trigger_field": "address_since",
-            "deadline_value": 90,
-            "deadline_unit": DeadlineUnit.CALENDAR_DAY,
+            "deadline_value": 7,
+            "deadline_unit": DeadlineUnit.WORKING_DAY,
+            "lead_days": 7,
         },
         {
             "type": ObligationType.CONTRACT_NOTICE,
             "trigger_field": "contract_date",
             "deadline_value": 3,
             "deadline_unit": DeadlineUnit.WORKING_DAY,
+            "lead_days": 3,
         },
         {
             "type": ObligationType.EFS1_REPORT,
             "trigger_field": "contract_date",
             "deadline_value": 1,
             "deadline_unit": DeadlineUnit.WORKING_DAY,
+            "lead_days": 1,
         },
     ],
     # PATENT, VISA, HQS — намеренно не заполнены. При добавлении первого сотрудника
     # этих категорий рулы нужно проверить у юриста, а не копировать по аналогии с EAEU/BELARUS.
 }
+
+
+def lead_days_for(category, obligation_type, deadline_unit, default: int = 7) -> int:
+    """Порог 'скоро' (жёлтый чип и момент уведомления) для обязанности данного типа.
+    Один источник истины со сроком — берётся из того же правила DEADLINE_RULES.
+
+    Ключ поиска — (type, deadline_unit): в пределах категории он уникален даже для
+    REGISTRATION, у которой два правила (entry_date=CALENDAR_DAY, address_since=WORKING_DAY).
+
+    Короткоплечие правила (WORKING_DAY) считаются born-amber на стороне webforms
+    (жёлтая с создания), поэтому их числовой lead_days номинален. Для 30-дневных
+    календарных (регистрация 7, медосмотр/дактилоскопия 14) lead_days содержателен.
+
+    default возвращается, если правило не найдено — например, REGISTRATION_RENEWAL
+    создаётся отдельным механизмом и в DEADLINE_RULES отсутствует."""
+    for rule in DEADLINE_RULES.get(category, []):
+        if rule["type"] == obligation_type and rule["deadline_unit"] == deadline_unit:
+            return rule.get("lead_days", default)
+    return default
 
 
 def working_days_add(start, days: int):
