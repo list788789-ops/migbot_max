@@ -113,44 +113,39 @@ PAGE_HEAD = """<!doctype html>
 <title>{title}</title>
 <style>
 *{{box-sizing:border-box}}
-body{{font-family:Georgia,'Times New Roman',serif;max-width:720px;margin:0 auto;
-padding:16px;background:#efe4c8;color:#3a2a1a;position:relative}}
-body::before{{content:"";position:fixed;inset:0;pointer-events:none;z-index:-1;
-background-color:#efe4c8;
-background-image:repeating-linear-gradient(0deg,rgba(60,40,10,.03) 0px,rgba(60,40,10,.03) 1px,
-transparent 1px,transparent 3px)}}
-header.org{{background:#7a2e22;color:#fff8ef;border-radius:4px;padding:16px 18px;margin-bottom:16px;
-border:1px solid #5c2118}}
-header.org .org-name{{font-size:13px;opacity:.85;letter-spacing:.03em}}
+body{{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:720px;margin:0 auto;
+padding:16px;background:#f2f2f2;color:#2b2b2b}}
+header.org{{background:#0072bc;color:#ffffff;border-radius:2px;padding:16px 18px;margin-bottom:16px;
+border-left:6px solid #f7a600}}
+header.org .org-name{{font-size:13px;opacity:.9;letter-spacing:.02em}}
 header.org .page-title{{font-size:20px;font-weight:600;margin-top:2px}}
-h1{{font-size:20px;color:#3a2a1a}}
-h2{{font-size:14px;margin:0 0 10px 0;color:#7a2e22;text-transform:uppercase;letter-spacing:.06em;
-border-bottom:1px solid #d8c69a;padding-bottom:6px}}
-section{{background:#fffdf6;border-radius:6px;padding:14px;margin-bottom:14px;
-border:1px solid #d8c69a;box-shadow:0 2px 6px rgba(60,40,10,.10)}}
-.card{{background:#f7f0dd;border-radius:5px;padding:12px;margin-bottom:8px;
-border:1px solid #e2d3ac;font-family:-apple-system,Segoe UI,Roboto,sans-serif;font-weight:600;
-color:#2a1d10}}
+h1{{font-size:20px;color:#2b2b2b;font-weight:600}}
+h2{{font-size:13px;margin:0 0 10px 0;color:#0072bc;text-transform:uppercase;letter-spacing:.05em;
+border-bottom:2px solid #f7a600;padding-bottom:6px;font-weight:700}}
+section{{background:#ffffff;border-radius:2px;padding:14px;margin-bottom:14px;
+border:1px solid #d5d5d5}}
+.card{{background:#fafafa;border-radius:2px;padding:12px;margin-bottom:8px;
+border:1px solid #e0e0e0;border-left:3px solid #f7a600;font-weight:600;color:#2b2b2b}}
 .card:last-child{{margin-bottom:0}}
-.card .muted-line{{font-family:inherit;font-weight:400;color:#8a7355}}
-a.btn,button{{display:inline-block;background:#7a2e22;color:#fff8ef;text-decoration:none;
-padding:14px 20px;min-height:48px;line-height:20px;border-radius:6px;border:none;font-size:16px;
-font-family:Georgia,serif;letter-spacing:.02em;margin-top:8px;margin-right:8px;cursor:pointer}}
-a.btn.secondary,button.secondary{{background:transparent;color:#7a2e22;border:2px solid #7a2e22}}
+.card .muted-line{{font-weight:400;color:#6b6b6b}}
+a.btn,button{{display:inline-block;background:#f7a600;color:#1a1a1a;text-decoration:none;
+padding:14px 20px;min-height:48px;line-height:20px;border-radius:2px;border:none;font-size:16px;
+font-family:inherit;font-weight:600;letter-spacing:.01em;margin-top:8px;margin-right:8px;cursor:pointer}}
+a.btn.secondary,button.secondary{{background:#ffffff;color:#0072bc;border:2px solid #0072bc}}
 input[type=date],input[type=text],input[type=password]{{width:100%;padding:12px;
-font-size:16px;font-family:-apple-system,Segoe UI,Roboto,sans-serif;border:1px solid #c9b48a;
-border-radius:6px;margin:6px 0 12px 0;background:#fffef9;color:#2a1d10}}
-.badge{{display:inline-block;padding:3px 10px;border-radius:10px;font-size:12px;color:#fff8ef;
-font-family:-apple-system,Segoe UI,Roboto,sans-serif;font-weight:600;margin:2px 4px 2px 0}}
-.badge.red{{background:#7a2e22}} .badge.orange{{background:#b8862b}} .badge.green{{background:#4a7a3a}}
-.muted{{color:#8a7355;font-size:13px;font-family:-apple-system,Segoe UI,Roboto,sans-serif}}
-nav{{margin-bottom:16px}}
-nav a{{color:#7a2e22;text-decoration:none;margin-right:16px;font-size:14px;padding:6px 0;
+font-size:16px;font-family:inherit;border:1px solid #b8b8b8;border-radius:2px;
+margin:6px 0 12px 0;background:#ffffff;color:#2b2b2b}}
+.badge{{display:inline-block;padding:3px 10px;border-radius:2px;font-size:12px;color:#ffffff;
+font-weight:600;margin:2px 4px 2px 0}}
+.badge.red{{background:#c0392b}} .badge.orange{{background:#f7a600;color:#1a1a1a}} .badge.green{{background:#2e7d32}}
+.muted{{color:#6b6b6b;font-size:13px}}
+nav{{margin-bottom:16px;background:#ffffff;border:1px solid #d5d5d5;padding:6px 10px}}
+nav a{{color:#0072bc;text-decoration:none;margin-right:16px;font-size:14px;padding:6px 0;
 display:inline-block;font-weight:600}}
 form.inline{{display:inline}}
-fieldset{{border:1px solid #e2d3ac;border-radius:6px;padding:12px;margin-bottom:14px}}
-fieldset legend{{font-size:13px;color:#7a2e22;text-transform:uppercase;letter-spacing:.05em;
-font-weight:600;padding:0 6px}}
+fieldset{{border:1px solid #d5d5d5;border-radius:2px;padding:12px;margin-bottom:14px}}
+fieldset legend{{font-size:12px;color:#0072bc;text-transform:uppercase;letter-spacing:.04em;
+font-weight:700;padding:0 6px}}
 
 @media (min-width:760px){{
   body{{max-width:1080px;padding:24px 32px}}
@@ -193,45 +188,19 @@ LOGIN_HEAD = """<!doctype html>
 <style>
 *{{box-sizing:border-box}}
 body.login-page{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
-background:radial-gradient(ellipse at center,#f4ecd8 0%,#e4d5b0 55%,#cdb98a 100%);
-font-family:Georgia,'Times New Roman',serif;position:relative;overflow:hidden;padding:16px}}
-body.login-page::before{{content:"";position:absolute;inset:0;pointer-events:none;
-background-image:repeating-linear-gradient(0deg,rgba(60,40,10,.035) 0px,rgba(60,40,10,.035) 1px,
-transparent 1px,transparent 3px)}}
-.vintage-bg{{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
-opacity:.32;transform:rotate(-9deg);pointer-events:none}}
-.vintage-bg svg{{width:320px;height:320px}}
-.login-card{{position:relative;z-index:1;background:#fffdf6;border:1px solid #c9b48a;
-border-radius:4px;padding:28px 24px;width:280px;box-shadow:0 8px 28px rgba(60,40,10,.28)}}
-.login-card h1{{font-size:19px;margin:0 0 2px 0;color:#3a2a1a}}
-.login-card .subtitle{{font-size:11px;color:#8a7355;margin:0 0 18px 0;letter-spacing:.06em;
-text-transform:uppercase}}
-.login-card input{{width:100%;padding:10px;font-size:16px;border:1px solid #c9b48a;border-radius:4px;
-margin:6px 0 12px 0;background:#fffef9;font-family:inherit}}
-.login-card button{{width:100%;background:#7a2e22;color:#fff8ef;border:none;padding:15px;
-min-height:50px;border-radius:6px;font-size:16px;cursor:pointer;letter-spacing:.03em;font-family:inherit}}
-.login-card a.btn{{display:inline-block;margin-top:12px;color:#7a2e22;text-decoration:underline;
+background:#f2f2f2;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;padding:16px}}
+.login-card{{background:#ffffff;border:1px solid #d5d5d5;border-top:4px solid #f7a600;
+border-radius:2px;padding:28px 24px;width:280px}}
+.login-card h1{{font-size:19px;margin:0 0 2px 0;color:#0072bc;font-weight:700}}
+.login-card .subtitle{{font-size:12px;color:#6b6b6b;margin:0 0 18px 0}}
+.login-card input{{width:100%;padding:12px;font-size:16px;border:1px solid #b8b8b8;border-radius:2px;
+margin:6px 0 12px 0;background:#ffffff;font-family:inherit}}
+.login-card button{{width:100%;background:#f7a600;color:#1a1a1a;border:none;padding:15px;
+min-height:50px;border-radius:2px;font-size:16px;font-weight:600;cursor:pointer;font-family:inherit}}
+.login-card a.btn{{display:inline-block;margin-top:12px;color:#0072bc;text-decoration:underline;
 font-size:13px}}
 </style></head>
 <body class="login-page">
-<div class="vintage-bg">
-<svg viewBox="0 0 400 400">
-<defs>
-<path id="stampCircle" d="M 200,200 m -150,0 a 150,150 0 1,1 300,0 a 150,150 0 1,1 -300,0" />
-</defs>
-<circle cx="200" cy="200" r="150" fill="none" stroke="#7a2e22" stroke-width="4"/>
-<circle cx="200" cy="200" r="130" fill="none" stroke="#7a2e22" stroke-width="2"/>
-<text font-size="19" fill="#7a2e22" letter-spacing="6">
-<textPath href="#stampCircle" startOffset="1%">МИГРАЦИОННЫЙ УЧЁТ • БЕЛОКАМЕННАЯ • MURMANSK •</textPath>
-</text>
-<g stroke="#7a2e22" fill="none" stroke-width="3">
-<line x1="200" y1="118" x2="200" y2="282"/>
-<line x1="118" y1="200" x2="282" y2="200"/>
-<circle cx="200" cy="200" r="42"/>
-<circle cx="200" cy="200" r="6" fill="#7a2e22"/>
-</g>
-</svg>
-</div>
 """
 
 
@@ -711,9 +680,13 @@ def medical_refer(
     obligation_id: str = Form(...),
     db: Session = Depends(get_db),
 ):
-    """Выписывает направление: генерирует docx (та же генерация, что /send_medical_referral
-    в bot.py) и заводит запись Referral, привязанную к обязательству MEDICAL_EXAM. bot.py
-    сам Referral не создаёт — это новая часть учёта, добавленная здесь."""
+    """Выписывает направление: заводит запись Referral, привязанную к обязательству
+    MEDICAL_EXAM (bot.py сам Referral не создаёт — это новая часть учёта, добавленная
+    здесь), затем показывает HTML-предпросмотр документа с кнопками "Печать" и
+    "Скачать .docx". Сам docx (та же генерация, что /send_medical_referral в bot.py)
+    не отдаётся принудительно как download — на экране браузера его не отрисовать
+    напрямую (нет нативного просмотра .docx), поэтому печать идёт через HTML-версию
+    того же содержания (window.print()), а .docx доступен отдельной кнопкой на скачивание."""
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
 
@@ -726,10 +699,11 @@ def medical_refer(
         raise HTTPException(404, "Обязательство не найдено или не принадлежит этому сотруднику")
 
     try:
-        path = generate_medical_referral_docx(emp)
+        # Генерируем один раз здесь ТОЛЬКО ради проверки обязательных полей
+        # (_require_fields в document_templates.py) — если чего-то не хватает,
+        # ValueError всплывёт до создания записи Referral, а не после.
+        generate_medical_referral_docx(emp)
     except ValueError as e:
-        # ValueError — сигнал от _require_fields в document_templates.py о конкретных
-        # незаполненных полях, а не непредвиденная ошибка. Показываем текст как есть.
         raise HTTPException(400, str(e))
     except Exception:
         raise HTTPException(500, "Не удалось сгенерировать направление. Проверьте логи сервиса.")
@@ -744,8 +718,100 @@ def medical_refer(
     db.add(referral)
     db.commit()
 
+    return HTMLResponse(_render_referral_preview(emp, obligation_id))
+
+
+@app.get("/medical/{employee_id}/referral/{obligation_id}/download")
+def medical_referral_download(
+    employee_id: str,
+    obligation_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Отдельный маршрут на скачивание — регенерирует docx по текущим данным сотрудника.
+    Не хранит путь к файлу между запросами (файловая система Railway эфемерна между
+    процессами), поэтому пересоздаёт документ заново при каждом скачивании. Единственный
+    практический нюанс: поле "10. Дата выдачи направления" в документе — дата генерации
+    файла, а не дата исходного нажатия "Выписать направление"; если скачать на следующий
+    день после того, как направление уже выписано, дата в файле сдвинется на сегодня."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    try:
+        path = generate_medical_referral_docx(emp)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception:
+        raise HTTPException(500, "Не удалось сгенерировать направление. Проверьте логи сервиса.")
+
     filename = f"Направление_{emp.full_name.replace(' ', '_')}.docx"
     return FileResponse(path, filename=filename)
+
+
+def _render_referral_preview(emp: Employee, obligation_id: str) -> str:
+    """HTML-версия направления для экрана/печати — содержание зеркалит
+    generate_medical_referral_docx в document_templates.py. Если меняешь текст/поля
+    там — поменяй и здесь, иначе предпросмотр разойдётся с реальным .docx."""
+    birth = emp.birth_date.strftime("%d.%m.%Y") if emp.birth_date else "—"
+    name_parts = emp.full_name.split()
+    surname = name_parts[0] if name_parts else "—"
+    first_name = name_parts[1] if len(name_parts) > 1 else "—"
+    patronymic = name_parts[2] if len(name_parts) > 2 else "—"
+
+    download_url = f"/medical/{emp.id}/referral/{obligation_id}/download"
+
+    body = f"""
+<style>
+@media print {{
+  nav, .no-print {{ display: none !important; }}
+  body {{ background: #fff !important; }}
+  section {{ box-shadow: none !important; border: none !important; }}
+}}
+.referral-doc p {{ margin: 4px 0; }}
+</style>
+
+<h1>Направление на медосмотр</h1>
+
+<div class="no-print" style="margin-bottom:14px">
+<button onclick="window.print()">🖨 Печать</button>
+<a class="btn secondary" href="{download_url}">⬇ Скачать .docx</a>
+<a class="btn secondary" href="/medical">← К медкомиссии</a>
+</div>
+
+<section class="narrow referral-doc">
+<p style="text-align:right">к Договору № {CLINIC_CONTRACT_NUMBER} от «{CLINIC_CONTRACT_DATE}»<br>Приложение № 1</p>
+<p style="text-align:center"><strong>НАПРАВЛЕНИЕ НА МЕДИЦИНСКОЕ ОСВИДЕТЕЛЬСТВОВАНИЕ</strong></p>
+<p>В {REFERRAL_CLINIC_NAME}</p>
+<p class="muted">наименование медицинской организации (МО)</p>
+<p>1. Фамилия {surname}</p>
+<p>Имя {first_name}</p>
+<p>Отчество {patronymic}</p>
+<p>2. Дата рождения (число, месяц, год) {birth}</p>
+<p>3. Адрес (по месту проживания) {emp.address or "—"}</p>
+<p>4. Серия паспорта {emp.passport_series or "—"} Номер паспорта {emp.passport_number or "—"}</p>
+<p>5. Место работы {REFERRAL_PAYER_NAME}</p>
+<p>6. Наименование медицинской услуги (медицинского освидетельствования)</p>
+<p>{MEDICAL_SERVICE_TEXT}</p>
+<p>7. Дата проведения услуги _____________ кабинет N _____ время _____</p>
+<p>8. Полное наименование организации, направившей иностранного гражданина, телефон {PAYER_PHONE}</p>
+<p>{REFERRAL_PAYER_NAME}</p>
+<p>подпись, печать _____________________</p>
+<p>10. Дата выдачи направления {date.today().strftime('%d.%m.%Y')}</p>
+<br>
+<table style="width:100%">
+<tr><td><strong>От Исполнителя:</strong></td><td><strong>От Заказчика:</strong></td></tr>
+<tr><td>{REFERRAL_CLINIC_NAME}</td><td>Индивидуальный предприниматель</td></tr>
+<tr><td>Главный врач</td><td>&nbsp;</td></tr>
+<tr><td>_____________________ {CLINIC_CHIEF_DOCTOR_NAME}<br>м.п.</td>
+<td>_____________________ {PAYER_SIGNATORY_NAME}<br>м.п.</td></tr>
+</table>
+</section>
+"""
+    return _render("Направление на медосмотр", body)
 
 
 @app.post("/medical/{employee_id}/result")
