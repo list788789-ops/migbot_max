@@ -250,10 +250,11 @@ LOGIN_HEAD = """<!doctype html>
 *{box-sizing:border-box}
 body.login-page{margin:0;min-height:100dvh;display:flex;flex-direction:column;justify-content:flex-start;background:url('/login-bg.svg') no-repeat center bottom / cover, #fff;font-family:var(--sans);color:var(--ink)}
 .auth{width:100%;max-width:440px;margin:0 auto;padding:56px 24px 40px}
+.auth-row{background:#fff;border:1px solid #e6e9ee;border-radius:16px;padding:14px;box-shadow:0 6px 24px rgba(20,24,30,.10)}
 .auth h1{font-family:var(--serif);font-weight:700;letter-spacing:-.02em;font-size:clamp(2.25rem,6vw,3.25rem);line-height:1.03;margin:0 0 .3em}
 .auth .subtitle{font-family:var(--serif);font-weight:400;color:var(--sub);font-size:clamp(1.125rem,2.5vw,1.375rem);margin:0 0 1.75rem}
 .auth-row{display:flex;gap:10px;flex-wrap:wrap;align-items:stretch}
-.auth input{flex:1 1 45%;min-width:130px;font-family:var(--sans);font-size:16px;padding:14px 16px;border:1px solid #d9dde3;border-radius:12px;background:#fff;margin:0}
+.auth input{flex:1 1 45%;min-width:130px;font-family:var(--sans);font-size:16px;padding:14px 16px;border:1px solid #b8c0cc;border-radius:12px;background:#fff;margin:0}
 .auth input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px #2f80ed22}
 .auth button{flex:1 1 100%;border:0;border-radius:12px;background:var(--accent);color:#fff;font:16px/1 var(--sans);padding:15px 20px;min-height:50px;cursor:pointer}
 .auth .err{color:#c0392b;font-size:14px;margin:0 0 12px}
@@ -302,7 +303,7 @@ def login_submit(request: Request, username: str = Form(...), password: str = Fo
 
 
 LOGIN_BG_SVG = """<svg viewBox="0 0 430 760" preserveAspectRatio="xMidYMid slice" xmlns="http://www.w3.org/2000/svg">
-<g fill="none" stroke="#dce1e8" stroke-width="1">
+<g fill="none" stroke="#c3ccd6" stroke-width="1">
 <path d="M-40 300 Q215 280 470 300"/><path d="M-40 360 Q215 340 470 360"/>
 <path d="M-40 420 Q215 400 470 420"/><path d="M-40 480 Q215 460 470 480"/>
 <path d="M-40 540 Q215 520 470 540"/><path d="M-40 600 Q215 580 470 600"/>
@@ -310,16 +311,16 @@ LOGIN_BG_SVG = """<svg viewBox="0 0 430 760" preserveAspectRatio="xMidYMid slice
 <path d="M60 760 Q120 500 175 250"/><path d="M150 760 Q180 500 205 250"/>
 <path d="M240 760 Q235 500 235 250"/><path d="M330 760 Q290 500 265 250"/>
 <path d="M420 760 Q350 500 295 250"/></g>
-<g stroke="#c7cfd9" stroke-width="1"><path d="M231 300 L239 300 M231 360 L239 360 M231 420 L239 420 M231 480 L239 480 M231 600 L239 600 M231 660 L239 660 M231 720 L239 720"/></g>
-<g fill="none" stroke="#d3dae2" stroke-width="1">
+<g stroke="#aab4c0" stroke-width="1"><path d="M231 300 L239 300 M231 360 L239 360 M231 420 L239 420 M231 480 L239 480 M231 600 L239 600 M231 660 L239 660 M231 720 L239 720"/></g>
+<g fill="none" stroke="#b7c0cb" stroke-width="1">
 <path d="M120 760 C150 660 120 600 175 545 C215 505 205 460 250 430"/>
 <path d="M170 560 l-6 -4 M158 588 l-6 -4 M150 618 l-6 -4 M146 650 l-6 -4"/></g>
-<g stroke="#c7cfd9" fill="none" stroke-width="1"><path d="M392 300 L392 330 M392 300 L387 309 M392 300 L397 309"/></g>
-<text x="388" y="292" font-family="-apple-system,system-ui,sans-serif" font-size="10" fill="#aeb5be">С</text>
+<g stroke="#aab4c0" fill="none" stroke-width="1"><path d="M392 300 L392 330 M392 300 L387 309 M392 300 L397 309"/></g>
+<text x="388" y="292" font-family="-apple-system,system-ui,sans-serif" font-size="10" fill="#98a2ae">С</text>
 <g stroke="#2f80ed" fill="none" stroke-width="1.4"><circle cx="235" cy="540" r="7"/><path d="M235 522 L235 558 M217 540 L253 540"/></g>
 <circle cx="235" cy="540" r="2.4" fill="#2f80ed"/>
-<text x="248" y="536" font-family="-apple-system,system-ui,sans-serif" font-size="11" fill="#9aa0a8">Белокаменка</text>
-<text x="248" y="551" font-family="-apple-system,system-ui,sans-serif" font-size="10" fill="#b6bcc4">69°14′ N · 33°17′ E</text>
+<text x="248" y="536" font-family="-apple-system,system-ui,sans-serif" font-size="11" fill="#7f8996">Белокаменка</text>
+<text x="248" y="551" font-family="-apple-system,system-ui,sans-serif" font-size="10" fill="#9aa4b0">69°14′ N · 33°17′ E</text>
 </svg>"""
 
 
