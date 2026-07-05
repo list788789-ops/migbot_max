@@ -22,7 +22,7 @@
 import asyncio
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, UTC
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
@@ -179,6 +179,7 @@ def _build_main_menu() -> InlineKeyboardBuilder:
     builder.row(CallbackButton(text="⏳ Без даты въезда", payload="menu:incomplete"))
     builder.row(CallbackButton(text="🗑 Удалить сотрудника (тест)", payload="menu:delete_employee"))
     builder.row(CallbackButton(text="🖊 Ожидают согласия", payload="menu:pending_consent"))
+    builder.row(CallbackButton(text="🗓 Без даты договора", payload="menu:contractdate"))
     return builder
 
 
@@ -218,6 +219,7 @@ PICKER_TITLES = {
     "empdate": "Без даты въезда",
     "delpick": "Выберите сотрудника для удаления (тест, необратимо)",
     "consentpick": "Ожидают согласия",
+    "contractdate": "Без даты договора",
 }
 
 
@@ -235,6 +237,13 @@ def _picker_employees(session: Session, prefix: str) -> list[Employee]:
         return (
             session.query(Employee)
             .filter_by(consent_status=ConsentStatus.DRAFT)
+            .order_by(Employee.full_name)
+            .all()
+        )
+    if prefix == "contractdate":
+        return (
+            session.query(Employee)
+            .filter(Employee.contract_date.is_(None))
             .order_by(Employee.full_name)
             .all()
         )
@@ -327,7 +336,7 @@ async def _execute_consent_confirm_by_button(responder: "_Responder", employee_i
         consent = Consent(
             employee_id=employee.id,
             method=ConsentMethod.BOT_BUTTON,
-            proof=f"button_click:{responder.user_id()}:{datetime.utcnow().isoformat()}",
+            proof=f"button_click:{responder.user_id()}:{datetime.now(UTC).isoformat()}",
             consent_text_version=CONSENT_TEXT_VERSION,
         )
         session.add(consent)
@@ -453,6 +462,27 @@ async def on_callback(event: MessageCallback):
         await responder.send(f"Введите дату въезда для {full_name} в формате ГГГГ-ММ-ДД:")
         return
 
+    if payload == "menu:contractdate":
+        await _deliver_picker(responder, "contractdate")
+        return
+
+    if payload.startswith("contractdate:"):
+        employee_id = payload.split(":", 1)[1]
+        with Session(engine) as session:
+            employee = session.get(Employee, employee_id)
+            if employee is None:
+                await event.answer(notification="Сотрудник не найден.")
+                return
+            full_name = employee.full_name
+
+        _pending_forms[responder.user_id()] = {
+            "state": "awaiting_contract_date_button",
+            "employee_id": employee_id,
+        }
+        await event.message.delete()
+        await responder.send(f"Введите дату договора для {full_name} в формате ГГГГ-ММ-ДД:")
+        return
+
     if payload == "menu:delete_employee":
         await _deliver_picker(responder, "delpick")
         return
@@ -541,6 +571,55 @@ async def _handle_set_entry_date(event: MessageCreated, raw_text: str) -> None:
     await _apply_entry_date(event, employee_id, entry_date)
 
 
+async def _apply_contract_date(event, employee_id: str, contract_date) -> None:
+    """Общая логика установки даты договора — используется и командой /set_contract_date,
+    и сценарием после клика по кнопке в списке 'Без даты договора'. Симметрично
+    _apply_entry_date: контроль и обязательства (contract_notice, efs1_report) зависят
+    от этого поля так же, как registration/medical_exam — от entry_date."""
+    with Session(engine) as session:
+        employee = session.get(Employee, employee_id.strip())
+        if employee is None:
+            await event.reply(text="Сотрудник с таким id не найден.") \
+                if isinstance(event, MessageCallback) else \
+                await event.message.answer("Сотрудник с таким id не найден.")
+            return
+
+        employee.contract_date = contract_date
+        session.add(employee)
+        session.commit()
+        session.refresh(employee)
+
+        if employee.consent_status == ConsentStatus.CONFIRMED:
+            create_obligations_for_employee(session, employee)
+
+        full_name = employee.full_name
+
+    text = f"Дата договора для {full_name} установлена: {contract_date.strftime('%d.%m.%Y')}."
+    if isinstance(event, MessageCallback):
+        await event.reply(text=text)
+    else:
+        await event.message.answer(text)
+
+
+async def _handle_set_contract_date(event: MessageCreated, raw_text: str) -> None:
+    parts = raw_text.split(maxsplit=2)
+    if len(parts) != 3:
+        await event.message.answer(
+            "Формат: /set_contract_date <id> <ГГГГ-ММ-ДД>\n"
+            "id сотрудника смотрите в списке 'Без даты договора'."
+        )
+        return
+
+    _, employee_id, date_s = parts
+    try:
+        contract_date = datetime.strptime(date_s.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        await event.message.answer("Не распознал дату. Формат: ГГГГ-ММ-ДД, например 2026-06-15.")
+        return
+
+    await _apply_contract_date(event, employee_id, contract_date)
+
+
 async def _handle_send_document(event: MessageCreated, raw_text: str, generator_func, doc_label: str) -> None:
     parts = raw_text.split(maxsplit=1)
     if len(parts) != 2:
@@ -583,6 +662,19 @@ async def on_text(event: MessageCreated):
         employee_id = form["employee_id"]
         _pending_forms.pop(user_id, None)
         await _apply_entry_date(event, employee_id, entry_date)
+        return
+
+    if form and form.get("state") == "awaiting_contract_date_button":
+        date_s = event.message.body.text.strip()
+        try:
+            contract_date = datetime.strptime(date_s, "%Y-%m-%d").date()
+        except ValueError:
+            await event.message.answer("Не распознал дату. Формат: ГГГГ-ММ-ДД, например 2026-06-15.")
+            return
+
+        employee_id = form["employee_id"]
+        _pending_forms.pop(user_id, None)
+        await _apply_contract_date(event, employee_id, contract_date)
         return
 
     if form and form.get("state") == "awaiting_employee_data":
@@ -636,6 +728,10 @@ async def on_text(event: MessageCreated):
 
         if raw_text.startswith("/set_entry_date"):
             await _handle_set_entry_date(event, raw_text)
+            return
+
+        if raw_text.startswith("/set_contract_date"):
+            await _handle_set_contract_date(event, raw_text)
             return
 
         if raw_text.startswith("/send_consent_doc"):
