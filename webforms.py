@@ -206,7 +206,7 @@ PAGE_HEAD = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
 <style>
-:root{{--ink:#111214;--sub:#5b626b;--line:#e6e9ee;--line-2:#eef1f4;--accent:#2f80ed;--accent-ink:#1c63c4;
+:root{{--ink:#111214;--sub:#5b626b;--line:#e6e9ee;--line-2:#eef1f4;--accent:#4a90e2;--accent-ink:#2f6fb0;
 --red-bg:#fdecec;--red-ink:#c0392b;--amber-bg:#fdf3e2;--amber-ink:#a5720a;--green-bg:#eaf6f0;--green-ink:#1f7a55;
 --neutral-bg:#eef1f4;--neutral-ink:#55606b;--serif:Georgia,"Times New Roman",serif;
 --sans:-apple-system,Segoe UI,Roboto,Arial,sans-serif}}
@@ -224,7 +224,7 @@ section{{background:#fff;border:1px solid var(--line);border-radius:16px;padding
 a.btn,button{{display:inline-block;background:var(--accent);color:#fff;text-decoration:none;padding:14px 20px;min-height:48px;line-height:20px;border-radius:12px;border:none;font-size:16px;font-family:var(--sans);font-weight:600;margin:8px 8px 0 0;cursor:pointer}}
 a.btn.secondary,button.secondary{{background:#fff;color:var(--accent-ink);border:1px solid var(--accent)}}
 input[type=date],input[type=text],input[type=password]{{width:100%;padding:12px;font-size:16px;font-family:inherit;border:1px solid #d9dde3;border-radius:12px;margin:6px 0 12px;background:#fff;color:var(--ink)}}
-input:focus{{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px #2f80ed22}}
+input:focus{{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px #4a90e222}}
 label{{font-size:13px;color:var(--sub)}}
 .badge{{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:600;margin:2px 4px 2px 0}}
 .badge.red{{background:var(--red-bg);color:var(--red-ink)}}
@@ -276,7 +276,7 @@ LOGIN_HEAD = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Вход</title>
 <style>
-:root{--accent:#2f80ed;--ink:#111214;--sub:#5b626b;--serif:Georgia,"Times New Roman",serif;--sans:-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+:root{--accent:#4a90e2;--ink:#111214;--sub:#5b626b;--serif:Georgia,"Times New Roman",serif;--sans:-apple-system,Segoe UI,Roboto,Arial,sans-serif}
 *{box-sizing:border-box}
 body.login-page{margin:0;min-height:100dvh;display:flex;flex-direction:column;justify-content:flex-start;background:url('/login-bg.svg') no-repeat center bottom / cover, #fff;font-family:var(--sans);color:var(--ink)}
 .auth{width:100%;max-width:440px;margin:0 auto;padding:56px 24px 40px}
@@ -285,7 +285,7 @@ body.login-page{margin:0;min-height:100dvh;display:flex;flex-direction:column;ju
 .auth .subtitle{font-family:var(--serif);font-weight:400;color:var(--sub);font-size:clamp(1.125rem,2.5vw,1.375rem);margin:0 0 1.75rem}
 .auth-row{display:flex;gap:10px;flex-wrap:wrap;align-items:stretch}
 .auth input{flex:1 1 45%;min-width:130px;font-family:var(--sans);font-size:16px;padding:14px 16px;border:1px solid #b8c0cc;border-radius:12px;background:#fff;margin:0}
-.auth input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px #2f80ed22}
+.auth input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px #4a90e222}
 .auth button{flex:1 1 100%;border:0;border-radius:12px;background:var(--accent);color:#fff;font:16px/1 var(--sans);padding:15px 20px;min-height:50px;cursor:pointer}
 .auth .err{color:#c0392b;font-size:14px;margin:0 0 12px}
 .auth a.btn{display:inline-block;margin-top:14px;color:var(--accent);text-decoration:underline;font-size:14px}
@@ -333,7 +333,7 @@ def login_submit(request: Request, username: str = Form(...), password: str = Fo
 
 
 LOGIN_BG_SVG = """<svg viewBox="0 0 430 760" preserveAspectRatio="xMidYMid slice" xmlns="http://www.w3.org/2000/svg">
-<g fill="none" stroke="#c3ccd6" stroke-width="1">
+<g fill="none" stroke="#aab4c2" stroke-width="1">
 <path d="M-40 300 Q215 280 470 300"/><path d="M-40 360 Q215 340 470 360"/>
 <path d="M-40 420 Q215 400 470 420"/><path d="M-40 480 Q215 460 470 480"/>
 <path d="M-40 540 Q215 520 470 540"/><path d="M-40 600 Q215 580 470 600"/>
@@ -341,16 +341,16 @@ LOGIN_BG_SVG = """<svg viewBox="0 0 430 760" preserveAspectRatio="xMidYMid slice
 <path d="M60 760 Q120 500 175 250"/><path d="M150 760 Q180 500 205 250"/>
 <path d="M240 760 Q235 500 235 250"/><path d="M330 760 Q290 500 265 250"/>
 <path d="M420 760 Q350 500 295 250"/></g>
-<g stroke="#aab4c0" stroke-width="1"><path d="M231 300 L239 300 M231 360 L239 360 M231 420 L239 420 M231 480 L239 480 M231 600 L239 600 M231 660 L239 660 M231 720 L239 720"/></g>
-<g fill="none" stroke="#b7c0cb" stroke-width="1">
+<g stroke="#8f9aa8" stroke-width="1"><path d="M231 300 L239 300 M231 360 L239 360 M231 420 L239 420 M231 480 L239 480 M231 600 L239 600 M231 660 L239 660 M231 720 L239 720"/></g>
+<g fill="none" stroke="#9ba6b3" stroke-width="1">
 <path d="M120 760 C150 660 120 600 175 545 C215 505 205 460 250 430"/>
 <path d="M170 560 l-6 -4 M158 588 l-6 -4 M150 618 l-6 -4 M146 650 l-6 -4"/></g>
-<g stroke="#aab4c0" fill="none" stroke-width="1"><path d="M392 300 L392 330 M392 300 L387 309 M392 300 L397 309"/></g>
-<text x="388" y="292" font-family="-apple-system,system-ui,sans-serif" font-size="10" fill="#98a2ae">С</text>
+<g stroke="#8f9aa8" fill="none" stroke-width="1"><path d="M392 300 L392 330 M392 300 L387 309 M392 300 L397 309"/></g>
+<text x="388" y="292" font-family="-apple-system,system-ui,sans-serif" font-size="10" fill="#7f8a98">С</text>
 <g stroke="#2f80ed" fill="none" stroke-width="1.4"><circle cx="235" cy="540" r="7"/><path d="M235 522 L235 558 M217 540 L253 540"/></g>
 <circle cx="235" cy="540" r="2.4" fill="#2f80ed"/>
-<text x="248" y="536" font-family="-apple-system,system-ui,sans-serif" font-size="11" fill="#7f8996">Белокаменка</text>
-<text x="248" y="551" font-family="-apple-system,system-ui,sans-serif" font-size="10" fill="#9aa4b0">69°14′ N · 33°17′ E</text>
+<text x="248" y="536" font-family="-apple-system,system-ui,sans-serif" font-size="11" fill="#68737f">Белокаменка</text>
+<text x="248" y="551" font-family="-apple-system,system-ui,sans-serif" font-size="10" fill="#828d9a">69°14′ N · 33°17′ E</text>
 </svg>"""
 
 
@@ -514,7 +514,13 @@ def employees_list(request: Request, db: Session = Depends(get_db)):
 
     def row(e: Employee) -> str:
         cit = e.citizenship or "—"
-        if e.consent_status != ConsentStatus.CONFIRMED:
+        # Ожидающие прибытия (без даты въезда): обязательства по въезду не создаются,
+        # поэтому чип нейтральный "ожидает прибытия", а не "в норме" (которое врёт — человека
+        # ещё нет). Дедлайны появятся, когда в карточку впишут дату въезда.
+        if e.entry_date is None:
+            chip = '<span class="badge neutral">ожидает прибытия</span>'
+            ob_line = '<div class="muted-line">дата въезда не указана — дедлайны не идут</div>'
+        elif e.consent_status != ConsentStatus.CONFIRMED:
             chip = '<span class="badge neutral">без согласия</span>'
             ob_line = '<div class="muted-line">обязанности создаются после согласия</div>'
         else:
@@ -536,12 +542,26 @@ def employees_list(request: Request, db: Session = Depends(get_db)):
             f'<a class="btn" href="/employees/{e.id}">Открыть карточку</a></div>'
         )
 
-    rows = "".join(row(e) for e in employees) or '<p class="muted">Сотрудников в базе нет.</p>'
+    active = [e for e in employees if e.entry_date is not None]
+    awaiting = [e for e in employees if e.entry_date is None]
+
+    active_rows = "".join(row(e) for e in active) or '<p class="muted">Нет активных сотрудников.</p>'
+    active_section = (
+        f'<section class="grid"><h2>Активные ({len(active)})</h2>{active_rows}</section>'
+    )
+
+    awaiting_section = ""
+    if awaiting:
+        awaiting_rows = "".join(row(e) for e in awaiting)
+        awaiting_section = (
+            f'<section class="grid"><h2>Ожидают прибытия ({len(awaiting)})</h2>{awaiting_rows}</section>'
+        )
+
     return _render(
         "Сотрудники",
         f'<h1>Сотрудники ({len(employees)})</h1>'
         f'<p><a class="btn" href="/employees/new">+ Добавить сотрудника</a></p>'
-        f'<section class="grid">{rows}</section>',
+        f'{active_section}{awaiting_section}',
     )
 
 
