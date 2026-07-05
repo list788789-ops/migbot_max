@@ -14,12 +14,31 @@
 не как часть трудового договора или другой формы — поэтому это отдельный docx,
 а не пункт в существующем consent_texts.py (тот — для текста в чате, не для подписи).
 
+2026-07: добавлена проверка обязательных полей сотрудника ПЕРЕД генерацией — раньше
+пустые passport_series/passport_number/birth_date/address молча превращались в текст
+"[не указано]" внутри готового документа, который уходит в клинику или сотруднику на
+подпись. Теперь генератор поднимает ValueError с точным списком недостающих полей —
+ВАЖНО: вызывающий код (bot.py, webforms.py) должен показывать текст ЭТОГО исключения
+кадровику, а не общее "не удалось сгенерировать документ", иначе смысл проверки теряется.
+
+2026-07: добавлен блок подписей "От Исполнителя / От Заказчика" в направление на
+медосмотр — был в бумажном шаблоне (Приложение №1 к договору №176), но отсутствовал
+в генераторе; документ обрывался на пункте 10.
+
 Требуемые переменные окружения:
   COMPANY_NAME             — полное наименование юрлица-работодателя
   COMPANY_INN              — ИНН
   COMPANY_LEGAL_ADDRESS    — юридический адрес
   HR_SIGNATORY_NAME        — ФИО подписанта со стороны работодателя
   HR_SIGNATORY_POSITION    — должность подписанта
+  CLINIC_NAME              — наименование медицинской организации
+  CLINIC_CONTRACT_NUMBER   — номер договора с клиникой
+  CLINIC_CONTRACT_DATE     — дата договора с клиникой, формат ДД.ММ.ГГГГ
+  CLINIC_CHIEF_DOCTOR_NAME — ФИО главного врача клиники (для блока подписи "От Исполнителя")
+  PAYER_NAME               — заказчик услуги (напр. "ИП Буц С.Ю.") — используется в п.5/8 бланка
+  PAYER_SIGNATORY_NAME     — ФИО подписанта со стороны заказчика для блока подписи
+                             (напр. "С. Ю. Буц") — если не задано, используется PAYER_NAME
+  PAYER_PHONE              — телефон заказчика
 """
 
 import os
@@ -53,8 +72,30 @@ def _passport_str(employee: Employee) -> str:
     return passport or "[паспортные данные не указаны]"
 
 
+def _require_fields(employee: Employee, field_labels: dict[str, str]) -> None:
+    """Поднимает ValueError с точным списком незаполненных полей, вместо того чтобы
+    молча вставить в документ текст-плейсхолдер. field_labels: {атрибут: человекочитаемое имя}."""
+    missing = [
+        label for attr, label in field_labels.items()
+        if getattr(employee, attr) in (None, "")
+    ]
+    if missing:
+        raise ValueError(
+            f"Нельзя сгенерировать документ для {employee.full_name} — "
+            f"не заполнены поля: {', '.join(missing)}. "
+            f"Заполните их в карточке сотрудника перед генерацией."
+        )
+
+
 def generate_consent_docx(employee: Employee, output_dir: str = "/tmp") -> str:
     """Согласие на обработку персональных данных — отдельный документ (152-ФЗ)."""
+    _require_fields(employee, {
+        "birth_date": "дата рождения",
+        "passport_series": "серия паспорта",
+        "passport_number": "номер паспорта",
+        "address": "адрес места пребывания",
+    })
+
     doc = Document()
     _set_default_style(doc)
 
@@ -66,8 +107,8 @@ def generate_consent_docx(employee: Employee, output_dir: str = "/tmp") -> str:
 
     doc.add_paragraph()
 
-    birth = employee.birth_date.strftime("%d.%m.%Y") if employee.birth_date else "[дата рождения не указана]"
-    address = employee.address or "[адрес не указан]"
+    birth = employee.birth_date.strftime("%d.%m.%Y")
+    address = employee.address
 
     body = (
         f"Я, {employee.full_name}, {birth} года рождения, "
@@ -113,7 +154,9 @@ def generate_consent_docx(employee: Employee, output_dir: str = "/tmp") -> str:
 CLINIC_NAME = os.environ.get("CLINIC_NAME", "[НЕ ЗАПОЛНЕНО — наименование медицинской организации]")
 CLINIC_CONTRACT_NUMBER = os.environ.get("CLINIC_CONTRACT_NUMBER", "[номер договора не указан]")
 CLINIC_CONTRACT_DATE = os.environ.get("CLINIC_CONTRACT_DATE", "[дата договора не указана]")
+CLINIC_CHIEF_DOCTOR_NAME = os.environ.get("CLINIC_CHIEF_DOCTOR_NAME", "[ФИО главного врача не указано]")
 PAYER_NAME = os.environ.get("PAYER_NAME", "[НЕ ЗАПОЛНЕНО — заказчик услуги, ИП/юрлицо]")
+PAYER_SIGNATORY_NAME = os.environ.get("PAYER_SIGNATORY_NAME", PAYER_NAME)
 PAYER_PHONE = os.environ.get("PAYER_PHONE", "[телефон заказчика не указан]")
 
 MEDICAL_SERVICE_TEXT = (
@@ -129,6 +172,20 @@ MEDICAL_SERVICE_TEXT = (
 )
 
 
+def _contract_header_parts() -> tuple[str, str, str]:
+    """Разбивает CLINIC_CONTRACT_DATE (ожидается формат ДД.ММ.ГГГГ) на день/месяц/год —
+    в бумажном бланке это три отдельных поля («25» 06 2026г.), не одна строка.
+    [Предполагаю] формат хранения даты в env var — ДД.ММ.ГГГГ, как и в остальных местах
+    проекта. Если строку не удалось разобрать — используем как есть одним куском в поле
+    "день", чтобы не потерять данные и не упасть, но это не будет визуально соответствовать
+    трём полям бланка."""
+    try:
+        parsed = datetime.strptime(CLINIC_CONTRACT_DATE, "%d.%m.%Y").date()
+        return parsed.strftime("%d"), parsed.strftime("%m"), parsed.strftime("%Y")
+    except ValueError:
+        return CLINIC_CONTRACT_DATE, "", ""
+
+
 def generate_medical_referral_docx(employee: Employee, output_dir: str = "/tmp") -> str:
     """Направление на медицинское освидетельствование — форма ГОАУЗ «МОМЦ» (Приложение №1
     к договору), заполняется по факту согласования конкретной даты/кабинета с клиникой.
@@ -136,16 +193,24 @@ def generate_medical_referral_docx(employee: Employee, output_dir: str = "/tmp")
     Дата приёма, номер кабинета и время намеренно оставлены пустыми полями для ручного
     заполнения — это отдельный процесс согласования с клиникой, бот не может знать
     расписание клиники заранее и не должен его придумывать."""
+    _require_fields(employee, {
+        "birth_date": "дата рождения",
+        "passport_series": "серия паспорта",
+        "passport_number": "номер паспорта",
+        "address": "адрес места пребывания",
+    })
+
     doc = Document()
     _set_default_style(doc)
 
+    day, month, year = _contract_header_parts()
     header = doc.add_paragraph()
     header.alignment = WD_ALIGN_PARAGRAPH.RIGHT
     header.add_run(
-        f"к Договору № {CLINIC_CONTRACT_NUMBER} от «{CLINIC_CONTRACT_DATE}»\nПриложение № 1"
+        f"к Договору № {CLINIC_CONTRACT_NUMBER} от «{day}» {month} {year}г.\nПриложение № 1"
     )
 
-    doc.add_paragraph("ШАБЛОН")
+    doc.add_paragraph()
 
     title = doc.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -166,15 +231,14 @@ def generate_medical_referral_docx(employee: Employee, output_dir: str = "/tmp")
     doc.add_paragraph(f"Имя {first_name}")
     doc.add_paragraph(f"Отчество {patronymic}")
 
-    birth = employee.birth_date.strftime("%d.%m.%Y") if employee.birth_date else "[дата рождения не указана]"
+    birth = employee.birth_date.strftime("%d.%m.%Y")
     doc.add_paragraph(f"2. Дата рождения (число, месяц, год) {birth}")
 
-    address = employee.address or "[адрес не указан]"
-    doc.add_paragraph(f"3. Адрес (по месту проживания) {address}")
+    doc.add_paragraph(f"3. Адрес (по месту проживания) {employee.address}")
 
     doc.add_paragraph(
-        f"4. Серия паспорта {employee.passport_series or '[не указана]'} "
-        f"Номер паспорта {employee.passport_number or '[не указан]'}"
+        f"4. Серия паспорта {employee.passport_series} "
+        f"Номер паспорта {employee.passport_number}"
     )
 
     doc.add_paragraph(f"5. Место работы {PAYER_NAME}")
@@ -192,6 +256,28 @@ def generate_medical_referral_docx(employee: Employee, output_dir: str = "/tmp")
     doc.add_paragraph("подпись, печать _____________________")
 
     doc.add_paragraph(f"10. Дата выдачи направления {datetime.now(MSK).date().strftime('%d.%m.%Y')}")
+
+    doc.add_paragraph()
+
+    # Блок подписей "От Исполнителя / От Заказчика" — был в бумажном бланке, отсутствовал
+    # в генераторе. Таблица 2×2 без границ, чтобы визуально повторить два столбца оригинала.
+    table = doc.add_table(rows=4, cols=2)
+    table.autofit = True
+
+    def _cell(row: int, col: int, text: str, bold: bool = False) -> None:
+        cell = table.cell(row, col)
+        p = cell.paragraphs[0]
+        r = p.add_run(text)
+        r.bold = bold
+
+    _cell(0, 0, "От Исполнителя:", bold=True)
+    _cell(0, 1, "От Заказчика:", bold=True)
+    _cell(1, 0, f"{CLINIC_NAME}")
+    _cell(1, 1, "Индивидуальный предприниматель")
+    _cell(2, 0, "Главный врач")
+    _cell(2, 1, "")
+    _cell(3, 0, f"_____________________ {CLINIC_CHIEF_DOCTOR_NAME}\nм.п.")
+    _cell(3, 1, f"_____________________ {PAYER_SIGNATORY_NAME}\nм.п.")
 
     filename = f"medical_referral_{employee.id}.docx"
     path = os.path.join(output_dir, filename)
