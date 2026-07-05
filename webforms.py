@@ -130,6 +130,7 @@ form.inline{{display:inline}}
   header.org .page-title{{font-size:23px}}
   section.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));
   gap:12px;align-items:start}}
+  section.grid.wide{{grid-template-columns:repeat(auto-fill,minmax(340px,1fr))}}
   section.grid .card{{margin-bottom:0}}
   section.narrow{{max-width:440px;margin:0 auto}}
   a.btn:hover,button:hover{{opacity:.85}}
@@ -146,6 +147,8 @@ NAV = (
     '<nav>'
     '<a href="/">Рабочий стол</a>'
     '<a href="/entry_date">Дата въезда</a>'
+    '<a href="/entry_country">Место въезда</a>'
+    '<a href="/address">Место пребывания</a>'
     '<a href="/contract_date">Дата договора</a>'
     '<a href="/consent">Согласия</a>'
     '<a href="/medical">Медкомиссия</a>'
@@ -259,6 +262,12 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
         .order_by(Employee.full_name)
     ).all()
 
+    no_entry_country = db.scalars(
+        select(Employee)
+        .where(Employee.entry_country.is_(None))
+        .order_by(Employee.full_name)
+    ).all()
+
     no_consent = db.scalars(
         select(Employee)
         .where(Employee.consent_status == ConsentStatus.DRAFT)
@@ -273,6 +282,7 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
 
     overdue = db.scalars(
         select(Obligation)
+        .where(Obligation.is_current == True)  # noqa: E712 — SQLAlchemy требует именно так, не `is True`
         .where(Obligation.status == ObligationStatus.PENDING)
         .where(Obligation.deadline_date < today)
         .order_by(Obligation.deadline_date)
@@ -280,6 +290,7 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
 
     due_soon = db.scalars(
         select(Obligation)
+        .where(Obligation.is_current == True)  # noqa: E712
         .where(Obligation.status == ObligationStatus.PENDING)
         .where(Obligation.deadline_date >= today)
         .where(Obligation.deadline_date <= soon)
@@ -299,6 +310,7 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
     need_referral = [
         o for o in db.scalars(
             select(Obligation)
+            .where(Obligation.is_current == True)  # noqa: E712
             .where(Obligation.type == ObligationType.MEDICAL_EXAM)
             .where(Obligation.status == ObligationStatus.PENDING)
         ).all()
@@ -327,6 +339,11 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
 </section>
 
 <section class="grid">
+<h2>Без места въезда ({len(no_entry_country)})</h2>
+{''.join(f'<div class="card">{e.full_name} <a class="btn" href="/entry_country/{e.id}">Указать место</a></div>' for e in no_entry_country) or '<p class="muted">У всех указано место въезда.</p>'}
+</section>
+
+<section class="grid">
 <h2>Без подтверждённого согласия ({len(no_consent)})</h2>
 {''.join(f'<div class="card">{e.full_name} <a class="btn" href="/consent/{e.id}">Подтвердить</a></div>' for e in no_consent) or '<p class="muted">У всех есть согласие.</p>'}
 </section>
@@ -334,6 +351,12 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
 <section class="grid">
 <h2>Без даты договора ({len(no_contract_date)})</h2>
 {''.join(f'<div class="card">{e.full_name} <a class="btn" href="/contract_date/{e.id}">Указать дату</a></div>' for e in no_contract_date) or '<p class="muted">У всех указана дата договора.</p>'}
+</section>
+
+<section>
+<h2>Место пребывания</h2>
+<div class="card">Смена адреса создаёт новое обязательство по регистрации автоматически.<br>
+<a class="btn" href="/address">Открыть раздел</a></div>
 </section>
 
 <section>
@@ -562,6 +585,95 @@ def contract_date_submit(
     return RedirectResponse("/contract_date", status_code=303)
 
 
+# --- Место пребывания (address + address_since) -----------------------------
+# Смена адреса — отдельное юридическое событие (см. deadlines.py, второе правило
+# REGISTRATION с trigger_field="address_since"). Критично: address_since проставляется
+# ТОЛЬКО когда это реальная смена уже известного адреса — если раньше адреса не было
+# (первый ввод), это часть первичной регистрации по entry_date, а не новое событие,
+# и address_since должен остаться NULL, иначе следующий вызов create_obligations_for_employee
+# создаст лишнее обязательство по несуществующей "смене".
+
+@app.get("/address", response_class=HTMLResponse)
+def address_list(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    employees = db.scalars(select(Employee).order_by(Employee.full_name)).all()
+
+    rows = "".join(
+        f'<div class="card">{e.full_name}<br>'
+        f'<span class="muted">{e.address or "адрес не указан"}</span><br>'
+        f'<a class="btn" href="/address/{e.id}">Изменить</a></div>'
+        for e in employees
+    ) or '<p class="muted">Сотрудников в базе нет.</p>'
+
+    return _render("Место пребывания", f"<h1>Место пребывания сотрудников</h1><section class=\"grid\">{rows}</section>")
+
+
+@app.get("/address/{employee_id}", response_class=HTMLResponse)
+def address_form(employee_id: str, request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    current = emp.address or ""
+    body = f"""
+<h1>{emp.full_name}</h1>
+<section class="narrow">
+<p class="muted">Текущий адрес: {current or "не указан"}</p>
+<form method="post" action="/address/{emp.id}">
+<label>Адрес места пребывания</label>
+<input type="text" name="address" required value="{current}">
+<label>Дата, с которой действует этот адрес</label>
+<input type="date" name="address_since" required max="{date.today().isoformat()}"
+value="{date.today().isoformat()}">
+<button type="submit">Сохранить</button>
+</form>
+<p class="muted">Если это первый адрес для сотрудника — дата ниже не создаст новое
+обязательство по регистрации, оно уже создано по дате въезда. Обязательство создаётся
+заново только когда адрес реально МЕНЯЕТСЯ.</p>
+</section>"""
+    return _render("Место пребывания", body)
+
+
+@app.post("/address/{employee_id}")
+def address_submit(
+    employee_id: str,
+    request: Request,
+    address: str = Form(...),
+    address_since: date = Form(...),
+    db: Session = Depends(get_db),
+):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    previous_address = (emp.address or "").strip()
+    new_address = address.strip()
+    is_real_change = previous_address != "" and previous_address != new_address
+
+    emp.address = new_address
+    if is_real_change:
+        emp.address_since = address_since
+    # Если previous_address был пуст — это первый ввод адреса, address_since НЕ трогаем
+    # (остаётся тем, что было — обычно None), чтобы не создать ложное обязательство
+    # по несуществующей смене места пребывания.
+
+    db.commit()
+    db.refresh(emp)
+
+    if is_real_change and emp.consent_status == ConsentStatus.CONFIRMED:
+        create_obligations_for_employee(db, emp)
+
+    return RedirectResponse("/address", status_code=303)
+
+
 @app.get("/medical", response_class=HTMLResponse)
 def medical_list(request: Request, db: Session = Depends(get_db)):
     if not _logged_in(request):
@@ -571,6 +683,7 @@ def medical_list(request: Request, db: Session = Depends(get_db)):
     need_referral = [
         o for o in db.scalars(
             select(Obligation)
+            .where(Obligation.is_current == True)  # noqa: E712
             .where(Obligation.type == ObligationType.MEDICAL_EXAM)
             .where(Obligation.status == ObligationStatus.PENDING)
             .order_by(Obligation.deadline_date)
@@ -611,12 +724,12 @@ def medical_list(request: Request, db: Session = Depends(get_db)):
     body = f"""
 <h1>Медкомиссия</h1>
 
-<section>
+<section class="grid wide">
 <h2>Нужно направление ({len(need_referral)})</h2>
 {''.join(referral_row(o) for o in need_referral) or '<p class="muted">Все, у кого активно обязательство, уже направлены.</p>'}
 </section>
 
-<section>
+<section class="grid wide">
 <h2>Направлены, ждут результата ({len(awaiting_result)})</h2>
 {''.join(awaiting_row(r) for r in awaiting_result) or '<p class="muted">Нет ожидающих результата.</p>'}
 </section>
