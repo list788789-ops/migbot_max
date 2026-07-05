@@ -23,7 +23,7 @@
 """
 
 import os
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -32,6 +32,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Font
 
 from models import Employee
+
+MSK = timezone(timedelta(hours=3))  # Мурманская обл. — московское время, без перехода на летнее с 2014
 
 COMPANY_NAME = os.environ.get("COMPANY_NAME", "[НЕ ЗАПОЛНЕНО — укажите наименование юрлица]")
 COMPANY_INN = os.environ.get("COMPANY_INN", "[ИНН не указан]")
@@ -99,7 +101,7 @@ def generate_consent_docx(employee: Employee, output_dir: str = "/tmp") -> str:
     )
 
     doc.add_paragraph()
-    doc.add_paragraph(f"Дата: {date.today().strftime('%d.%m.%Y')}")
+    doc.add_paragraph(f"Дата: {datetime.now(MSK).date().strftime('%d.%m.%Y')}")
     doc.add_paragraph(f"Подпись: _____________________ / {employee.full_name}")
 
     filename = f"consent_{employee.id}.docx"
@@ -189,7 +191,7 @@ def generate_medical_referral_docx(employee: Employee, output_dir: str = "/tmp")
     doc.add_paragraph(PAYER_NAME)
     doc.add_paragraph("подпись, печать _____________________")
 
-    doc.add_paragraph(f"10. Дата выдачи направления {date.today().strftime('%d.%m.%Y')}")
+    doc.add_paragraph(f"10. Дата выдачи направления {datetime.now(MSK).date().strftime('%d.%m.%Y')}")
 
     filename = f"medical_referral_{employee.id}.docx"
     path = os.path.join(output_dir, filename)
