@@ -82,27 +82,41 @@ PAGE_HEAD = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
 <style>
-body{{font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:720px;margin:0 auto;
-padding:16px;background:#f5f5f7;color:#1c1c1e}}
-header.org{{background:#1c1c1e;color:#fff;border-radius:12px;padding:14px 16px;margin-bottom:16px}}
-header.org .org-name{{font-size:14px;opacity:.75}}
-header.org .page-title{{font-size:19px;font-weight:600;margin-top:2px}}
-h1{{font-size:20px}} h2{{font-size:15px;margin:0 0 8px 0;color:#444;
-text-transform:uppercase;letter-spacing:.02em}}
-section{{background:#fff;border-radius:14px;padding:14px;margin-bottom:14px;
-box-shadow:0 1px 3px rgba(0,0,0,.08)}}
-.card{{background:#f7f7f9;border-radius:10px;padding:12px;margin-bottom:8px}}
+*{{box-sizing:border-box}}
+body{{font-family:Georgia,'Times New Roman',serif;max-width:720px;margin:0 auto;
+padding:16px;background:#efe4c8;color:#3a2a1a;position:relative}}
+body::before{{content:"";position:fixed;inset:0;pointer-events:none;z-index:-1;
+background-color:#efe4c8;
+background-image:repeating-linear-gradient(0deg,rgba(60,40,10,.03) 0px,rgba(60,40,10,.03) 1px,
+transparent 1px,transparent 3px)}}
+header.org{{background:#7a2e22;color:#fff8ef;border-radius:4px;padding:16px 18px;margin-bottom:16px;
+border:1px solid #5c2118}}
+header.org .org-name{{font-size:13px;opacity:.85;letter-spacing:.03em}}
+header.org .page-title{{font-size:20px;font-weight:600;margin-top:2px}}
+h1{{font-size:20px;color:#3a2a1a}}
+h2{{font-size:14px;margin:0 0 10px 0;color:#7a2e22;text-transform:uppercase;letter-spacing:.06em;
+border-bottom:1px solid #d8c69a;padding-bottom:6px}}
+section{{background:#fffdf6;border-radius:6px;padding:14px;margin-bottom:14px;
+border:1px solid #d8c69a;box-shadow:0 2px 6px rgba(60,40,10,.10)}}
+.card{{background:#f7f0dd;border-radius:5px;padding:12px;margin-bottom:8px;
+border:1px solid #e2d3ac;font-family:-apple-system,Segoe UI,Roboto,sans-serif;font-weight:600;
+color:#2a1d10}}
 .card:last-child{{margin-bottom:0}}
-a.btn,button{{display:inline-block;background:#0a7cff;color:#fff;text-decoration:none;
-padding:9px 14px;border-radius:8px;border:none;font-size:14px;margin-top:6px;margin-right:6px}}
-a.btn.secondary,button.secondary{{background:#e6473a}}
-input[type=date],input[type=text],input[type=password]{{width:100%;padding:10px;
-font-size:16px;border:1px solid #ccc;border-radius:8px;margin:6px 0 12px 0;box-sizing:border-box}}
-.badge{{display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;color:#fff}}
-.badge.red{{background:#e6473a}} .badge.orange{{background:#e69a3a}}
-.muted{{color:#777;font-size:13px}}
+.card .muted-line{{font-family:inherit;font-weight:400;color:#8a7355}}
+a.btn,button{{display:inline-block;background:#7a2e22;color:#fff8ef;text-decoration:none;
+padding:14px 20px;min-height:48px;line-height:20px;border-radius:6px;border:none;font-size:16px;
+font-family:Georgia,serif;letter-spacing:.02em;margin-top:8px;margin-right:8px;cursor:pointer}}
+a.btn.secondary,button.secondary{{background:transparent;color:#7a2e22;border:2px solid #7a2e22}}
+input[type=date],input[type=text],input[type=password]{{width:100%;padding:12px;
+font-size:16px;font-family:-apple-system,Segoe UI,Roboto,sans-serif;border:1px solid #c9b48a;
+border-radius:6px;margin:6px 0 12px 0;background:#fffef9;color:#2a1d10}}
+.badge{{display:inline-block;padding:3px 10px;border-radius:10px;font-size:12px;color:#fff8ef;
+font-family:-apple-system,Segoe UI,Roboto,sans-serif;font-weight:600}}
+.badge.red{{background:#7a2e22}} .badge.orange{{background:#b8862b}}
+.muted{{color:#8a7355;font-size:13px;font-family:-apple-system,Segoe UI,Roboto,sans-serif}}
 nav{{margin-bottom:16px}}
-nav a{{color:#0a7cff;text-decoration:none;margin-right:14px;font-size:14px}}
+nav a{{color:#7a2e22;text-decoration:none;margin-right:16px;font-size:14px;padding:6px 0;
+display:inline-block;font-weight:600}}
 form.inline{{display:inline}}
 </style></head><body>
 <header class="org">
@@ -147,8 +161,8 @@ border-radius:4px;padding:28px 24px;width:280px;box-shadow:0 8px 28px rgba(60,40
 text-transform:uppercase}}
 .login-card input{{width:100%;padding:10px;font-size:16px;border:1px solid #c9b48a;border-radius:4px;
 margin:6px 0 12px 0;background:#fffef9;font-family:inherit}}
-.login-card button{{width:100%;background:#7a2e22;color:#fff8ef;border:none;padding:11px;
-border-radius:4px;font-size:15px;cursor:pointer;letter-spacing:.03em;font-family:inherit}}
+.login-card button{{width:100%;background:#7a2e22;color:#fff8ef;border:none;padding:15px;
+min-height:50px;border-radius:6px;font-size:16px;cursor:pointer;letter-spacing:.03em;font-family:inherit}}
 .login-card a.btn{{display:inline-block;margin-top:12px;color:#7a2e22;text-decoration:underline;
 font-size:13px}}
 </style></head>
@@ -176,10 +190,10 @@ font-size:13px}}
 
 @app.get("/login", response_class=HTMLResponse)
 def login_form():
-    return LOGIN_HEAD + """
+    return LOGIN_HEAD + f"""
 <div class="login-card">
 <h1>Миграционный учёт</h1>
-<p class="subtitle">Вход для кадровика</p>
+<p class="subtitle">{ORG_NAME}</p>
 <form method="post" action="/login">
 <input type="text" name="username" placeholder="Логин" required>
 <input type="password" name="password" placeholder="Пароль" required>
