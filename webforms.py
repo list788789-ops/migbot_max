@@ -20,7 +20,7 @@ create_obligations_for_employee вынесена в отдельный моду�
 from __future__ import annotations
 
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
@@ -29,6 +29,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from starlette.middleware.sessions import SessionMiddleware
 
 from models import (
+    Consent,
+    ConsentMethod,
     ConsentStatus,
     Employee,
     ExamStatus,
@@ -39,6 +41,8 @@ from models import (
 )
 from obligations import create_obligations_for_employee
 from document_templates import generate_medical_referral_docx
+
+MSK = timezone(timedelta(hours=3))  # то же смещение, что в bot.py — для единообразия timestamp'ов proof
 
 # --- База данных: та же Postgres, что у бота -------------------------------
 
@@ -66,6 +70,7 @@ WEBFORMS_PASSWORD = os.environ["WEBFORMS_PASSWORD"]
 SECRET_KEY = os.environ["WEBFORMS_SECRET_KEY"]
 ORG_NAME = os.environ.get("COMPANY_NAME", "ИП Буц Сергей Юрьевич")
 CLINIC_ID = os.environ.get("CLINIC_ID", "pirogova_murmansk")
+CONSENT_TEXT_VERSION = os.environ.get("CONSENT_TEXT_VERSION", "v1")
 
 app = FastAPI()
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, session_cookie="migbot_session")
@@ -129,6 +134,8 @@ NAV = (
     '<nav>'
     '<a href="/">Рабочий стол</a>'
     '<a href="/entry_date">Дата въезда</a>'
+    '<a href="/contract_date">Дата договора</a>'
+    '<a href="/consent">Согласия</a>'
     '<a href="/medical">Медкомиссия</a>'
     '<a href="/logout">Выйти</a>'
     '</nav>'
@@ -246,6 +253,12 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
         .order_by(Employee.full_name)
     ).all()
 
+    no_contract_date = db.scalars(
+        select(Employee)
+        .where(Employee.contract_date.is_(None))
+        .order_by(Employee.full_name)
+    ).all()
+
     overdue = db.scalars(
         select(Obligation)
         .where(Obligation.status == ObligationStatus.PENDING)
@@ -303,7 +316,12 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
 
 <section>
 <h2>Без подтверждённого согласия ({len(no_consent)})</h2>
-{''.join(f'<div class="card">{e.full_name}</div>' for e in no_consent) or '<p class="muted">У всех есть согласие.</p>'}
+{''.join(f'<div class="card">{e.full_name} <a class="btn" href="/consent/{e.id}">Подтвердить</a></div>' for e in no_consent) or '<p class="muted">У всех есть согласие.</p>'}
+</section>
+
+<section>
+<h2>Без даты договора ({len(no_contract_date)})</h2>
+{''.join(f'<div class="card">{e.full_name} <a class="btn" href="/contract_date/{e.id}">Указать дату</a></div>' for e in no_contract_date) or '<p class="muted">У всех указана дата договора.</p>'}
 </section>
 
 <section>
