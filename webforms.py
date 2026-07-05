@@ -233,7 +233,7 @@ label{{font-size:13px;color:var(--sub)}}
 .badge.neutral{{background:var(--neutral-bg);color:var(--neutral-ink)}}
 .muted{{color:var(--sub);font-size:13px}}
 .warning-banner{{background:var(--amber-bg);border:1px solid #f0c674;border-left:4px solid var(--amber-ink);border-radius:12px;padding:12px 14px;margin-bottom:14px;font-weight:600;color:#7a4a00}}
-nav{{margin-bottom:16px;background:#fff;border:1px solid var(--line);border-radius:12px;padding:4px 8px;display:flex;gap:2px;overflow-x:auto}}
+nav{{margin-bottom:16px;background:#fff;border:1px solid var(--line);border-radius:12px;padding:4px 8px;display:flex;flex-wrap:wrap;gap:2px}}
 nav a{{color:var(--sub);text-decoration:none;font-size:15px;padding:10px 12px;white-space:nowrap;font-weight:600;border-radius:8px}}
 nav a:hover{{color:var(--ink);background:#f5f7f9}}
 form.inline{{display:inline}}
