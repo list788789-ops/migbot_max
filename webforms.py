@@ -123,6 +123,18 @@ nav{{margin-bottom:16px}}
 nav a{{color:#7a2e22;text-decoration:none;margin-right:16px;font-size:14px;padding:6px 0;
 display:inline-block;font-weight:600}}
 form.inline{{display:inline}}
+
+@media (min-width:760px){{
+  body{{max-width:1080px;padding:24px 32px}}
+  header.org{{padding:20px 28px}}
+  header.org .page-title{{font-size:23px}}
+  section.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));
+  gap:12px;align-items:start}}
+  section.grid .card{{margin-bottom:0}}
+  section.narrow{{max-width:440px;margin:0 auto}}
+  a.btn:hover,button:hover{{opacity:.85}}
+  nav a:hover{{text-decoration:underline}}
+}}
 </style></head><body>
 <header class="org">
 <div class="org-name">{org_name}</div>
@@ -299,27 +311,27 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
     body = f"""
 <h1>Задачи</h1>
 
-<section>
+<section class="grid">
 <h2>Просрочено ({len(overdue)})</h2>
 {''.join(obl_row(o) for o in overdue) or '<p class="muted">Нет просроченных.</p>'}
 </section>
 
-<section>
+<section class="grid">
 <h2>Дедлайн в ближайшие 7 дней ({len(due_soon)})</h2>
 {''.join(obl_row(o) for o in due_soon) or '<p class="muted">Нет.</p>'}
 </section>
 
-<section>
+<section class="grid">
 <h2>Без даты въезда ({len(no_entry_date)})</h2>
 {''.join(f'<div class="card">{e.full_name} <a class="btn" href="/entry_date/{e.id}">Указать дату</a></div>' for e in no_entry_date) or '<p class="muted">Все указаны.</p>'}
 </section>
 
-<section>
+<section class="grid">
 <h2>Без подтверждённого согласия ({len(no_consent)})</h2>
 {''.join(f'<div class="card">{e.full_name} <a class="btn" href="/consent/{e.id}">Подтвердить</a></div>' for e in no_consent) or '<p class="muted">У всех есть согласие.</p>'}
 </section>
 
-<section>
+<section class="grid">
 <h2>Без даты договора ({len(no_contract_date)})</h2>
 {''.join(f'<div class="card">{e.full_name} <a class="btn" href="/contract_date/{e.id}">Указать дату</a></div>' for e in no_contract_date) or '<p class="muted">У всех указана дата договора.</p>'}
 </section>
@@ -351,7 +363,7 @@ def entry_date_list(request: Request, db: Session = Depends(get_db)):
         for e in employees
     ) or '<p class="muted">У всех сотрудников уже есть дата въезда.</p>'
 
-    return _render("Дата въезда", f"<h1>Кому нужна дата въезда</h1><section>{rows}</section>")
+    return _render("Дата въезда", f"<h1>Кому нужна дата въезда</h1><section class=\"grid\">{rows}</section>")
 
 
 @app.get("/entry_date/{employee_id}", response_class=HTMLResponse)
@@ -365,11 +377,13 @@ def entry_date_form(employee_id: str, request: Request, db: Session = Depends(ge
 
     body = f"""
 <h1>{emp.full_name}</h1>
+<section class="narrow">
 <form method="post" action="/entry_date/{emp.id}">
 <label>Дата въезда</label>
 <input type="date" name="entry_date" required max="{date.today().isoformat()}">
 <button type="submit">Сохранить</button>
-</form>"""
+</form>
+</section>"""
     return _render("Дата въезда", body)
 
 
@@ -398,6 +412,154 @@ def entry_date_submit(
         create_obligations_for_employee(db, emp)
 
     return RedirectResponse("/entry_date", status_code=303)
+
+
+# --- Согласия (тестовое подтверждение кнопкой) ------------------------------
+# Зеркалит _deliver_consent_confirmation / _execute_consent_confirm_by_button в bot.py:
+# тот же метод ConsentMethod.BOT_BUTTON, тот же дисклеймер про юридическую слабость
+# такого способа по сравнению со сканом (ст.9 152-ФЗ), тот же вызов
+# create_obligations_for_employee сразу после подтверждения.
+
+@app.get("/consent", response_class=HTMLResponse)
+def consent_list(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    employees = db.scalars(
+        select(Employee)
+        .where(Employee.consent_status == ConsentStatus.DRAFT)
+        .order_by(Employee.full_name)
+    ).all()
+
+    rows = "".join(
+        f'<div class="card">{e.full_name}<br>'
+        f'<a class="btn" href="/consent/{e.id}">Подтвердить</a></div>'
+        for e in employees
+    ) or '<p class="muted">У всех сотрудников согласие подтверждено.</p>'
+
+    return _render("Согласия", f"<h1>Ожидают согласия</h1><section class=\"grid\">{rows}</section>")
+
+
+@app.get("/consent/{employee_id}", response_class=HTMLResponse)
+def consent_confirm_form(employee_id: str, request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    body = f"""
+<h1>{emp.full_name}</h1>
+<section class="narrow">
+<p class="muted">Подтвердить согласие кнопкой? Это тестовый способ — юридически слабее,
+чем сканированная подпись (ст.9 152-ФЗ требует осознанного согласия, клик без верификации
+личности это не подтверждает).</p>
+<form method="post" action="/consent/{emp.id}/confirm">
+<button type="submit">✅ Подтвердить (кнопкой, тест)</button>
+</form>
+<a class="btn secondary" href="/consent">Отмена</a>
+</section>"""
+    return _render("Согласия", body)
+
+
+@app.post("/consent/{employee_id}/confirm")
+def consent_confirm_submit(employee_id: str, request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    # proof здесь — не user_id из MAX (кадровик авторизован логином/паролем, не MAX-аккаунтом),
+    # поэтому используем логин кадровика вместо user_id, чтобы след в аудите оставался осмысленным.
+    consent = Consent(
+        employee_id=emp.id,
+        method=ConsentMethod.BOT_BUTTON,
+        proof=f"button_click:webforms:{WEBFORMS_USER}:{datetime.now(MSK).isoformat()}",
+        consent_text_version=CONSENT_TEXT_VERSION,
+    )
+    db.add(consent)
+
+    emp.consent_status = ConsentStatus.CONFIRMED
+    db.add(emp)
+    db.commit()
+    db.refresh(emp)
+
+    create_obligations_for_employee(db, emp)
+
+    return RedirectResponse("/consent", status_code=303)
+
+
+# --- Дата договора -----------------------------------------------------------
+# Симметрично /entry_date выше и _apply_contract_date() в bot.py.
+
+@app.get("/contract_date", response_class=HTMLResponse)
+def contract_date_list(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    employees = db.scalars(
+        select(Employee)
+        .where(Employee.contract_date.is_(None))
+        .order_by(Employee.full_name)
+    ).all()
+
+    rows = "".join(
+        f'<div class="card">{e.full_name}<br>'
+        f'<a class="btn" href="/contract_date/{e.id}">Указать дату</a></div>'
+        for e in employees
+    ) or '<p class="muted">У всех сотрудников уже есть дата договора.</p>'
+
+    return _render("Дата договора", f"<h1>Кому нужна дата договора</h1><section class=\"grid\">{rows}</section>")
+
+
+@app.get("/contract_date/{employee_id}", response_class=HTMLResponse)
+def contract_date_form(employee_id: str, request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    body = f"""
+<h1>{emp.full_name}</h1>
+<section class="narrow">
+<form method="post" action="/contract_date/{emp.id}">
+<label>Дата договора</label>
+<input type="date" name="contract_date" required max="{date.today().isoformat()}">
+<button type="submit">Сохранить</button>
+</form>
+</section>"""
+    return _render("Дата договора", body)
+
+
+@app.post("/contract_date/{employee_id}")
+def contract_date_submit(
+    employee_id: str,
+    request: Request,
+    contract_date: date = Form(...),
+    db: Session = Depends(get_db),
+):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    emp.contract_date = contract_date
+    db.commit()
+    db.refresh(emp)
+
+    # Симметрично _apply_contract_date() в bot.py: обязательства, зависящие от даты договора
+    # (contract_notice, efs1_report), досоздаются сразу, если согласие уже подтверждено.
+    if emp.consent_status == ConsentStatus.CONFIRMED:
+        create_obligations_for_employee(db, emp)
+
+    return RedirectResponse("/contract_date", status_code=303)
 
 
 @app.get("/medical", response_class=HTMLResponse)
