@@ -58,6 +58,18 @@ class Category(str, enum.Enum):
     HQS = "hqs"            # высококвалифицированные специалисты
 
 
+class RegistrationStatus(str, enum.Enum):
+    """Статус миграционного учёта. Управляет тем, от какой даты считать дедлайны.
+    PRIMARY — первичный учёт: регистрация/медосмотр/дактилоскопия от даты въезда (entry_date).
+    PRIOR — ранее стоял на учёте в РФ (приехал на вахту из другого региона): регистрация от
+    даты прибытия (address_since), медосмотр и дактилоскопия ЗАНОВО НЕ создаются.
+    NULL (не задан) — создание обязательств ЗАБЛОКИРОВАНО до заполнения кадровиком; в карточке
+    и списке показывается громкая пометка. Пустой статус НЕ трактуется как PRIMARY намеренно —
+    кадровик обязан выбрать явно (решение зафиксировано в задачах)."""
+    PRIMARY = "primary"
+    PRIOR = "prior"
+
+
 class ConsentStatus(str, enum.Enum):
     DRAFT = "draft"
     CONFIRMED = "confirmed"
@@ -172,6 +184,14 @@ class Employee(Base):
     # На боевой БД добавить колонку вручную (create_all не меняет существующие таблицы):
     #   ALTER TABLE employees ADD COLUMN tab_number VARCHAR;
     tab_number: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    # Статус миграционного учёта (2026-07). Управляет расчётом дедлайнов (см. RegistrationStatus).
+    # NULL = не задан → создание обязательств заблокировано. Кадровик проставляет вручную.
+    # На боевой БД добавить колонку вручную (create_all не меняет существующие таблицы):
+    #   ALTER TABLE employees ADD COLUMN registration_status VARCHAR;
+    registration_status: Mapped[RegistrationStatus | None] = mapped_column(
+        Enum(RegistrationStatus), nullable=True
+    )
 
     created_by: Mapped[str | None] = mapped_column(String, nullable=True)  # кто завёл (кадровик/прораб)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
