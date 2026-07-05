@@ -177,6 +177,7 @@ class _Responder:
         # не проверено на реальном инстансе, что answer() возвращает то же самое, что
         # send_message; если это не так, редактирование списка после подтверждения не сработает
         # и молча упадёт в исключение при вызове bot.edit_message ниже.
+        log.info("Responder.send() вернул объект типа %s: %r", type(sent).__name__, sent)
         return getattr(sent, "id", None)
 
     def user_id(self) -> str:
@@ -313,6 +314,9 @@ async def _deliver_picker(
                 nav.append(CallbackButton(text="▶️", payload=f"page:{prefix}:{page + 1}"))
             if nav:
                 builder.row(*nav)
+
+        if prefix == "consentpick":
+            builder.row(CallbackButton(text="🚪 Выход", payload="exitpicker:consentpick"))
 
     header = f"{PICKER_TITLES.get(prefix, prefix)}: {total}"
     if total_pages > 1:
@@ -550,6 +554,12 @@ async def on_callback(event: MessageCallback):
     if payload.startswith("cancel:"):
         prefix = payload.split(":", 1)[1]
         await event.message.delete()  # убираем диалог подтверждения; список не менялся, не трогаем
+        return
+
+    if payload.startswith("exitpicker:"):
+        prefix = payload.split(":", 1)[1]
+        await event.message.delete()
+        _open_pickers.pop((responder.user_id(), prefix), None)
         return
 
     if payload == "menu:pending_consent":
