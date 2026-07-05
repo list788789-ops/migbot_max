@@ -210,51 +210,72 @@ async def _deliver_employees_list(responder: "_Responder") -> None:
     )
 
 
-async def _deliver_incomplete_list(responder: "_Responder") -> None:
-    with Session(engine) as session:
-        employees = (
+PICKER_PAGE_SIZE = 25  # запас от подтверждённого лимита MAX: 30 рядов на сообщение
+# (dev.max.ru/docs-api: максимум 210 кнопок, 30 рядов, до 7 в ряду — здесь 1 кнопка
+# на ряд, значит лимит по факту 30; проявилось в проде как errors.maxRows на 67 записях)
+
+PICKER_TITLES = {
+    "empdate": "Без даты въезда",
+    "delpick": "Выберите сотрудника для удаления (тест, необратимо)",
+    "consentpick": "Ожидают согласия",
+}
+
+
+def _picker_employees(session: Session, prefix: str) -> list[Employee]:
+    if prefix == "empdate":
+        return (
             session.query(Employee)
             .filter(Employee.entry_date.is_(None))
             .order_by(Employee.full_name)
             .all()
         )
-        if not employees:
-            await responder.send("У всех сотрудников указана дата въезда.")
-            return
-
-        builder = InlineKeyboardBuilder()
-        for emp in employees:
-            passport = f"{emp.passport_series or ''} {emp.passport_number or ''}".strip()
-            label = f"{emp.full_name} ({passport})" if passport else emp.full_name
-            builder.row(CallbackButton(text=label[:60], payload=f"empdate:{emp.id}"))
-        count = len(employees)
-
-    await responder.send(
-        text=f"Без даты въезда: {count}\nНажмите на сотрудника, чтобы указать дату:",
-        attachments=[builder.as_markup()],
-    )
+    if prefix == "delpick":
+        return session.query(Employee).order_by(Employee.full_name).all()
+    if prefix == "consentpick":
+        return (
+            session.query(Employee)
+            .filter_by(consent_status=ConsentStatus.DRAFT)
+            .order_by(Employee.full_name)
+            .all()
+        )
+    return []
 
 
-async def _deliver_delete_picker(responder: "_Responder") -> None:
-    """Список сотрудников как кнопки для удаления. Двухшаговое подтверждение обязательно —
-    без него один клик безвозвратно удаляет сотрудника со всей историей (согласия,
-    обязательства, направления), а восстановить это средствами бота нельзя."""
+async def _deliver_picker(responder: "_Responder", prefix: str, page: int = 0) -> None:
+    """Общий постраничный список сотрудников-кнопок для empdate/delpick/consentpick.
+    Единая точка на случай, если лимит MAX по рядам/кнопкам снова изменится или
+    обнаружится, что 25 — тоже недостаточный запас."""
     with Session(engine) as session:
-        employees = session.query(Employee).order_by(Employee.full_name).all()
+        employees = _picker_employees(session, prefix)
         if not employees:
-            await responder.send("Сотрудников в базе нет.")
+            await responder.send("Список пуст.")
             return
 
+        total = len(employees)
+        start = page * PICKER_PAGE_SIZE
+        chunk = employees[start : start + PICKER_PAGE_SIZE]
+
         builder = InlineKeyboardBuilder()
-        for emp in employees:
+        for emp in chunk:
             passport = f"{emp.passport_series or ''} {emp.passport_number or ''}".strip()
             label = f"{emp.full_name} ({passport})" if passport else emp.full_name
-            builder.row(CallbackButton(text=label[:60], payload=f"delpick:{emp.id}"))
+            builder.row(CallbackButton(text=label[:60], payload=f"{prefix}:{emp.id}"))
 
-    await responder.send(
-        text="Выберите сотрудника для удаления (тестовая функция, действие необратимо):",
-        attachments=[builder.as_markup()],
-    )
+        total_pages = (total + PICKER_PAGE_SIZE - 1) // PICKER_PAGE_SIZE
+        if total_pages > 1:
+            nav = []
+            if page > 0:
+                nav.append(CallbackButton(text="◀️", payload=f"page:{prefix}:{page - 1}"))
+            if page < total_pages - 1:
+                nav.append(CallbackButton(text="▶️", payload=f"page:{prefix}:{page + 1}"))
+            if nav:
+                builder.row(*nav)
+
+    header = f"{PICKER_TITLES.get(prefix, prefix)}: {total}"
+    if total_pages > 1:
+        header += f"\nСтраница {page + 1}/{total_pages}"
+
+    await responder.send(text=header, attachments=[builder.as_markup()])
 
 
 async def _deliver_delete_confirmation(responder: "_Responder", employee_id: str) -> None:
@@ -272,30 +293,6 @@ async def _deliver_delete_confirmation(responder: "_Responder", employee_id: str
     await responder.send(
         text=f"Удалить {full_name} безвозвратно, вместе со всей историей "
         "(согласия, обязательства, направления)?",
-        attachments=[builder.as_markup()],
-    )
-
-
-async def _deliver_pending_consent_picker(responder: "_Responder") -> None:
-    """Список сотрудников со статусом DRAFT — кнопка на каждого запускает подтверждение
-    согласия методом BOT_BUTTON (тестовый шорткат, не замена сканированной подписи)."""
-    with Session(engine) as session:
-        employees = (
-            session.query(Employee)
-            .filter_by(consent_status=ConsentStatus.DRAFT)
-            .order_by(Employee.full_name)
-            .all()
-        )
-        if not employees:
-            await responder.send("Нет сотрудников, ожидающих согласия.")
-            return
-
-        builder = InlineKeyboardBuilder()
-        for emp in employees:
-            builder.row(CallbackButton(text=emp.full_name[:60], payload=f"consentpick:{emp.id}"))
-
-    await responder.send(
-        text=f"Ожидают согласия: {len(employees)}\nВыберите сотрудника:",
         attachments=[builder.as_markup()],
     )
 
@@ -408,7 +405,7 @@ async def on_employees(event: MessageCreated):
 
 @dp.message_created(F.message.body.text == "/incomplete")
 async def on_incomplete(event: MessageCreated):
-    await _deliver_incomplete_list(_Responder(event))
+    await _deliver_picker(_Responder(event), "empdate")
 
 
 @dp.message_callback()
@@ -431,7 +428,12 @@ async def on_callback(event: MessageCallback):
         return
 
     if payload == "menu:incomplete":
-        await _deliver_incomplete_list(responder)
+        await _deliver_picker(responder, "empdate")
+        return
+
+    if payload.startswith("page:"):
+        _, prefix, page_s = payload.split(":", 2)
+        await _deliver_picker(responder, prefix, page=int(page_s))
         return
 
     if payload.startswith("empdate:"):
@@ -451,7 +453,7 @@ async def on_callback(event: MessageCallback):
         return
 
     if payload == "menu:delete_employee":
-        await _deliver_delete_picker(responder)
+        await _deliver_picker(responder, "delpick")
         return
 
     if payload.startswith("delpick:"):
@@ -469,7 +471,7 @@ async def on_callback(event: MessageCallback):
         return
 
     if payload == "menu:pending_consent":
-        await _deliver_pending_consent_picker(responder)
+        await _deliver_picker(responder, "consentpick")
         return
 
     if payload.startswith("consentpick:"):
