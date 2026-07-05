@@ -1,5 +1,5 @@
 """
-webforms.py — веб-интерфейс для кадровика: рабочий стол с задачами, дата въезда, медкомиссия.
+webforms.py — веб-интерфейс для кадровика: рабочий стол, карточка сотрудника, медкомиссия.
 
 Отдельный сервис в ТОМ ЖЕ Railway-проекте, что и bot.py: тот же репозиторий, тот же
 DATABASE_URL, те же модели из models.py. Деплой — обычный git push, Railway подхватит
@@ -10,11 +10,26 @@ Start Command именно этого сервиса (см. инструкцию
 create_obligations_for_employee вынесена в отдельный модуль obligations.py и импортируется
 и сюда, и в bot.py — см. obligations.py, там же инструкция по правке bot.py.
 
+2026-07: консолидация. Раньше дата въезда, место въезда, дата договора, согласие и место
+пребывания были отдельными разделами верхнего уровня (каждый — свой список + своя форма).
+Теперь единственное место редактирования — карточка сотрудника (/employees/{id}), где все
+поля собраны на одной странице несколькими независимыми мини-формами (каждая шлёт только
+своё поле, чтобы случайно не затереть остальные при частичном заполнении). Раздел
+"Место въезда" (entry_country) при этом обрёл первый реально работающий обработчик —
+раньше на него ссылались навигация и дашборд, но сам POST/GET для него не был дописан.
+
 Раздел "Медкомиссия" зеркалит две команды бота, а не вводит новую логику:
   - /send_medical_referral <id> — генерация направления (generate_medical_referral_docx)
   - /medical_exam_result <id> <done|failed> — отметка результата на Obligation(type=MEDICAL_EXAM)
 См. _handle_medical_exam_result в bot.py — статус НЕ меняется при "failed" (в модели нет
 поля для причины отказа), это сознательное решение из bot.py, а не упрощение здесь.
+
+Место пребывания (address + address_since) — отдельное юридическое событие (см. deadlines.py,
+второе правило REGISTRATION с trigger_field="address_since"). Критично: address_since
+проставляется ТОЛЬКО когда это реальная смена уже известного адреса — если раньше адреса
+не было (первый ввод), это часть первичной регистрации по entry_date, а не новое событие,
+и address_since должен остаться NULL, иначе следующий вызов create_obligations_for_employee
+создаст лишнее обязательство по несуществующей "смене".
 """
 
 from __future__ import annotations
@@ -116,13 +131,16 @@ input[type=date],input[type=text],input[type=password]{{width:100%;padding:12px;
 font-size:16px;font-family:-apple-system,Segoe UI,Roboto,sans-serif;border:1px solid #c9b48a;
 border-radius:6px;margin:6px 0 12px 0;background:#fffef9;color:#2a1d10}}
 .badge{{display:inline-block;padding:3px 10px;border-radius:10px;font-size:12px;color:#fff8ef;
-font-family:-apple-system,Segoe UI,Roboto,sans-serif;font-weight:600}}
-.badge.red{{background:#7a2e22}} .badge.orange{{background:#b8862b}}
+font-family:-apple-system,Segoe UI,Roboto,sans-serif;font-weight:600;margin:2px 4px 2px 0}}
+.badge.red{{background:#7a2e22}} .badge.orange{{background:#b8862b}} .badge.green{{background:#4a7a3a}}
 .muted{{color:#8a7355;font-size:13px;font-family:-apple-system,Segoe UI,Roboto,sans-serif}}
 nav{{margin-bottom:16px}}
 nav a{{color:#7a2e22;text-decoration:none;margin-right:16px;font-size:14px;padding:6px 0;
 display:inline-block;font-weight:600}}
 form.inline{{display:inline}}
+fieldset{{border:1px solid #e2d3ac;border-radius:6px;padding:12px;margin-bottom:14px}}
+fieldset legend{{font-size:13px;color:#7a2e22;text-transform:uppercase;letter-spacing:.05em;
+font-weight:600;padding:0 6px}}
 
 @media (min-width:760px){{
   body{{max-width:1080px;padding:24px 32px}}
@@ -133,6 +151,7 @@ form.inline{{display:inline}}
   section.grid.wide{{grid-template-columns:repeat(auto-fill,minmax(340px,1fr))}}
   section.grid .card{{margin-bottom:0}}
   section.narrow{{max-width:440px;margin:0 auto}}
+  section.card-form{{max-width:640px;margin:0 auto}}
   a.btn:hover,button:hover{{opacity:.85}}
   nav a:hover{{text-decoration:underline}}
 }}
@@ -146,11 +165,7 @@ PAGE_FOOT = "</body></html>"
 NAV = (
     '<nav>'
     '<a href="/">Рабочий стол</a>'
-    '<a href="/entry_date">Дата въезда</a>'
-    '<a href="/entry_country">Место въезда</a>'
-    '<a href="/address">Место пребывания</a>'
-    '<a href="/contract_date">Дата договора</a>'
-    '<a href="/consent">Согласия</a>'
+    '<a href="/employees">Сотрудники</a>'
     '<a href="/medical">Медкомиссия</a>'
     '<a href="/logout">Выйти</a>'
     '</nav>'
@@ -248,6 +263,8 @@ def logout(request: Request):
     return RedirectResponse("/login", status_code=303)
 
 
+# --- Рабочий стол ------------------------------------------------------------
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request, db: Session = Depends(get_db)):
     if not _logged_in(request):
@@ -255,30 +272,6 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
 
     today = date.today()
     soon = today + timedelta(days=7)
-
-    no_entry_date = db.scalars(
-        select(Employee)
-        .where(Employee.entry_date.is_(None))
-        .order_by(Employee.full_name)
-    ).all()
-
-    no_entry_country = db.scalars(
-        select(Employee)
-        .where(Employee.entry_country.is_(None))
-        .order_by(Employee.full_name)
-    ).all()
-
-    no_consent = db.scalars(
-        select(Employee)
-        .where(Employee.consent_status == ConsentStatus.DRAFT)
-        .order_by(Employee.full_name)
-    ).all()
-
-    no_contract_date = db.scalars(
-        select(Employee)
-        .where(Employee.contract_date.is_(None))
-        .order_by(Employee.full_name)
-    ).all()
 
     overdue = db.scalars(
         select(Obligation)
@@ -305,6 +298,25 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
             f'<span class="badge {badge}">{o.deadline_date.isoformat()}</span></div>'
         )
 
+    # Сотрудники, у которых не хватает хотя бы одного из ключевых полей карточки —
+    # единый список вместо четырёх отдельных разделов, все ведут в /employees/{id}.
+    all_employees = db.scalars(select(Employee).order_by(Employee.full_name)).all()
+
+    def missing_badges(e: Employee) -> list[str]:
+        badges = []
+        if e.entry_date is None:
+            badges.append('<span class="badge red">нет даты въезда</span>')
+        if e.entry_country is None:
+            badges.append('<span class="badge orange">нет места въезда</span>')
+        if e.contract_date is None:
+            badges.append('<span class="badge orange">нет даты договора</span>')
+        if e.consent_status == ConsentStatus.DRAFT:
+            badges.append('<span class="badge red">нет согласия</span>')
+        return badges
+
+    needs_attention = [(e, missing_badges(e)) for e in all_employees]
+    needs_attention = [(e, b) for e, b in needs_attention if b]
+
     # Медобязательства, ожидающие направления: PENDING medical_exam без связанного Referral.
     referred_obligation_ids = {r.obligation_id for r in db.scalars(select(Referral)).all()}
     need_referral = [
@@ -320,6 +332,13 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
         select(Referral).where(Referral.exam_status == ExamStatus.REFERRED)
     ).all()
 
+    def attention_row(e: Employee, badges: list[str]) -> str:
+        return (
+            f'<div class="card">{e.full_name}<br>'
+            f'{"".join(badges)}<br>'
+            f'<a class="btn" href="/employees/{e.id}">Открыть карточку</a></div>'
+        )
+
     body = f"""
 <h1>Задачи</h1>
 
@@ -334,29 +353,8 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
 </section>
 
 <section class="grid">
-<h2>Без даты въезда ({len(no_entry_date)})</h2>
-{''.join(f'<div class="card">{e.full_name} <a class="btn" href="/entry_date/{e.id}">Указать дату</a></div>' for e in no_entry_date) or '<p class="muted">Все указаны.</p>'}
-</section>
-
-<section class="grid">
-<h2>Без места въезда ({len(no_entry_country)})</h2>
-{''.join(f'<div class="card">{e.full_name} <a class="btn" href="/entry_country/{e.id}">Указать место</a></div>' for e in no_entry_country) or '<p class="muted">У всех указано место въезда.</p>'}
-</section>
-
-<section class="grid">
-<h2>Без подтверждённого согласия ({len(no_consent)})</h2>
-{''.join(f'<div class="card">{e.full_name} <a class="btn" href="/consent/{e.id}">Подтвердить</a></div>' for e in no_consent) or '<p class="muted">У всех есть согласие.</p>'}
-</section>
-
-<section class="grid">
-<h2>Без даты договора ({len(no_contract_date)})</h2>
-{''.join(f'<div class="card">{e.full_name} <a class="btn" href="/contract_date/{e.id}">Указать дату</a></div>' for e in no_contract_date) or '<p class="muted">У всех указана дата договора.</p>'}
-</section>
-
-<section>
-<h2>Место пребывания</h2>
-<div class="card">Смена адреса создаёт новое обязательство по регистрации автоматически.<br>
-<a class="btn" href="/address">Открыть раздел</a></div>
+<h2>Требуют внимания в карточке ({len(needs_attention)})</h2>
+{''.join(attention_row(e, b) for e, b in needs_attention) or '<p class="muted">У всех сотрудников заполнены ключевые поля.</p>'}
 </section>
 
 <section>
@@ -369,28 +367,33 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
     return _render("Рабочий стол", body)
 
 
-@app.get("/entry_date", response_class=HTMLResponse)
-def entry_date_list(request: Request, db: Session = Depends(get_db)):
+# --- Сотрудники: список + единая карточка ------------------------------------
+
+@app.get("/employees", response_class=HTMLResponse)
+def employees_list(request: Request, db: Session = Depends(get_db)):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
 
-    employees = db.scalars(
-        select(Employee)
-        .where(Employee.entry_date.is_(None))
-        .order_by(Employee.full_name)
-    ).all()
+    employees = db.scalars(select(Employee).order_by(Employee.full_name)).all()
+
+    def status_badge(e: Employee) -> str:
+        return (
+            '<span class="badge green">согласие ✓</span>'
+            if e.consent_status == ConsentStatus.CONFIRMED
+            else '<span class="badge red">без согласия</span>'
+        )
 
     rows = "".join(
-        f'<div class="card">{e.full_name}<br>'
-        f'<a class="btn" href="/entry_date/{e.id}">Указать дату</a></div>'
+        f'<div class="card">{e.full_name}<br>{status_badge(e)}<br>'
+        f'<a class="btn" href="/employees/{e.id}">Открыть карточку</a></div>'
         for e in employees
-    ) or '<p class="muted">У всех сотрудников уже есть дата въезда.</p>'
+    ) or '<p class="muted">Сотрудников в базе нет.</p>'
 
-    return _render("Дата въезда", f"<h1>Кому нужна дата въезда</h1><section class=\"grid\">{rows}</section>")
+    return _render("Сотрудники", f"<h1>Сотрудники ({len(employees)})</h1><section class=\"grid\">{rows}</section>")
 
 
-@app.get("/entry_date/{employee_id}", response_class=HTMLResponse)
-def entry_date_form(employee_id: str, request: Request, db: Session = Depends(get_db)):
+@app.get("/employees/{employee_id}", response_class=HTMLResponse)
+def employee_card(employee_id: str, request: Request, db: Session = Depends(get_db)):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
 
@@ -398,20 +401,76 @@ def entry_date_form(employee_id: str, request: Request, db: Session = Depends(ge
     if emp is None:
         raise HTTPException(404, "Сотрудник не найден")
 
+    today_s = date.today().isoformat()
+
+    if emp.consent_status == ConsentStatus.CONFIRMED:
+        consent_block = '<p><span class="badge green">Согласие подтверждено</span></p>'
+    else:
+        consent_block = f"""
+<p class="muted">Подтвердить согласие кнопкой? Это тестовый способ — юридически слабее,
+чем сканированная подпись (ст.9 152-ФЗ требует осознанного согласия, клик без верификации
+личности это не подтверждает).</p>
+<form method="post" action="/employees/{emp.id}/consent_confirm">
+<button type="submit">✅ Подтвердить (кнопкой, тест)</button>
+</form>"""
+
     body = f"""
 <h1>{emp.full_name}</h1>
-<section class="narrow">
-<form method="post" action="/entry_date/{emp.id}">
-<label>Дата въезда</label>
-<input type="date" name="entry_date" required max="{date.today().isoformat()}">
+<section class="card-form">
+
+<fieldset>
+<legend>Дата въезда</legend>
+<form method="post" action="/employees/{emp.id}/entry_date">
+<input type="date" name="entry_date" required max="{today_s}"
+value="{emp.entry_date.isoformat() if emp.entry_date else ''}">
 <button type="submit">Сохранить</button>
 </form>
+</fieldset>
+
+<fieldset>
+<legend>Место въезда</legend>
+<form method="post" action="/employees/{emp.id}/entry_country">
+<input type="text" name="entry_country" required value="{emp.entry_country or ''}">
+<button type="submit">Сохранить</button>
+</form>
+</fieldset>
+
+<fieldset>
+<legend>Место пребывания</legend>
+<p class="muted">Текущий адрес: {emp.address or "не указан"}</p>
+<form method="post" action="/employees/{emp.id}/address">
+<label>Адрес</label>
+<input type="text" name="address" required value="{emp.address or ''}">
+<label>Дата, с которой действует этот адрес</label>
+<input type="date" name="address_since" required max="{today_s}" value="{today_s}">
+<button type="submit">Сохранить</button>
+</form>
+<p class="muted">Если это первый адрес для сотрудника — дата не создаст новое обязательство
+по регистрации (оно уже создано по дате въезда). Новое обязательство появляется только
+когда адрес реально МЕНЯЕТСЯ.</p>
+</fieldset>
+
+<fieldset>
+<legend>Дата договора</legend>
+<form method="post" action="/employees/{emp.id}/contract_date">
+<input type="date" name="contract_date" required max="{today_s}"
+value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
+<button type="submit">Сохранить</button>
+</form>
+</fieldset>
+
+<fieldset>
+<legend>Согласие на обработку ПД</legend>
+{consent_block}
+</fieldset>
+
+<a class="btn secondary" href="/employees">← Ко всем сотрудникам</a>
 </section>"""
-    return _render("Дата въезда", body)
+    return _render(emp.full_name, body)
 
 
-@app.post("/entry_date/{employee_id}")
-def entry_date_submit(
+@app.post("/employees/{employee_id}/entry_date")
+def employee_entry_date_submit(
     employee_id: str,
     request: Request,
     entry_date: date = Form(...),
@@ -434,136 +493,14 @@ def entry_date_submit(
     if emp.consent_status == ConsentStatus.CONFIRMED:
         create_obligations_for_employee(db, emp)
 
-    return RedirectResponse("/entry_date", status_code=303)
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
 
 
-# --- Согласия (тестовое подтверждение кнопкой) ------------------------------
-# Зеркалит _deliver_consent_confirmation / _execute_consent_confirm_by_button в bot.py:
-# тот же метод ConsentMethod.BOT_BUTTON, тот же дисклеймер про юридическую слабость
-# такого способа по сравнению со сканом (ст.9 152-ФЗ), тот же вызов
-# create_obligations_for_employee сразу после подтверждения.
-
-@app.get("/consent", response_class=HTMLResponse)
-def consent_list(request: Request, db: Session = Depends(get_db)):
-    if not _logged_in(request):
-        return RedirectResponse("/login", status_code=303)
-
-    employees = db.scalars(
-        select(Employee)
-        .where(Employee.consent_status == ConsentStatus.DRAFT)
-        .order_by(Employee.full_name)
-    ).all()
-
-    rows = "".join(
-        f'<div class="card">{e.full_name}<br>'
-        f'<a class="btn" href="/consent/{e.id}">Подтвердить</a></div>'
-        for e in employees
-    ) or '<p class="muted">У всех сотрудников согласие подтверждено.</p>'
-
-    return _render("Согласия", f"<h1>Ожидают согласия</h1><section class=\"grid\">{rows}</section>")
-
-
-@app.get("/consent/{employee_id}", response_class=HTMLResponse)
-def consent_confirm_form(employee_id: str, request: Request, db: Session = Depends(get_db)):
-    if not _logged_in(request):
-        return RedirectResponse("/login", status_code=303)
-
-    emp = db.get(Employee, employee_id)
-    if emp is None:
-        raise HTTPException(404, "Сотрудник не найден")
-
-    body = f"""
-<h1>{emp.full_name}</h1>
-<section class="narrow">
-<p class="muted">Подтвердить согласие кнопкой? Это тестовый способ — юридически слабее,
-чем сканированная подпись (ст.9 152-ФЗ требует осознанного согласия, клик без верификации
-личности это не подтверждает).</p>
-<form method="post" action="/consent/{emp.id}/confirm">
-<button type="submit">✅ Подтвердить (кнопкой, тест)</button>
-</form>
-<a class="btn secondary" href="/consent">Отмена</a>
-</section>"""
-    return _render("Согласия", body)
-
-
-@app.post("/consent/{employee_id}/confirm")
-def consent_confirm_submit(employee_id: str, request: Request, db: Session = Depends(get_db)):
-    if not _logged_in(request):
-        return RedirectResponse("/login", status_code=303)
-
-    emp = db.get(Employee, employee_id)
-    if emp is None:
-        raise HTTPException(404, "Сотрудник не найден")
-
-    # proof здесь — не user_id из MAX (кадровик авторизован логином/паролем, не MAX-аккаунтом),
-    # поэтому используем логин кадровика вместо user_id, чтобы след в аудите оставался осмысленным.
-    consent = Consent(
-        employee_id=emp.id,
-        method=ConsentMethod.BOT_BUTTON,
-        proof=f"button_click:webforms:{WEBFORMS_USER}:{datetime.now(MSK).isoformat()}",
-        consent_text_version=CONSENT_TEXT_VERSION,
-    )
-    db.add(consent)
-
-    emp.consent_status = ConsentStatus.CONFIRMED
-    db.add(emp)
-    db.commit()
-    db.refresh(emp)
-
-    create_obligations_for_employee(db, emp)
-
-    return RedirectResponse("/consent", status_code=303)
-
-
-# --- Дата договора -----------------------------------------------------------
-# Симметрично /entry_date выше и _apply_contract_date() в bot.py.
-
-@app.get("/contract_date", response_class=HTMLResponse)
-def contract_date_list(request: Request, db: Session = Depends(get_db)):
-    if not _logged_in(request):
-        return RedirectResponse("/login", status_code=303)
-
-    employees = db.scalars(
-        select(Employee)
-        .where(Employee.contract_date.is_(None))
-        .order_by(Employee.full_name)
-    ).all()
-
-    rows = "".join(
-        f'<div class="card">{e.full_name}<br>'
-        f'<a class="btn" href="/contract_date/{e.id}">Указать дату</a></div>'
-        for e in employees
-    ) or '<p class="muted">У всех сотрудников уже есть дата договора.</p>'
-
-    return _render("Дата договора", f"<h1>Кому нужна дата договора</h1><section class=\"grid\">{rows}</section>")
-
-
-@app.get("/contract_date/{employee_id}", response_class=HTMLResponse)
-def contract_date_form(employee_id: str, request: Request, db: Session = Depends(get_db)):
-    if not _logged_in(request):
-        return RedirectResponse("/login", status_code=303)
-
-    emp = db.get(Employee, employee_id)
-    if emp is None:
-        raise HTTPException(404, "Сотрудник не найден")
-
-    body = f"""
-<h1>{emp.full_name}</h1>
-<section class="narrow">
-<form method="post" action="/contract_date/{emp.id}">
-<label>Дата договора</label>
-<input type="date" name="contract_date" required max="{date.today().isoformat()}">
-<button type="submit">Сохранить</button>
-</form>
-</section>"""
-    return _render("Дата договора", body)
-
-
-@app.post("/contract_date/{employee_id}")
-def contract_date_submit(
+@app.post("/employees/{employee_id}/entry_country")
+def employee_entry_country_submit(
     employee_id: str,
     request: Request,
-    contract_date: date = Form(...),
+    entry_country: str = Form(...),
     db: Session = Depends(get_db),
 ):
     if not _logged_in(request):
@@ -573,74 +510,15 @@ def contract_date_submit(
     if emp is None:
         raise HTTPException(404, "Сотрудник не найден")
 
-    emp.contract_date = contract_date
+    # Справочное поле — не участвует в deadlines.py (DEADLINE_RULES), obligations не пересчитываются.
+    emp.entry_country = entry_country.strip()
     db.commit()
-    db.refresh(emp)
 
-    # Симметрично _apply_contract_date() в bot.py: обязательства, зависящие от даты договора
-    # (contract_notice, efs1_report), досоздаются сразу, если согласие уже подтверждено.
-    if emp.consent_status == ConsentStatus.CONFIRMED:
-        create_obligations_for_employee(db, emp)
-
-    return RedirectResponse("/contract_date", status_code=303)
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
 
 
-# --- Место пребывания (address + address_since) -----------------------------
-# Смена адреса — отдельное юридическое событие (см. deadlines.py, второе правило
-# REGISTRATION с trigger_field="address_since"). Критично: address_since проставляется
-# ТОЛЬКО когда это реальная смена уже известного адреса — если раньше адреса не было
-# (первый ввод), это часть первичной регистрации по entry_date, а не новое событие,
-# и address_since должен остаться NULL, иначе следующий вызов create_obligations_for_employee
-# создаст лишнее обязательство по несуществующей "смене".
-
-@app.get("/address", response_class=HTMLResponse)
-def address_list(request: Request, db: Session = Depends(get_db)):
-    if not _logged_in(request):
-        return RedirectResponse("/login", status_code=303)
-
-    employees = db.scalars(select(Employee).order_by(Employee.full_name)).all()
-
-    rows = "".join(
-        f'<div class="card">{e.full_name}<br>'
-        f'<span class="muted">{e.address or "адрес не указан"}</span><br>'
-        f'<a class="btn" href="/address/{e.id}">Изменить</a></div>'
-        for e in employees
-    ) or '<p class="muted">Сотрудников в базе нет.</p>'
-
-    return _render("Место пребывания", f"<h1>Место пребывания сотрудников</h1><section class=\"grid\">{rows}</section>")
-
-
-@app.get("/address/{employee_id}", response_class=HTMLResponse)
-def address_form(employee_id: str, request: Request, db: Session = Depends(get_db)):
-    if not _logged_in(request):
-        return RedirectResponse("/login", status_code=303)
-
-    emp = db.get(Employee, employee_id)
-    if emp is None:
-        raise HTTPException(404, "Сотрудник не найден")
-
-    current = emp.address or ""
-    body = f"""
-<h1>{emp.full_name}</h1>
-<section class="narrow">
-<p class="muted">Текущий адрес: {current or "не указан"}</p>
-<form method="post" action="/address/{emp.id}">
-<label>Адрес места пребывания</label>
-<input type="text" name="address" required value="{current}">
-<label>Дата, с которой действует этот адрес</label>
-<input type="date" name="address_since" required max="{date.today().isoformat()}"
-value="{date.today().isoformat()}">
-<button type="submit">Сохранить</button>
-</form>
-<p class="muted">Если это первый адрес для сотрудника — дата ниже не создаст новое
-обязательство по регистрации, оно уже создано по дате въезда. Обязательство создаётся
-заново только когда адрес реально МЕНЯЕТСЯ.</p>
-</section>"""
-    return _render("Место пребывания", body)
-
-
-@app.post("/address/{employee_id}")
-def address_submit(
+@app.post("/employees/{employee_id}/address")
+def employee_address_submit(
     employee_id: str,
     request: Request,
     address: str = Form(...),
@@ -671,8 +549,70 @@ def address_submit(
     if is_real_change and emp.consent_status == ConsentStatus.CONFIRMED:
         create_obligations_for_employee(db, emp)
 
-    return RedirectResponse("/address", status_code=303)
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
 
+
+@app.post("/employees/{employee_id}/contract_date")
+def employee_contract_date_submit(
+    employee_id: str,
+    request: Request,
+    contract_date: date = Form(...),
+    db: Session = Depends(get_db),
+):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    emp.contract_date = contract_date
+    db.commit()
+    db.refresh(emp)
+
+    # Симметрично _apply_contract_date() в bot.py: обязательства, зависящие от даты договора
+    # (contract_notice, efs1_report), досоздаются сразу, если согласие уже подтверждено.
+    if emp.consent_status == ConsentStatus.CONFIRMED:
+        create_obligations_for_employee(db, emp)
+
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+
+@app.post("/employees/{employee_id}/consent_confirm")
+def employee_consent_confirm_submit(employee_id: str, request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    # Зеркалит _execute_consent_confirm_by_button в bot.py: тот же метод ConsentMethod.BOT_BUTTON,
+    # тот же дисклеймер про юридическую слабость такого способа по сравнению со сканом (ст.9 152-ФЗ).
+    # proof здесь — логин кадровика, а не user_id из MAX (кадровик авторизован логином/паролем,
+    # не MAX-аккаунтом), чтобы след в аудите оставался осмысленным.
+    consent = Consent(
+        employee_id=emp.id,
+        method=ConsentMethod.BOT_BUTTON,
+        proof=f"button_click:webforms:{WEBFORMS_USER}:{datetime.now(MSK).isoformat()}",
+        consent_text_version=CONSENT_TEXT_VERSION,
+    )
+    db.add(consent)
+
+    emp.consent_status = ConsentStatus.CONFIRMED
+    db.add(emp)
+    db.commit()
+    db.refresh(emp)
+
+    create_obligations_for_employee(db, emp)
+
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+
+# --- Медкомиссия ---------------------------------------------------------
+# Зеркалит две команды бота: /send_medical_referral и /medical_exam_result.
+# Не тронуто консолидацией — отдельный раздел, не привязан к общей карточке сотрудника,
+# потому что список "кому нужно направление" естественно общий на всех, а не per-employee.
 
 @app.get("/medical", response_class=HTMLResponse)
 def medical_list(request: Request, db: Session = Depends(get_db)):
