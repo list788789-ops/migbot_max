@@ -39,7 +39,8 @@
   COMPANY_LEGAL_ADDRESS    — юридический адрес
   HR_SIGNATORY_NAME        — ФИО подписанта со стороны работодателя
   HR_SIGNATORY_POSITION    — должность подписанта
-  CLINIC_NAME              — наименование медицинской организации
+  CLINIC_NAME              — ПОЛНОЕ наименование медицинской организации (шапка бланка)
+  CLINIC_SHORT_NAME        — короткое имя МО для блока подписи (напр. ГОАУЗ «МОМЦ»)
   CLINIC_CONTRACT_NUMBER   — номер договора с клиникой
   CLINIC_CONTRACT_DATE     — дата договора с клиникой, формат ДД.ММ.ГГГГ
   CLINIC_CHIEF_DOCTOR_NAME — ФИО главного врача клиники (для блока подписи "От Исполнителя")
@@ -230,13 +231,23 @@ def generate_consent_docx(employee: Employee, output_dir: str = "/tmp") -> str:
     return path
 
 
-CLINIC_NAME = os.environ.get("CLINIC_NAME", "[НЕ ЗАПОЛНЕНО — наименование медицинской организации]")
-CLINIC_CONTRACT_NUMBER = os.environ.get("CLINIC_CONTRACT_NUMBER", "[номер договора не указан]")
-CLINIC_CONTRACT_DATE = os.environ.get("CLINIC_CONTRACT_DATE", "[дата договора не указана]")
-CLINIC_CHIEF_DOCTOR_NAME = os.environ.get("CLINIC_CHIEF_DOCTOR_NAME", "[ФИО главного врача не указано]")
-PAYER_NAME = os.environ.get("PAYER_NAME", "[НЕ ЗАПОЛНЕНО — заказчик услуги, ИП/юрлицо]")
-PAYER_SIGNATORY_NAME = os.environ.get("PAYER_SIGNATORY_NAME", PAYER_NAME)
-PAYER_PHONE = os.environ.get("PAYER_PHONE", "[телефон заказчика не указан]")
+# Реквизиты клиники и заказчика. Значения по умолчанию зашиты как fallback (по образцу
+# направления «Пирогова», договор №176), но переменная окружения их переопределяет —
+# при смене договора/главврача/телефона правь env в Railway, а не этот файл.
+# CLINIC_NAME — ПОЛНОЕ имя МО (идёт в шапку "В ..."); CLINIC_SHORT_NAME — короткое,
+# для блока подписи "От Исполнителя" (в образце там "ГОАУЗ «МОМЦ»", а не полное имя).
+CLINIC_NAME = os.environ.get(
+    "CLINIC_NAME",
+    "Государственное областное автономное учреждение здравоохранения "
+    "«Мурманский областной медицинский центр»",
+)
+CLINIC_SHORT_NAME = os.environ.get("CLINIC_SHORT_NAME", "ГОАУЗ «МОМЦ»")
+CLINIC_CONTRACT_NUMBER = os.environ.get("CLINIC_CONTRACT_NUMBER", "176")
+CLINIC_CONTRACT_DATE = os.environ.get("CLINIC_CONTRACT_DATE", "25.06.2026")
+CLINIC_CHIEF_DOCTOR_NAME = os.environ.get("CLINIC_CHIEF_DOCTOR_NAME", "А.М. Амозов")
+PAYER_NAME = os.environ.get("PAYER_NAME", "ИП Буц С.Ю.")
+PAYER_SIGNATORY_NAME = os.environ.get("PAYER_SIGNATORY_NAME", "С. Ю. Буц")
+PAYER_PHONE = os.environ.get("PAYER_PHONE", "+7 (985) 415-54-20")
 
 MEDICAL_SERVICE_TEXT = (
     "Медицинское освидетельствование на наличие или отсутствие инфекционных заболеваний, "
@@ -349,7 +360,7 @@ def generate_medical_referral_docx(employee: Employee, output_dir: str = "/tmp")
 
     _cell(0, 0, "От Исполнителя:", bold=True)
     _cell(0, 1, "От Заказчика:", bold=True)
-    _cell(1, 0, f"{CLINIC_NAME}")
+    _cell(1, 0, f"{CLINIC_SHORT_NAME}")
     _cell(1, 1, "Индивидуальный предприниматель")
     _cell(2, 0, "Главный врач")
     _cell(2, 1, "")
