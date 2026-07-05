@@ -125,15 +125,68 @@ def _render(title: str, body: str) -> str:
     return PAGE_HEAD.format(title=title, org_name=ORG_NAME) + NAV + body + PAGE_FOOT
 
 
+LOGIN_HEAD = """<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Вход</title>
+<style>
+*{{box-sizing:border-box}}
+body.login-page{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+background:radial-gradient(ellipse at center,#f4ecd8 0%,#e4d5b0 55%,#cdb98a 100%);
+font-family:Georgia,'Times New Roman',serif;position:relative;overflow:hidden;padding:16px}}
+body.login-page::before{{content:"";position:absolute;inset:0;pointer-events:none;
+background-image:repeating-linear-gradient(0deg,rgba(60,40,10,.035) 0px,rgba(60,40,10,.035) 1px,
+transparent 1px,transparent 3px)}}
+.vintage-bg{{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+opacity:.32;transform:rotate(-9deg);pointer-events:none}}
+.vintage-bg svg{{width:320px;height:320px}}
+.login-card{{position:relative;z-index:1;background:#fffdf6;border:1px solid #c9b48a;
+border-radius:4px;padding:28px 24px;width:280px;box-shadow:0 8px 28px rgba(60,40,10,.28)}}
+.login-card h1{{font-size:19px;margin:0 0 2px 0;color:#3a2a1a}}
+.login-card .subtitle{{font-size:11px;color:#8a7355;margin:0 0 18px 0;letter-spacing:.06em;
+text-transform:uppercase}}
+.login-card input{{width:100%;padding:10px;font-size:16px;border:1px solid #c9b48a;border-radius:4px;
+margin:6px 0 12px 0;background:#fffef9;font-family:inherit}}
+.login-card button{{width:100%;background:#7a2e22;color:#fff8ef;border:none;padding:11px;
+border-radius:4px;font-size:15px;cursor:pointer;letter-spacing:.03em;font-family:inherit}}
+.login-card a.btn{{display:inline-block;margin-top:12px;color:#7a2e22;text-decoration:underline;
+font-size:13px}}
+</style></head>
+<body class="login-page">
+<div class="vintage-bg">
+<svg viewBox="0 0 400 400">
+<defs>
+<path id="stampCircle" d="M 200,200 m -150,0 a 150,150 0 1,1 300,0 a 150,150 0 1,1 -300,0" />
+</defs>
+<circle cx="200" cy="200" r="150" fill="none" stroke="#7a2e22" stroke-width="4"/>
+<circle cx="200" cy="200" r="130" fill="none" stroke="#7a2e22" stroke-width="2"/>
+<text font-size="19" fill="#7a2e22" letter-spacing="6">
+<textPath href="#stampCircle" startOffset="1%">МИГРАЦИОННЫЙ УЧЁТ • БЕЛОКАМЕННАЯ • MURMANSK •</textPath>
+</text>
+<g stroke="#7a2e22" fill="none" stroke-width="3">
+<line x1="200" y1="118" x2="200" y2="282"/>
+<line x1="118" y1="200" x2="282" y2="200"/>
+<circle cx="200" cy="200" r="42"/>
+<circle cx="200" cy="200" r="6" fill="#7a2e22"/>
+</g>
+</svg>
+</div>
+"""
+
+
 @app.get("/login", response_class=HTMLResponse)
 def login_form():
-    return PAGE_HEAD.format(title="Вход", org_name=ORG_NAME) + """
-<h1>Кадровик — вход</h1>
+    return LOGIN_HEAD + """
+<div class="login-card">
+<h1>Миграционный учёт</h1>
+<p class="subtitle">Вход для кадровика</p>
 <form method="post" action="/login">
 <input type="text" name="username" placeholder="Логин" required>
 <input type="password" name="password" placeholder="Пароль" required>
 <button type="submit">Войти</button>
-</form>""" + PAGE_FOOT
+</form>
+</div>
+</body></html>"""
 
 
 @app.post("/login")
@@ -142,9 +195,13 @@ def login_submit(request: Request, username: str = Form(...), password: str = Fo
         request.session["logged_in"] = True
         return RedirectResponse("/", status_code=303)
     return HTMLResponse(
-        PAGE_HEAD.format(title="Вход", org_name=ORG_NAME)
-        + '<h1>Неверный логин или пароль</h1><a class="btn" href="/login">Назад</a>'
-        + PAGE_FOOT,
+        LOGIN_HEAD
+        + """
+<div class="login-card">
+<h1>Неверный логин или пароль</h1>
+<a class="btn" href="/login">Назад</a>
+</div>
+</body></html>""",
         status_code=401,
     )
 
