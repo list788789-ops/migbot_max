@@ -449,6 +449,7 @@ async def on_callback(event: MessageCallback):
             "state": "awaiting_entry_date_button",
             "employee_id": employee_id,
         }
+        await event.message.delete()  # убираем список — дата будет введена текстом дальше
         await responder.send(f"Введите дату въезда для {full_name} в формате ГГГГ-ММ-ДД:")
         return
 
@@ -458,15 +459,18 @@ async def on_callback(event: MessageCallback):
 
     if payload.startswith("delpick:"):
         employee_id = payload.split(":", 1)[1]
+        await event.message.delete()  # список сотрудников больше не нужен на этом шаге
         await _deliver_delete_confirmation(responder, employee_id)
         return
 
     if payload.startswith("delconfirm:"):
         employee_id = payload.split(":", 1)[1]
+        await event.message.delete()  # диалог подтверждения — сотрудник и так исчезнет из списков
         await _execute_delete_employee(responder, employee_id)
         return
 
     if payload == "delcancel":
+        await event.message.delete()
         await responder.send("Отменено.")
         return
 
@@ -476,11 +480,13 @@ async def on_callback(event: MessageCallback):
 
     if payload.startswith("consentpick:"):
         employee_id = payload.split(":", 1)[1]
+        await event.message.delete()  # список ожидающих согласия больше не нужен на этом шаге
         await _deliver_consent_confirmation(responder, employee_id)
         return
 
     if payload.startswith("consentconfirm:"):
         employee_id = payload.split(":", 1)[1]
+        await event.message.delete()  # диалог подтверждения — сотрудник уйдёт из DRAFT-списка сам
         await _execute_consent_confirm_by_button(responder, employee_id)
         return
 
