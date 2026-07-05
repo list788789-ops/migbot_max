@@ -315,8 +315,7 @@ async def _deliver_picker(
             if nav:
                 builder.row(*nav)
 
-        if prefix == "consentpick":
-            builder.row(CallbackButton(text="🚪 Выход", payload="exitpicker:consentpick"))
+        builder.row(CallbackButton(text="🚪 Выход", payload=f"exitpicker:{prefix}"))
 
     header = f"{PICKER_TITLES.get(prefix, prefix)}: {total}"
     if total_pages > 1:
