@@ -763,10 +763,10 @@ def employee_create(
 
 
 def _help(text: str) -> str:
-    """Значок-справка (i) с раскрытием по тапу. Надёжно на мобильном (нативный <details>,
+    """Значок-подсказка (i) с раскрытием по тапу. Надёжно на мобильном (нативный <details>,
     без JS и без title, который на телефоне не показывается)."""
     return (
-        '<details class="field-help"><summary><span class="i">i</span> справка</summary>'
+        '<details class="field-help"><summary><span class="i">i</span> подсказка</summary>'
         f'<p>{html.escape(text)}</p></details>'
     )
 
