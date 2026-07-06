@@ -114,6 +114,11 @@ class ObligationType(str, enum.Enum):
                                                    # та же процедура и карта, отдельным типом НЕ заводится.
     REGISTRATION_RENEWAL = "registration_renewal"  # продление по правилу "90 из 180" — периодическое,
                                                     # создаётся отдельным cron-скриптом, не разовым триггером
+    DEPARTURE_NOTICE = "departure_notice"          # снятие с миграционного учёта (уведомление об убытии)
+                                                    # при увольнении. Принимающая сторона (вахта) обязана
+                                                    # подать в 7 рабочих дней с даты убытия (ст.23 №109-ФЗ,
+                                                    # п.45 Правил ПП №9). Работодатель ТСМ — принимающая
+                                                    # сторона. Пропуск -> риск обвинения в фиктивной постановке.
 
 
 class DeadlineUnit(str, enum.Enum):
@@ -156,7 +161,9 @@ class Employee(Base):
 
     entry_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     contract_date: Mapped[date | None] = mapped_column(Date, nullable=True)
-    contract_end_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    contract_end_date: Mapped[date | None] = mapped_column(Date, nullable=True)  # дата увольнения
+    # (расторжения договора). Ставится при оформлении увольнения; создаёт обязательства
+    # CONTRACT_TERMINATION_NOTICE (+3 раб.дня) и DEPARTURE_NOTICE (+7 раб.дней).
 
     language: Mapped[str] = mapped_column(String, default="ru")  # ISO-код, напр. 'kk', 'ru'
     phone: Mapped[str | None] = mapped_column(String, nullable=True)  # свой номер сотрудника, не корпоративный
