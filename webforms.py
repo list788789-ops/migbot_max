@@ -1094,6 +1094,11 @@ def employee_card(employee_id: str, request: Request, db: Session = Depends(get_
     # Плательщик госпошлины, запомненный на сессию (prefill поля). Экранируем — уходит в HTML-атрибут.
     _last_payer = html.escape(request.session.get("last_payer", ""), quote=True)
 
+    # Роль: прораб — только чтение и скачивание, формы записи ему не показываем (сервер их
+    # тоже режет 403, но кнопки-впустую путают). can_write = не прораб.
+    _cu = _current_user(request, db)
+    can_write = bool(_cu and _cu.role != UserRole.PRORAB)
+
     # Тексты справок у полей карточки (значок i с раскрытием). Коротко: что это и что делает.
     help_entry = _help(
         "Дата въезда в РФ по миграционной карте/штампу. От неё считаются сроки: регистрация "
@@ -1236,22 +1241,18 @@ onsubmit="return confirm(&#39;Отменить договор? Дата дого
 <button type="submit">✅ Подтвердить (кнопкой, тест)</button>
 </form>"""
 
-    body = f"""
-<h1>{emp.full_name}</h1>
-<section class="card-form">
-<div class="card-cols">
-<div class="card-col">
+    # Левая колонка: пишущим — форма сохранения; прорабу — те же данные текстом (только чтение).
+    if can_write:
+        left_col = f"""
 <p class="muted">Заполни известные поля и нажми одну кнопку внизу. Пустые поля не трогаются.</p>
 <form id="saveform" method="post" action="/employees/{emp.id}/save">
 <input type="hidden" name="confirmed" value="">
-
 <fieldset>
 <legend>Дата въезда</legend>
 <input type="date" name="entry_date" max="{today_s}"
 value="{emp.entry_date.isoformat() if emp.entry_date else ''}">
 {help_entry}
 </fieldset>
-
 <fieldset>
 <legend>Дактилоскопия («грин карта»)</legend>
 <input type="date" name="dactyloscopy_date" max="{today_s}"
@@ -1259,8 +1260,6 @@ data-orig="{emp.dactyloscopy_date.isoformat() if emp.dactyloscopy_date else ''}"
 value="{emp.dactyloscopy_date.isoformat() if emp.dactyloscopy_date else ''}">
 {help_dact}
 </fieldset>
-
-
 <fieldset>
 <legend>Место пребывания</legend>
 <p class="muted">Текущий адрес: {emp.address or "не указан"}</p>
@@ -1270,16 +1269,64 @@ value="{emp.dactyloscopy_date.isoformat() if emp.dactyloscopy_date else ''}">
 <input type="date" name="address_since" max="{today_s}" value="{today_s}">
 {help_address}
 </fieldset>
-
 <fieldset>
 <legend>Дата договора</legend>
 <input type="date" name="contract_date" max="{today_s}"
 value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
 {help_contract_date}
 </fieldset>
-
 <button type="submit" class="btn-full">Сохранить</button>
+</form>"""
+    else:
+        _d = lambda v: v if v else "—"
+        left_col = f"""
+<p class="muted">Режим чтения. Изменение данных доступно кадровику.</p>
+<fieldset><legend>Дата въезда</legend><p>{_d(emp.entry_date.isoformat() if emp.entry_date else None)}</p></fieldset>
+<fieldset><legend>Дактилоскопия</legend><p>{_d(emp.dactyloscopy_date.isoformat() if emp.dactyloscopy_date else None)}</p></fieldset>
+<fieldset><legend>Место пребывания</legend><p>{_d(emp.address)}</p></fieldset>
+<fieldset><legend>Дата договора</legend><p>{_d(emp.contract_date.isoformat() if emp.contract_date else None)}</p></fieldset>"""
+
+    # Прораб — только чтение: убираем формы записи из правой колонки. Согласие/статус
+    # показываем текстом-статусом; договор оставляем ТОЛЬКО предпросмотр и скачивание
+    # (генерация документа — разрешена прорабу), но без «Заключить»/«Отменить».
+    if not can_write:
+        # согласие: только статус, без кнопки подтверждения
+        if emp.consent_status == ConsentStatus.CONFIRMED:
+            consent_block = '<p><span class="badge green">Согласие подтверждено</span></p>'
+        else:
+            consent_block = '<p class="muted">Согласие не подтверждено. Подтверждение доступно кадровику.</p>'
+        # статус: только текущее значение, без формы смены
+        _rs_ru = {"primary": "Первичный учёт", "prior": "Ранее стоял на учёте в РФ"}.get(
+            (emp.registration_status.value if emp.registration_status else ""), "не задан")
+        status_block = f'<p>Статус: <b>{_rs_ru}</b></p><p class="muted">Изменение доступно кадровику.</p>'
+        # договор: предпросмотр + скачивание (если заключён), без заключения/отмены
+        if (emp.tab_number or "").strip() and emp.registration_status is not None:
+            _dl = ""
+            if emp.contract_date is not None:
+                _dl = f"""<p class="muted">Договор заключён {emp.contract_date.strftime("%d.%m.%Y")}.</p>
+<form method="post" action="/employees/{emp.id}/labor_contract/download">
+<input type="hidden" name="position" value="Монтажник">
+<input type="hidden" name="salary" value="30000">
+<button type="submit" class="btn-full">Скачать .docx</button>
+</form>"""
+            contract_block = f"""
+<p class="muted">Режим чтения. Заключение договора доступно кадровику.</p>
+<form method="post" action="/employees/{emp.id}/labor_contract/preview">
+<input type="hidden" name="position" value="Монтажник">
+<input type="hidden" name="salary" value="30000">
+<input type="hidden" name="contract_date" value="{today_s}">
+<button type="submit" class="secondary btn-full">Предпросмотр договора</button>
 </form>
+{_dl}"""
+        else:
+            contract_block = '<p class="muted">Договор недоступен: не задан статус учёта или табельный номер.</p>'
+
+    body = f"""
+<h1>{emp.full_name}</h1>
+<section class="card-form">
+<div class="card-cols">
+<div class="card-col">
+{left_col}
 </div>
 <div class="card-col">
 <fieldset>
