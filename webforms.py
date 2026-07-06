@@ -161,14 +161,17 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
 
 
 def _hash_password(pw: str) -> str:
-    from passlib.hash import bcrypt
-    return bcrypt.hash(pw)
+    """Прямой bcrypt (не passlib-обёртка): passlib 1.7.x несовместим с bcrypt 4.x
+    (лезет в bcrypt.__about__, которого больше нет), из-за чего verify падал и вход не
+    проходил при верном пароле. bcrypt.hashpw/checkpw читают и $2a$, и $2b$ без проблем."""
+    import bcrypt as _bcrypt
+    return _bcrypt.hashpw(pw.encode("utf-8"), _bcrypt.gensalt(rounds=12)).decode("utf-8")
 
 
 def _verify_password(pw: str, pw_hash: str) -> bool:
-    from passlib.hash import bcrypt
+    import bcrypt as _bcrypt
     try:
-        return bcrypt.verify(pw, pw_hash)
+        return _bcrypt.checkpw(pw.encode("utf-8"), pw_hash.encode("utf-8"))
     except Exception:
         return False
 
