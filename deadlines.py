@@ -105,6 +105,25 @@ DEADLINE_RULES: dict[Category, list[dict]] = {
             "deadline_unit": DeadlineUnit.CALENDAR_DAY,
             "lead_days": 14,
         },
+        {
+            # Уведомление МВД о расторжении трудового договора. 3 рабочих дня с даты
+            # прекращения договора (п.8 ст.13 №115-ФЗ). Триггер — contract_end_date (увольнение).
+            "type": ObligationType.CONTRACT_TERMINATION_NOTICE,
+            "trigger_field": "contract_end_date",
+            "deadline_value": 3,
+            "deadline_unit": DeadlineUnit.WORKING_DAY,
+            "lead_days": 3,
+        },
+        {
+            # Снятие с миграционного учёта (уведомление об убытии). Вахта = принимающая сторона,
+            # 7 рабочих дней с даты убытия (ст.23 №109-ФЗ, п.45 Правил ПП №9). Триггер —
+            # contract_end_date. Пропуск -> риск обвинения в фиктивной постановке на учёт.
+            "type": ObligationType.DEPARTURE_NOTICE,
+            "trigger_field": "contract_end_date",
+            "deadline_value": 7,
+            "deadline_unit": DeadlineUnit.WORKING_DAY,
+            "lead_days": 7,
+        },
     ],
     Category.BELARUS: [
         {
@@ -137,6 +156,25 @@ DEADLINE_RULES: dict[Category, list[dict]] = {
             "deadline_unit": DeadlineUnit.WORKING_DAY,
             "lead_days": 1,
         },
+        {
+            # Уведомление МВД о расторжении трудового договора. 3 рабочих дня с даты
+            # прекращения договора (п.8 ст.13 №115-ФЗ). Триггер — contract_end_date (увольнение).
+            "type": ObligationType.CONTRACT_TERMINATION_NOTICE,
+            "trigger_field": "contract_end_date",
+            "deadline_value": 3,
+            "deadline_unit": DeadlineUnit.WORKING_DAY,
+            "lead_days": 3,
+        },
+        {
+            # Снятие с миграционного учёта (уведомление об убытии). Вахта = принимающая сторона,
+            # 7 рабочих дней с даты убытия (ст.23 №109-ФЗ, п.45 Правил ПП №9). Триггер —
+            # contract_end_date. Пропуск -> риск обвинения в фиктивной постановке на учёт.
+            "type": ObligationType.DEPARTURE_NOTICE,
+            "trigger_field": "contract_end_date",
+            "deadline_value": 7,
+            "deadline_unit": DeadlineUnit.WORKING_DAY,
+            "lead_days": 7,
+        },
     ],
     # PATENT, VISA, HQS — намеренно не заполнены. При добавлении первого сотрудника
     # этих категорий рулы нужно проверить у юриста, а не копировать по аналогии с EAEU/BELARUS.
@@ -162,21 +200,59 @@ def lead_days_for(category, obligation_type, deadline_unit, default: int = 7) ->
     return default
 
 
-def working_days_add(start, days: int):
-    """Наивная реализация — считает только будни, БЕЗ учёта праздников РФ.
-    Для продакшена подключить производственный календарь (напр. библиотеку `workalendar`),
-    иначе дедлайн 'contract_notice' будет ошибочно попадать на праздники.
+def _ru_holidays_for(year: int):
+    """Праздники РФ на год через библиотеку `holidays` (включает правительственные переносы).
+    Если библиотека не установлена — возвращает None, и working_days_add откатывается на
+    режим 'только будни'. Так отсутствие пакета не роняет расчёт дедлайнов, лишь снижает
+    точность в праздники (об этом предупреждение в логе один раз на процесс)."""
+    try:
+        import holidays as _holidays
+    except ImportError:
+        return None
+    try:
+        return _holidays.RU(years=year)
+    except Exception:
+        return None
 
-    Особенно критично для EFS1_REPORT — там всего 1 рабочий день запаса. Один
-    непросчитанный праздник (например, после новогодних каникул) сдвинет реальный
-    дедлайн раньше, чем покажет этот расчёт, и просрочка возникнет незаметно."""
+
+_HOLIDAYS_WARNED = False
+
+
+def _is_working_day(d) -> bool:
+    """True, если d — рабочий день: будний И не праздник РФ. При отсутствии библиотеки
+    праздники не учитываются (только будни)."""
+    global _HOLIDAYS_WARNED
+    if d.weekday() >= 5:  # сб/вс
+        return False
+    hol = _ru_holidays_for(d.year)
+    if hol is None:
+        if not _HOLIDAYS_WARNED:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Библиотека 'holidays' недоступна — дедлайны считаются без праздников РФ. "
+                "Установите holidays (в requirements) для корректного расчёта в праздники."
+            )
+            _HOLIDAYS_WARNED = True
+        return True  # только будни
+    return d not in hol
+
+
+def working_days_add(start, days: int):
+    """Прибавляет `days` РАБОЧИХ дней к start, пропуская выходные И праздники РФ
+    (через библиотеку `holidays`, включающую правительственные переносы). Если библиотека
+    не установлена — деградирует до 'только будни' (см. _is_working_day) и один раз пишет
+    предупреждение в лог.
+
+    Критично для EFS1_REPORT (1 рабочий день) и уведомлений при увольнении (3 и 7 рабочих
+    дней): без учёта праздников дедлайн сдвигался бы раньше реального, создавая скрытую
+    просрочку. Теперь праздники учитываются."""
     from datetime import timedelta
 
     current = start
     added = 0
     while added < days:
         current += timedelta(days=1)
-        if current.weekday() < 5:  # 0-4 = пн-пт
+        if _is_working_day(current):
             added += 1
     return current
 
