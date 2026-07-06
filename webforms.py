@@ -1543,13 +1543,23 @@ def _render_labor_contract_preview(emp, position, salary, contract_date_str, tab
 <h3>3. Оплата труда</h3>
 <p>3.1. Оклад: {_h.escape(salary_fmt)} руб.; Районный коэффициент: {_h.escape(DISTRICT_COEFFICIENT)}.</p>
 <h3>8. Адреса и подписи</h3>
-<p>Работник: {_h.escape(emp.full_name)}, {emp.birth_date.strftime("%d.%m.%Y") if emp.birth_date else "—"} г.р.<br>
+<table style="width:100%;border-collapse:collapse"><tr>
+<td style="width:50%;vertical-align:top;padding-right:12px">
+<b>Работник:</b><br>
+{_h.escape(emp.full_name)}, {emp.birth_date.strftime("%d.%m.%Y") if emp.birth_date else "—"} г.р.<br>
 Паспорт: {_h.escape((emp.passport_series or "") + " " + (emp.passport_number or ""))}, выдан: —<br>
-Адрес: {_h.escape(CONTRACT_SITE_ADDRESS)}</p>
-<p>Работодатель: {_h.escape(EMPLOYER_NAME_FULL)}<br>
+Адрес: {_h.escape(CONTRACT_SITE_ADDRESS)}<br><br>
+Подпись: _______________
+</td>
+<td style="width:50%;vertical-align:top;padding-left:12px">
+<b>Работодатель:</b><br>
+{_h.escape(EMPLOYER_NAME_FULL)}<br>
 ИНН {_h.escape(str(EMPLOYER_INN))} КПП {_h.escape(str(EMPLOYER_KPP))}<br>
-{_h.escape(EMPLOYER_LEGAL_ADDRESS)}<br>Телефон: {_h.escape(EMPLOYER_PHONE)}</p>
-<p>Генеральный директор _______________ {_h.escape(EMPLOYER_DIRECTOR_SHORT)}</p>
+{_h.escape(EMPLOYER_LEGAL_ADDRESS)}<br>
+Телефон: {_h.escape(EMPLOYER_PHONE)}<br><br>
+Ген. директор _______________<br>{_h.escape(EMPLOYER_DIRECTOR_SHORT)}<br>м.п.
+</td>
+</tr></table>
 </div>
 <p class="muted">Это предпросмотр (упрощённый вид). Полный документ — в скачанном .docx после заключения.</p>
 <div style="display:flex;gap:8px;flex-wrap:wrap">
