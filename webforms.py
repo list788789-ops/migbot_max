@@ -402,12 +402,11 @@ LOGIN_HEAD = """<!doctype html>
 <style>
 :root{--accent:#4a90e2;--ink:#111214;--sub:#5b626b;--serif:Georgia,"Times New Roman",serif;--sans:-apple-system,Segoe UI,Roboto,Arial,sans-serif}
 *{box-sizing:border-box}
-body.login-page{margin:0;min-height:100dvh;display:flex;flex-direction:column;justify-content:flex-start;background:url('/login-bg.svg') no-repeat center bottom / cover, #fff;font-family:var(--sans);color:var(--ink)}
+body.login-page{margin:0;min-height:100dvh;display:flex;flex-direction:column;justify-content:flex-start;align-items:center;background:url('/login-bg.svg') no-repeat center bottom / cover, #fff;font-family:var(--sans);color:var(--ink)}
 .auth{width:100%;max-width:440px;margin:0 auto;padding:56px 24px 40px}
-.auth-row{background:#fff;border:1px solid #e6e9ee;border-radius:16px;padding:14px;box-shadow:0 6px 24px rgba(20,24,30,.10)}
+.auth-row{background:#fff;border:1px solid #e6e9ee;border-radius:16px;padding:14px;box-shadow:0 6px 24px rgba(20,24,30,.10);display:flex;gap:10px;flex-wrap:wrap;align-items:stretch}
 .auth h1{font-family:var(--serif);font-weight:700;letter-spacing:-.02em;font-size:clamp(2.25rem,6vw,3.25rem);line-height:1.03;margin:0 0 .3em}
 .auth .subtitle{font-family:var(--serif);font-weight:400;color:var(--sub);font-size:clamp(1.125rem,2.5vw,1.375rem);margin:0 0 1.75rem}
-.auth-row{display:flex;gap:10px;flex-wrap:wrap;align-items:stretch}
 .auth input{flex:1 1 45%;min-width:130px;font-family:var(--sans);font-size:16px;padding:14px 16px;border:1px solid #b8c0cc;border-radius:12px;background:#fff;margin:0}
 .auth input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px #4a90e222}
 .auth button{flex:1 1 100%;border:0;border-radius:12px;background:var(--accent);color:#fff;font:16px/1 var(--sans);padding:15px 20px;min-height:50px;cursor:pointer}
