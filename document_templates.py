@@ -632,7 +632,7 @@ def _fix_table_width(table, widths_mm):
             tcW.set(qn("w:type"), "dxa")
 
 
-def generate_duty_receipt_docx(kind: str, employee=None, output_dir: str = "/tmp") -> str:
+def generate_duty_receipt_docx(kind: str, employee=None, payer_name: str = "", output_dir: str = "/tmp") -> str:
     """Квитанция на оплату госпошлины, форма ПД-4сб(налог). kind: "registration" (500, постановка
     на учёт) или "renewal" (1000, продление пребывания). Реквизиты фиксированные (DUTY_*), сумма
     фиксированная по типу. Плательщик (ФИО/адрес) — поля предусмотрены, но пустые: заполняются
@@ -656,8 +656,11 @@ def generate_duty_receipt_docx(kind: str, employee=None, output_dir: str = "/tmp
         sec.left_margin = _In(0.6)
         sec.right_margin = _In(0.6)
 
-    payer_fio = DASH
-    payer_addr = DASH
+    # ФИО плательщика — из формы (кадровик вводит; плательщик НЕ обязательно работник).
+    payer_fio = (payer_name or "").strip() or DASH
+    payer_addr = DASH  # адрес плательщика — прочерк (по решению: не вводим)
+    # ФИО работника, за кого платёж, добавляется в назначение платежа.
+    _worker = (getattr(employee, "full_name", "") or "").strip() if employee else ""
 
     # QR один раз генерируем во временный файл, вставляем в обе части (извещение и квитанция).
     import tempfile
@@ -693,7 +696,7 @@ def generate_duty_receipt_docx(kind: str, employee=None, output_dir: str = "/tmp
             ("Банк получателя", DUTY_BANK_NAME),
             ("БИК / Кор. счёт", f"{DUTY_BIC} / {DUTY_CORRESP_ACC}"),
             ("КБК", spec["kbk"]),
-            ("Наименование платежа", spec["purpose"]),
+            ("Наименование платежа", spec["purpose"] + (f" за {_worker}" if _worker else "")),
             ("Ф.И.О. плательщика", payer_fio),
             ("Адрес плательщика", payer_addr),
             ("Сумма платежа", f"{spec['amount']} руб. 00 коп."),
