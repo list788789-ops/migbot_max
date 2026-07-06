@@ -30,6 +30,7 @@ import uuid
 from datetime import date, datetime
 
 from sqlalchemy import (
+    Integer,
     Boolean,
     Date,
     DateTime,
@@ -68,6 +69,24 @@ class RegistrationStatus(str, enum.Enum):
     кадровик обязан выбрать явно (решение зафиксировано в задачах)."""
     PRIMARY = "primary"
     PRIOR = "prior"
+
+
+class UserRole(str, enum.Enum):
+    """Роли пользователей системы. PRORAB — только чтение и скачивание документов (договор,
+    квитанции, отчёты), без записи в БД. KADROVIK — всё по работникам (заключение, статусы,
+    правки), но НЕ управление пользователями. ADMIN — всё + одобрение заявок и управление
+    пользователями. Роль назначает админ при одобрении заявки (заявитель её не выбирает)."""
+    PRORAB = "prorab"
+    KADROVIK = "kadrovik"
+    ADMIN = "admin"
+
+
+class UserStatus(str, enum.Enum):
+    """PENDING — заявка подана, вход заблокирован до одобрения админом. APPROVED — активен,
+    может входить. BLOCKED — доступ отозван админом (вход запрещён, но запись сохранена)."""
+    PENDING = "pending"
+    APPROVED = "approved"
+    BLOCKED = "blocked"
 
 
 class ConsentStatus(str, enum.Enum):
@@ -251,6 +270,33 @@ class NotificationSubscriber(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
     chat_id: Mapped[str] = mapped_column(String, nullable=False, unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class User(Base):
+    """Пользователь системы (прораб/кадровик/админ). Логин — номер телефона (уникальный).
+    Пароль хранится ТОЛЬКО хэшем (bcrypt через passlib), открытый пароль нигде не сохраняется.
+    Регистрация открытая: заявитель указывает телефон, пароль, ФИО; роль назначает админ при
+    одобрении. До одобрения status=PENDING, вход заблокирован.
+    На боевой БД создать таблицу (create_all создаёт новые таблицы — при первом деплое модели
+    таблица появится сама; если нет — CREATE TABLE вручную)."""
+
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    phone: Mapped[str] = mapped_column(String, nullable=False, unique=True)  # логин
+    password_hash: Mapped[str] = mapped_column(String, nullable=False)       # bcrypt, не открытый
+    full_name: Mapped[str] = mapped_column(String, nullable=False)
+    role: Mapped[UserRole | None] = mapped_column(Enum(UserRole), nullable=True)  # назначает админ
+    status: Mapped[UserStatus] = mapped_column(
+        Enum(UserStatus), default=UserStatus.PENDING, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Защита от подбора пароля: 5 неудачных попыток подряд -> блокировка на час (locked_until).
+    # Успешный вход обнуляет счётчик. Админ снимает блокировку раньше кнопкой в админке.
+    # Это ОТДЕЛЬНО от status=BLOCKED (ручной отзыв доступа админом навсегда).
+    failed_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class Consent(Base):
