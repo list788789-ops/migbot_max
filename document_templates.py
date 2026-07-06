@@ -285,6 +285,51 @@ WORKPLACE_ADDRESS = os.environ.get(
 DISTRICT_COEFFICIENT = os.environ.get("DISTRICT_COEFFICIENT", "1,500")
 CONTRACT_NUMBER_PREFIX = os.environ.get("CONTRACT_NUMBER_PREFIX", "БК-ПСМ-")
 
+
+# --- Реквизиты госпошлины (квитанция ПД-4сб, налог). УФК по Мурманской области (УМВД).
+# Фиксированные, из платёжных реквизитов УМВД (фото от пользователя, приняты как факт).
+# Обе пошлины — один получатель, различаются назначением/КБК/суммой (см. DUTY_KINDS ниже).
+DUTY_PAYEE_NAME = os.environ.get(
+    "DUTY_PAYEE_NAME",
+    "УФК по Мурманской области (УМВД России по Мурманской области, л/сч 04491137920)",
+)
+DUTY_PAYEE_INN = os.environ.get("DUTY_PAYEE_INN", "5191501766")
+DUTY_PAYEE_KPP = os.environ.get("DUTY_PAYEE_KPP", "519001001")
+DUTY_OKTMO = os.environ.get("DUTY_OKTMO", "47536000")
+DUTY_ACCOUNT = os.environ.get("DUTY_ACCOUNT", "03100643000000014900")
+DUTY_BANK_NAME = os.environ.get(
+    "DUTY_BANK_NAME",
+    "ОКЦ № 3 Северо-Западного ГУ Банка России//УФК по Мурманской области г. Мурманск",
+)
+DUTY_BIC = os.environ.get("DUTY_BIC", "014705901")
+# Единый казначейский счёт (ЕКС / корр. счёт для QR по ГОСТ Р 56042). Определяется по БИК,
+# подтверждён по официальным источникам (УФК/госорганы Мурманской обл.). Для QR обязателен.
+DUTY_CORRESP_ACC = os.environ.get("DUTY_CORRESP_ACC", "40102810745370000041")
+# Наименование получателя для QR (без л/сч — в QR идёт чистое наименование).
+DUTY_PAYEE_NAME_QR = os.environ.get(
+    "DUTY_PAYEE_NAME_QR", "УФК по Мурманской области (УМВД России по Мурманской области)"
+)
+
+# Типы пошлин: назначение, КБК (20 цифр, без пробелов), сумма. Ключ передаётся в генератор.
+DUTY_KINDS = {
+    "registration": {
+        "purpose": (
+            "Государственная пошлина на постановку иностранного гражданина или лица без "
+            "гражданства на учёт по месту пребывания"
+        ),
+        "kbk": "18810806000010039110",
+        "amount": "500",
+    },
+    "renewal": {
+        "purpose": (
+            "Государственная пошлина за продление срока временного пребывания иностранного "
+            "гражданина в Российской Федерации"
+        ),
+        "kbk": "18810806000010041110",
+        "amount": "1000",
+    },
+}
+
 MEDICAL_SERVICE_TEXT = (
     "Медицинское освидетельствование на наличие или отсутствие инфекционных заболеваний, "
     "представляющих опасность для окружающих и являющихся основанием для отказа в выдаче "
@@ -481,6 +526,211 @@ def generate_labor_contract_docx(
 
     safe_tab = tab or "no_tab"
     filename = f"labor_contract_{employee.id}_{safe_tab}.docx"
+    path = os.path.join(output_dir, filename)
+    doc.save(path)
+    return path
+
+
+def _build_duty_qr_payload(kind: str) -> str:
+    """Платёжная строка по ГОСТ Р 56042 для банковского QR. Порядок и состав полей —
+    обязательные (Name, PersonalAcc, BankName, BIC, CorrespAcc, PayeeINN) плюс KPP, KBK,
+    OKTMO, Sum (в копейках), Purpose. Sum: рубли*100."""
+    spec = DUTY_KINDS[kind]
+    fields = {
+        "Name": DUTY_PAYEE_NAME_QR,
+        "PersonalAcc": DUTY_ACCOUNT,
+        "BankName": DUTY_BANK_NAME,
+        "BIC": DUTY_BIC,
+        "CorrespAcc": DUTY_CORRESP_ACC,
+        "PayeeINN": DUTY_PAYEE_INN,
+        "KPP": DUTY_PAYEE_KPP,
+        "KBK": spec["kbk"],
+        "OKTMO": DUTY_OKTMO,
+        "Sum": str(int(spec["amount"]) * 100),
+        "Purpose": spec["purpose"],
+    }
+    return "ST00012|" + "|".join(f"{k}={v}" for k, v in fields.items())
+
+
+def _generate_duty_qr_png(kind: str, out_path: str) -> bool:
+    """Строит QR-картинку платёжной строки в out_path. Возвращает True при успехе.
+    Библиотека qrcode может отсутствовать (офлайн-сборка) — тогда возвращаем False,
+    и квитанция генерируется без QR (не роняем весь документ из-за отсутствия картинки).
+    На Railway qrcode должна быть в зависимостях (добавить 'qrcode[pil]' в requirements)."""
+    try:
+        import qrcode
+    except ImportError:
+        return False
+    try:
+        img = qrcode.make(_build_duty_qr_payload(kind))
+        img.save(out_path)
+        return True
+    except Exception:
+        return False
+
+
+def _fix_table_width(table, widths_mm):
+    """Жёстко фиксирует ширину колонок таблицы через XML, иначе Word/LibreOffice игнорируют
+    cell.width и растягивают таблицу на всю ширину листа. Ставит tblLayout=fixed, общую
+    ширину таблицы и tcW (в twips) на каждую ячейку. widths_mm — список ширин колонок в мм."""
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+
+    def _twips(mm):
+        return str(int(mm * 56.6929))  # 1 мм = 56.6929 twips
+
+    tbl = table._tbl
+    tblPr = tbl.tblPr
+
+    # Инлайн-границы (не через стиль): мобильные docx-читалки игнорируют границы стиля
+    # Table Grid, поэтому прописываем tblBorders прямо в XML — видно в любой программе.
+    borders = tblPr.find(qn("w:tblBorders"))
+    if borders is None:
+        borders = OxmlElement("w:tblBorders")
+        tblPr.append(borders)
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        el = borders.find(qn(f"w:{edge}"))
+        if el is None:
+            el = OxmlElement(f"w:{edge}")
+            borders.append(el)
+        el.set(qn("w:val"), "single")
+        el.set(qn("w:sz"), "4")       # 0.5pt
+        el.set(qn("w:space"), "0")
+        el.set(qn("w:color"), "000000")
+
+    # layout = fixed
+    layout = tblPr.find(qn("w:tblLayout"))
+    if layout is None:
+        layout = OxmlElement("w:tblLayout")
+        tblPr.append(layout)
+    layout.set(qn("w:type"), "fixed")
+
+    # общая ширина таблицы
+    total = sum(widths_mm)
+    tblW = tblPr.find(qn("w:tblW"))
+    if tblW is None:
+        tblW = OxmlElement("w:tblW")
+        tblPr.append(tblW)
+    tblW.set(qn("w:w"), _twips(total))
+    tblW.set(qn("w:type"), "dxa")
+
+    # tblGrid — ширины колонок
+    grid = tbl.find(qn("w:tblGrid"))
+    if grid is not None:
+        for gc, w in zip(grid.findall(qn("w:gridCol")), widths_mm):
+            gc.set(qn("w:w"), _twips(w))
+
+    # tcW на каждую ячейку
+    for row in table.rows:
+        for cell, w in zip(row.cells, widths_mm):
+            tcPr = cell._tc.get_or_add_tcPr()
+            tcW = tcPr.find(qn("w:tcW"))
+            if tcW is None:
+                tcW = OxmlElement("w:tcW")
+                tcPr.append(tcW)
+            tcW.set(qn("w:w"), _twips(w))
+            tcW.set(qn("w:type"), "dxa")
+
+
+def generate_duty_receipt_docx(kind: str, employee=None, output_dir: str = "/tmp") -> str:
+    """Квитанция на оплату госпошлины, форма ПД-4сб(налог). kind: "registration" (500, постановка
+    на учёт) или "renewal" (1000, продление пребывания). Реквизиты фиксированные (DUTY_*), сумма
+    фиксированная по типу. Плательщик (ФИО/адрес) — поля предусмотрены, но пустые: заполняются
+    вручную (пользователь: ФИО пока не подставляем). employee — задел на будущее автозаполнение.
+
+    ПД-4сб состоит из двух одинаковых частей: «Извещение» (остаётся в банке) и «Квитанция»
+    (у плательщика). Обе части идентичны — строятся одной вспомогательной функцией."""
+    if kind not in DUTY_KINDS:
+        raise ValueError(f"Неизвестный тип пошлины: {kind!r}. Ожидается один из {list(DUTY_KINDS)}")
+    spec = DUTY_KINDS[kind]
+
+    doc = Document()
+    _set_default_style(doc)
+
+    # Компоновка на один лист A4: узкие поля + мелкий шрифт таблицы. Две части ПД-4сб (13 строк
+    # каждая) + QR иначе не влезают. Шрифт таблицы 8pt — компромисс ради одного листа (запрошено).
+    from docx.shared import Pt as _Pt, Inches as _In
+    for sec in doc.sections:
+        sec.top_margin = _In(0.5)
+        sec.bottom_margin = _In(0.5)
+        sec.left_margin = _In(0.6)
+        sec.right_margin = _In(0.6)
+
+    payer_fio = DASH
+    payer_addr = DASH
+
+    # QR один раз генерируем во временный файл, вставляем в обе части (извещение и квитанция).
+    import tempfile
+    qr_path = os.path.join(tempfile.gettempdir(), f"duty_qr_{kind}.png")
+    qr_ok = _generate_duty_qr_png(kind, qr_path)
+
+    def _tiny(paragraph, size=10):
+        for r in paragraph.runs:
+            r.font.size = _Pt(size)
+        # убрать вертикальные пробелы между строками таблицы
+        pf = paragraph.paragraph_format
+        pf.space_before = _Pt(1)
+        pf.space_after = _Pt(1)
+        pf.line_spacing = 1.0
+
+    def _build_part(part_title: str) -> None:
+        head = doc.add_paragraph()
+        head.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        r = head.add_run(part_title)
+        r.bold = True
+        r.font.size = _Pt(14)
+        sub = doc.add_paragraph()
+        sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        sr = sub.add_run("Форма № ПД-4сб (налог)")
+        sr.italic = True
+        sr.font.size = _Pt(9)
+
+        rows = [
+            ("Наименование получателя", DUTY_PAYEE_NAME),
+            ("ИНН / КПП получателя", f"{DUTY_PAYEE_INN} / {DUTY_PAYEE_KPP}"),
+            ("Код ОКТМО", DUTY_OKTMO),
+            ("Счёт получателя платежа", DUTY_ACCOUNT),
+            ("Банк получателя", DUTY_BANK_NAME),
+            ("БИК / Кор. счёт", f"{DUTY_BIC} / {DUTY_CORRESP_ACC}"),
+            ("КБК", spec["kbk"]),
+            ("Наименование платежа", spec["purpose"]),
+            ("Ф.И.О. плательщика", payer_fio),
+            ("Адрес плательщика", payer_addr),
+            ("Сумма платежа", f"{spec['amount']} руб. 00 коп."),
+        ]
+        table = doc.add_table(rows=len(rows), cols=2)
+        table.style = "Table Grid"
+        table.autofit = False
+        table.allow_autofit = False
+        for i, (label, value) in enumerate(rows):
+            c0 = table.cell(i, 0).paragraphs[0]
+            run = c0.add_run(label)
+            run.bold = True
+            _tiny(c0)
+            c1 = table.cell(i, 1).paragraphs[0]
+            c1.add_run(value)
+            _tiny(c1)
+        # Жёсткая фиксация ширины через XML: подписи 55 мм, значения 110 мм (итого 165 мм —
+        # ширина печатного поля A4 при полях 0.5"/0.6"). Без этого таблица растягивается.
+        _fix_table_width(table, [50, 95])
+
+        # QR + подпись рядом: таблица 1x2 без границ. Слева QR, справа поля подписи.
+        foot = doc.add_table(rows=1, cols=2)
+        foot.autofit = True
+        if qr_ok:
+            foot.cell(0, 0).paragraphs[0].add_run().add_picture(qr_path, width=_In(1.4))
+        else:
+            foot.cell(0, 0).paragraphs[0].add_run("(QR недоступен)").font.size = _Pt(7)
+        rc = foot.cell(0, 1)
+        p1 = rc.paragraphs[0]; p1.add_run("Плательщик (подпись) _______________"); _tiny(p1)
+        p2 = rc.add_paragraph(); p2.add_run("Дата _______________"); _tiny(p2)
+        p3 = rc.add_paragraph(); p3.add_run("Отсканируйте QR в банковском приложении для оплаты"); _tiny(p3, 7)
+
+    _build_part("ИЗВЕЩЕНИЕ")
+    doc.add_paragraph("- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -")
+    _build_part("КВИТАНЦИЯ")
+
+    filename = f"duty_receipt_{kind}.docx"
     path = os.path.join(output_dir, filename)
     doc.save(path)
     return path
