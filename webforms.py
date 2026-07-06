@@ -88,6 +88,7 @@ from document_templates import (
     check_medical_referral_fields,
     generate_medical_referral_docx,
     generate_labor_contract_docx,
+    generate_duty_receipt_docx,
     CONTRACT_NUMBER_PREFIX,
     EMPLOYER_NAME_SHORT,
     EMPLOYER_NAME_FULL,
@@ -782,6 +783,9 @@ def employee_card(employee_id: str, request: Request, db: Session = Depends(get_
 
     today_s = datetime.now(MSK).date().isoformat()
 
+    # Плательщик госпошлины, запомненный на сессию (prefill поля). Экранируем — уходит в HTML-атрибут.
+    _last_payer = html.escape(request.session.get("last_payer", ""), quote=True)
+
     # Тексты справок у полей карточки (значок i с раскрытием). Коротко: что это и что делает.
     help_entry = _help(
         "Дата въезда в РФ по миграционной карте/штампу. От неё считаются сроки: регистрация "
@@ -980,6 +984,18 @@ value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
 <fieldset>
 <legend>Трудовой договор ({EMPLOYER_NAME_SHORT})</legend>
 {contract_block}
+</fieldset>
+
+<fieldset>
+<legend>Госпошлина</legend>
+<p class="muted">Квитанция ПД-4сб. Введите ФИО плательщика (кто вносит деньги — необязательно
+сам работник). В назначение платежа автоматически попадёт ФИО работника, за кого платёж.</p>
+<form method="post" action="/employees/{emp.id}/duty_receipt">
+<label>Ф.И.О. плательщика (инициалы)</label>
+<input type="text" name="payer_name" placeholder="Иванов И. И." value="{_last_payer}">
+<button type="submit" name="kind" value="registration" class="btn-full">Квитанция: постановка на учёт (500 ₽)</button>
+<button type="submit" name="kind" value="renewal" class="btn-full">Квитанция: продление пребывания (1000 ₽)</button>
+</form>
 </fieldset>
 
 <a class="btn secondary" href="/employees">← Ко всем сотрудникам</a>
@@ -1613,6 +1629,36 @@ def employee_labor_contract_download(
     except Exception:
         raise HTTPException(500, "Не удалось сгенерировать договор. Проверьте логи сервиса.")
     filename = f"Трудовой_договор_{emp.full_name.replace(' ', '_')}.docx"
+    return FileResponse(path, filename=filename)
+
+
+@app.post("/employees/{employee_id}/duty_receipt")
+def employee_duty_receipt(
+    employee_id: str,
+    request: Request,
+    kind: str = Form(...),
+    payer_name: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    """Генерация квитанции госпошлины (ПД-4сб) и отдача docx. kind — из нажатой кнопки
+    (registration/renewal). payer_name — ФИО плательщика из формы (плательщик не обязательно
+    работник). ФИО работника уходит в назначение платежа автоматически внутри генератора."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+    if kind not in ("registration", "renewal"):
+        raise HTTPException(400, "Неизвестный тип пошлины")
+    # Запомнить плательщика на сессию (prefill в следующих карточках). Пустой ввод не затирает.
+    if (payer_name or "").strip():
+        request.session["last_payer"] = payer_name.strip()
+    try:
+        path = generate_duty_receipt_docx(kind, employee=emp, payer_name=payer_name)
+    except Exception:
+        raise HTTPException(500, "Не удалось сгенерировать квитанцию. Проверьте логи сервиса.")
+    kind_ru = "постановка" if kind == "registration" else "продление"
+    filename = f"Квитанция_{kind_ru}_{emp.full_name.replace(' ', '_')}.docx"
     return FileResponse(path, filename=filename)
 
 
