@@ -46,6 +46,7 @@ create_obligations_for_employee вынесена в отдельный моду�
 from __future__ import annotations
 
 import html
+import logging
 import os
 from datetime import date, datetime, timedelta, timezone
 
@@ -55,6 +56,8 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.sessions import SessionMiddleware
+
+log = logging.getLogger("webforms")
 
 from models import (
     User,
