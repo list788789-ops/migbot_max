@@ -95,6 +95,8 @@ from document_templates import (
     generate_medical_referral_docx,
     generate_labor_contract_docx,
     generate_duty_receipt_docx,
+    generate_termination_notice_docx,
+    generate_departure_notice_docx,
     CONTRACT_NUMBER_PREFIX,
     EMPLOYER_NAME_SHORT,
     EMPLOYER_NAME_FULL,
@@ -292,6 +294,7 @@ OBLIGATION_LABELS = {
     ObligationType.EFS1_REPORT: "ЕФС-1",
     ObligationType.DACTYLOSCOPY: "дактилоскопия",
     ObligationType.REGISTRATION_RENEWAL: "продление регистрации",
+    ObligationType.DEPARTURE_NOTICE: "снятие с учёта (убытие)",
     ObligationType.PATENT_PAYMENT: "оплата патента",
 }
 
@@ -1167,6 +1170,63 @@ def employee_card(employee_id: str, request: Request, db: Session = Depends(get_
         # выполненные (DONE) сохраняются как след исполнения.
         # Скачать и отменить доступны только ПОСЛЕ заключения (стоит contract_date).
         if emp.contract_date is not None:
+            # Отмена договора: админ — всегда; кадровик — только в день заключения (свежая ошибка
+            # ввода). После — только админ. cancel-роут это тоже проверяет на сервере.
+            _cancel_allowed = (_cu and _cu.role == UserRole.ADMIN) or (
+                _cu and _cu.role == UserRole.KADROVIK
+                and emp.contract_date == date.today()
+            )
+            _cancel = ""
+            if _cancel_allowed:
+                _cancel = f'''<form method="post" action="/employees/{emp.id}/labor_contract/cancel"
+onsubmit="return confirm(&#39;Отменить договор? Дата договора будет снята, а незакрытые обязательства (уведомление МВД, ЕФС-1) удалены. Выполненные останутся.&#39;)">
+<button type="submit" class="secondary btn-full">Отменить договор</button>
+</form>'''
+            elif _cu and _cu.role == UserRole.KADROVIK:
+                _cancel = '<p class="muted">Отмена договора доступна только в день заключения. Позже — обратитесь к администратору.</p>'
+
+            # Секция увольнения — только для пишущих (кадровик/админ), после заключения договора.
+            _termination = ""
+            if can_write:
+                if emp.contract_end_date is not None:
+                    _termination = f'''
+<hr>
+<p><b>Увольнение оформлено:</b> {emp.contract_end_date.strftime("%d.%m.%Y")}.</p>
+<p class="muted">Созданы обязательства: уведомление МВД о расторжении (3 раб. дня) и снятие с
+учёта / уведомление об убытии (7 раб. дней). Если дата в будущем — обязательства включатся в день увольнения.</p>
+<form method="post" action="/employees/{emp.id}/termination_notice">
+<button type="submit" class="secondary btn-full">Уведомление о расторжении — скачать</button>
+</form>
+<form method="post" action="/employees/{emp.id}/departure_notice">
+<button type="submit" class="secondary btn-full">Уведомление об убытии — скачать</button>
+</form>
+<form method="post" action="/employees/{emp.id}/termination/cancel"
+onsubmit="return confirm(&#39;Отменить оформление увольнения? Дата увольнения снимется, связанные обязательства удалятся.&#39;)">
+<button type="submit" class="secondary btn-full">Отменить увольнение</button>
+</form>'''
+                else:
+                    _termination = f'''
+<hr>
+<p><b>Увольнение / расторжение договора</b></p>
+<p class="muted">Отдельно от «Отменить договор»: отмена = договора не было (ошибка ввода);
+увольнение = работник был трудоустроён, история сохраняется. Дата не раньше даты договора.
+Будущую дату можно (обязательства включатся в день увольнения).</p>
+<form method="post" action="/employees/{emp.id}/termination">
+<label>Дата увольнения (расторжения договора)</label>
+<input type="date" name="termination_date" min="{emp.contract_date.isoformat()}" value="{today_s}">
+<label>Основание расторжения</label>
+<select name="basis">
+<option value="по собственному желанию">По собственному желанию</option>
+<option value="по инициативе работодателя">По инициативе работодателя</option>
+<option value="по соглашению сторон">По соглашению сторон</option>
+<option value="истечение срока договора">Истечение срока договора</option>
+<option value="иное">Иное (указать в примечании)</option>
+</select>
+<label>Примечание к основанию (если «иное»)</label>
+<input type="text" name="basis_note" placeholder="">
+<button type="submit" class="btn-full">Оформить увольнение</button>
+</form>'''
+
             _post = f'''
 <p class="muted">Договор заключён {emp.contract_date.strftime("%d.%m.%Y")}.</p>
 <form method="post" action="/employees/{emp.id}/labor_contract/download">
@@ -1174,10 +1234,8 @@ def employee_card(employee_id: str, request: Request, db: Session = Depends(get_
 <input type="hidden" name="salary" value="30000">
 <button type="submit" class="btn-full">Скачать .docx</button>
 </form>
-<form method="post" action="/employees/{emp.id}/labor_contract/cancel"
-onsubmit="return confirm(&#39;Отменить договор? Дата договора будет снята, а незакрытые обязательства (уведомление МВД, ЕФС-1) удалены. Выполненные останутся.&#39;)">
-<button type="submit" class="secondary btn-full">Отменить договор</button>
-</form>'''
+{_cancel}
+{_termination}'''
         else:
             _post = ""
         # До заключения: форма с предпросмотром и заключением. Предпросмотр (formaction preview)
@@ -2101,6 +2159,106 @@ def employee_registration_status(
     return RedirectResponse(f"/employees/{employee_id}", status_code=303)
 
 
+@app.post("/employees/{employee_id}/termination")
+def employee_termination(
+    employee_id: str,
+    request: Request,
+    termination_date: str = Form(...),
+    basis: str = Form(""),
+    basis_note: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    """Оформление увольнения: пишет contract_end_date, создаёт обязательства (расторжение +
+    убытие) через create_obligations_for_employee. Будущая дата разрешена — обязательства
+    отложатся до наступления (логика в obligations.py). Валидация: дата не раньше договора."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+    if emp.contract_date is None:
+        raise HTTPException(400, "Нельзя оформить увольнение: договор не заключён.")
+    try:
+        term_date = date.fromisoformat(termination_date)
+    except ValueError:
+        raise HTTPException(400, "Некорректная дата увольнения.")
+    # Валидация: дата увольнения не раньше даты договора.
+    if term_date < emp.contract_date:
+        raise HTTPException(400, "Дата увольнения не может быть раньше даты договора.")
+    # основание: если "иное" — берём примечание
+    final_basis = basis_note.strip() if basis == "иное" and basis_note.strip() else basis
+    emp.contract_end_date = term_date
+    db.commit()
+    # создаём обязательства (будущая дата -> отложатся внутри функции)
+    create_obligations_for_employee(db, emp)
+    db.commit()
+    # сохраним основание в сессию для генерации уведомления (в модели поля нет — не плодим ALTER)
+    request.session[f"term_basis_{emp.id}"] = final_basis
+    return RedirectResponse(f"/employees/{emp.id}", status_code=303)
+
+
+@app.post("/employees/{employee_id}/termination_notice")
+def employee_termination_notice(employee_id: str, request: Request, db: Session = Depends(get_db)):
+    """Скачать уведомление о расторжении договора (форма №8, приказ №536). Доступно всем
+    вошедшим (прораб тоже может скачать документ)."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+    if emp.contract_end_date is None:
+        raise HTTPException(400, "Увольнение не оформлено — нет даты расторжения.")
+    basis = request.session.get(f"term_basis_{emp.id}", "")
+    try:
+        path = generate_termination_notice_docx(emp, basis=basis)
+    except Exception:
+        raise HTTPException(500, "Не удалось сгенерировать уведомление о расторжении.")
+    fn = f"Уведомление_расторжение_{emp.full_name.replace(' ', '_')}.docx"
+    return FileResponse(path, filename=fn)
+
+
+@app.post("/employees/{employee_id}/departure_notice")
+def employee_departure_notice(employee_id: str, request: Request, db: Session = Depends(get_db)):
+    """Скачать уведомление об убытии (снятие с миграционного учёта). Доступно всем вошедшим."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+    if emp.contract_end_date is None:
+        raise HTTPException(400, "Увольнение не оформлено — нет даты убытия.")
+    try:
+        path = generate_departure_notice_docx(emp)
+    except Exception:
+        raise HTTPException(500, "Не удалось сгенерировать уведомление об убытии.")
+    fn = f"Уведомление_убытие_{emp.full_name.replace(' ', '_')}.docx"
+    return FileResponse(path, filename=fn)
+
+
+@app.post("/employees/{employee_id}/termination/cancel")
+def employee_termination_cancel(employee_id: str, request: Request, db: Session = Depends(get_db)):
+    """Отмена оформления увольнения: снимает contract_end_date, удаляет связанные незакрытые
+    обязательства (расторжение/убытие). Кадровик/админ."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+    # удалить незакрытые обязательства увольнения
+    from models import Obligation, ObligationType, ObligationStatus
+    db.query(Obligation).filter(
+        Obligation.employee_id == emp.id,
+        Obligation.type.in_([ObligationType.CONTRACT_TERMINATION_NOTICE, ObligationType.DEPARTURE_NOTICE]),
+        Obligation.status != ObligationStatus.DONE,
+    ).delete(synchronize_session=False)
+    emp.contract_end_date = None
+    db.commit()
+    request.session.pop(f"term_basis_{emp.id}", None)
+    return RedirectResponse(f"/employees/{emp.id}", status_code=303)
+
+
 @app.post("/employees/{employee_id}/labor_contract/cancel")
 def employee_labor_contract_cancel(
     employee_id: str,
@@ -2113,11 +2271,23 @@ def employee_labor_contract_cancel(
     Само поле contract_date общее с ручным вводом в карточке, отмена его тоже обнулит."""
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
-    _require_role(request, db, UserRole.KADROVIK)
+    _cu = _current_user(request, db)
+    if _cu is None:
+        raise HTTPException(401, "Требуется вход")
 
     emp = db.get(Employee, employee_id)
     if emp is None:
         raise HTTPException(404, "Сотрудник не найден")
+
+    # Отмена договора: админ — всегда; кадровик — только в день заключения (свежая ошибка ввода).
+    # Позже кадровику нельзя (заметание следов/поздний откат обязательств) — только админ.
+    if _cu.role != UserRole.ADMIN:
+        if _cu.role != UserRole.KADROVIK:
+            raise HTTPException(403, "Недостаточно прав")
+        if emp.contract_date != date.today():
+            raise HTTPException(
+                403, "Отмена договора доступна кадровику только в день заключения. Обратитесь к администратору."
+            )
 
     emp.contract_date = None
 
