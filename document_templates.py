@@ -277,6 +277,11 @@ EMPLOYER_ACTUAL_ADDRESS = os.environ.get("EMPLOYER_ACTUAL_ADDRESS", EMPLOYER_LEG
 EMPLOYER_PHONE = os.environ.get("EMPLOYER_PHONE", "+7 (495) 147-82-79")
 EMPLOYER_DIRECTOR_FULL = os.environ.get("EMPLOYER_DIRECTOR_FULL", "Железняка Валерия Александровича")
 EMPLOYER_DIRECTOR_SHORT = os.environ.get("EMPLOYER_DIRECTOR_SHORT", "Железняк В. А.")
+# ОКВЭД и ОГРН работодателя — обязательные поля формы уведомления МВД №8 (приказ №536),
+# но в системе их не было. Оставлены пустыми (env-override): по решению — заполняются вручную
+# в готовом документе. Когда появятся — задать через переменные окружения EMPLOYER_OKVED/OGRN.
+EMPLOYER_OKVED = os.environ.get("EMPLOYER_OKVED", "")
+EMPLOYER_OGRN = os.environ.get("EMPLOYER_OGRN", "")
 EMPLOYER_SUBDIVISION = os.environ.get("EMPLOYER_SUBDIVISION", "Обособленное подразделение Мурманск")
 WORKPLACE_ADDRESS = os.environ.get(
     "WORKPLACE_ADDRESS",
@@ -734,6 +739,186 @@ def generate_duty_receipt_docx(kind: str, employee=None, payer_name: str = "", o
     _build_part("КВИТАНЦИЯ")
 
     filename = f"duty_receipt_{kind}.docx"
+    path = os.path.join(output_dir, filename)
+    doc.save(path)
+    return path
+
+
+def generate_termination_notice_docx(employee: Employee, basis: str = "",
+                                     output_dir: str = "/tmp") -> str:
+    """Уведомление МВД о прекращении (расторжении) трудового договора с иностранцем.
+    Структура по форме №8 приказа МВД России от 30.07.2020 №536 (действует до 01.09.2026 —
+    с этой даты приказ №290 от 12.05.2026 вводит новые формы; см. задачу на обновление).
+
+    НЕ пиксельная копия бланка: подача основная через Госуслуги (там своя форма), это документ
+    для подготовки данных и архива / запасной бумажной подачи. Обязательные поля, которых нет в
+    системе (ОКВЭД, ОГРН работодателя), — прочерком под ручное заполнение.
+
+    basis — основание расторжения (по собственному желанию / инициатива работодателя /
+    истечение срока и т.п.), вводится в форме увольнения. Дата расторжения — contract_end_date."""
+    doc = Document()
+    _set_default_style(doc)
+
+    title = doc.add_paragraph()
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = title.add_run("УВЕДОМЛЕНИЕ\nо прекращении (расторжении) трудового договора\n"
+                      "с иностранным гражданином")
+    r.bold = True
+    sub = doc.add_paragraph()
+    sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    sr = sub.add_run("(форма по приложению №8 к приказу МВД России от 30.07.2020 №536)")
+    sr.italic = True
+    sr.font.size = Pt(9)
+
+    doc.add_paragraph()
+    doc.add_paragraph("В ____________________________________________________________")
+    doc.add_paragraph("(наименование территориального органа МВД России)")
+    doc.add_paragraph()
+
+    doc.add_paragraph("1. Сведения о работодателе (заказчике работ, услуг):")
+    rows = [
+        ("Полное наименование", EMPLOYER_NAME_FULL),
+        ("ИНН", EMPLOYER_INN),
+        ("КПП", EMPLOYER_KPP),
+        ("ОГРН", _text_or_dash(EMPLOYER_OGRN)),
+        ("ОКВЭД (основной вид деятельности)", _text_or_dash(EMPLOYER_OKVED)),
+        ("Юридический адрес", EMPLOYER_LEGAL_ADDRESS),
+        ("Фактический адрес (место работы)", WORKPLACE_ADDRESS),
+        ("Телефон", EMPLOYER_PHONE),
+    ]
+    t1 = doc.add_table(rows=len(rows), cols=2)
+    t1.style = "Table Grid"
+    for i, (k, v) in enumerate(rows):
+        t1.cell(i, 0).paragraphs[0].add_run(k).bold = True
+        t1.cell(i, 1).paragraphs[0].add_run(v)
+    _fix_table_width(t1, [70, 100])
+
+    doc.add_paragraph()
+    doc.add_paragraph("2. Сведения об иностранном гражданине (лице без гражданства):")
+    name_parts = (employee.full_name or "").split()
+    surname = name_parts[0] if name_parts else DASH
+    first = name_parts[1] if len(name_parts) > 1 else DASH
+    patr = name_parts[2] if len(name_parts) > 2 else DASH
+    rows2 = [
+        ("Фамилия", surname),
+        ("Имя", first),
+        ("Отчество", patr),
+        ("Гражданство", _text_or_dash(getattr(employee, "citizenship", None) or "Республика Казахстан")),
+        ("Дата рождения", _date_or_dash(employee.birth_date)),
+        ("Документ, удостоверяющий личность (серия, номер)", _passport_str(employee)),
+    ]
+    t2 = doc.add_table(rows=len(rows2), cols=2)
+    t2.style = "Table Grid"
+    for i, (k, v) in enumerate(rows2):
+        t2.cell(i, 0).paragraphs[0].add_run(k).bold = True
+        t2.cell(i, 1).paragraphs[0].add_run(v)
+    _fix_table_width(t2, [70, 100])
+
+    doc.add_paragraph()
+    doc.add_paragraph("3. Сведения о трудовом (гражданско-правовом) договоре:")
+    _contract_no = (CONTRACT_NUMBER_PREFIX + employee.tab_number.strip()) if (employee.tab_number or "").strip() else DASH
+    rows3 = [
+        ("Номер договора", _contract_no),
+        ("Дата заключения договора", _date_or_dash(employee.contract_date)),
+        ("Дата прекращения (расторжения)", _date_or_dash(employee.contract_end_date)),
+        ("Основание прекращения (расторжения)", _text_or_dash(basis)),
+    ]
+    t3 = doc.add_table(rows=len(rows3), cols=2)
+    t3.style = "Table Grid"
+    for i, (k, v) in enumerate(rows3):
+        t3.cell(i, 0).paragraphs[0].add_run(k).bold = True
+        t3.cell(i, 1).paragraphs[0].add_run(v)
+    _fix_table_width(t3, [70, 100])
+
+    doc.add_paragraph()
+    doc.add_paragraph("Уведомление подаётся в срок не более 3 рабочих дней с даты прекращения "
+                      "(расторжения) договора (п. 8 ст. 13 Федерального закона от 25.07.2002 №115-ФЗ).")
+    doc.add_paragraph()
+    doc.add_paragraph(f"Руководитель: _______________ / {EMPLOYER_DIRECTOR_SHORT}")
+    doc.add_paragraph(f"Дата подачи: «___» __________ 20__ г.        М.П.")
+
+    filename = f"termination_notice_{employee.id}.docx"
+    path = os.path.join(output_dir, filename)
+    doc.save(path)
+    return path
+
+
+def generate_departure_notice_docx(employee: Employee, output_dir: str = "/tmp") -> str:
+    """Уведомление об убытии иностранного гражданина из места пребывания (снятие с
+    миграционного учёта). Принимающая сторона — ООО «ТРЕСТСТРОЙМОНТАЖ» (вахта, предоставляет
+    жильё). Срок подачи — 7 рабочих дней с даты убытия (ст. 23 №109-ФЗ, п. 45 Правил ПП №9).
+
+    Дата убытия = contract_end_date (дата увольнения). Адрес пребывания, откуда убыл, —
+    SITE_ADDRESS (площадка). НЕ пиксельная копия бланка (подача через Госуслуги / бумага —
+    запасной путь); структурированный документ со всеми обязательными сведениями."""
+    doc = Document()
+    _set_default_style(doc)
+
+    title = doc.add_paragraph()
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = title.add_run("УВЕДОМЛЕНИЕ\nоб убытии иностранного гражданина\nиз места пребывания")
+    r.bold = True
+    sub = doc.add_paragraph()
+    sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    sr = sub.add_run("(снятие с миграционного учёта по месту пребывания)")
+    sr.italic = True
+    sr.font.size = Pt(9)
+
+    doc.add_paragraph()
+    doc.add_paragraph("В ____________________________________________________________")
+    doc.add_paragraph("(наименование территориального органа МВД России)")
+    doc.add_paragraph()
+
+    doc.add_paragraph("1. Сведения об иностранном гражданине, подлежащем снятию с учёта:")
+    name_parts = (employee.full_name or "").split()
+    surname = name_parts[0] if name_parts else DASH
+    first = name_parts[1] if len(name_parts) > 1 else DASH
+    patr = name_parts[2] if len(name_parts) > 2 else DASH
+    rows = [
+        ("Фамилия", surname),
+        ("Имя", first),
+        ("Отчество", patr),
+        ("Гражданство", _text_or_dash(getattr(employee, "citizenship", None) or "Республика Казахстан")),
+        ("Дата рождения", _date_or_dash(employee.birth_date)),
+        ("Документ, удостоверяющий личность", _passport_str(employee)),
+        ("Адрес места пребывания (откуда убыл)", SITE_ADDRESS),
+        ("Дата убытия из места пребывания", _date_or_dash(employee.contract_end_date)),
+    ]
+    t1 = doc.add_table(rows=len(rows), cols=2)
+    t1.style = "Table Grid"
+    for i, (k, v) in enumerate(rows):
+        t1.cell(i, 0).paragraphs[0].add_run(k).bold = True
+        t1.cell(i, 1).paragraphs[0].add_run(v)
+    _fix_table_width(t1, [70, 100])
+
+    doc.add_paragraph()
+    doc.add_paragraph("2. Сведения о принимающей стороне (организация):")
+    rows2 = [
+        ("Полное наименование", EMPLOYER_NAME_FULL),
+        ("ИНН", EMPLOYER_INN),
+        ("КПП", EMPLOYER_KPP),
+        ("ОГРН", _text_or_dash(EMPLOYER_OGRN)),
+        ("Адрес", EMPLOYER_LEGAL_ADDRESS),
+        ("Телефон", EMPLOYER_PHONE),
+        ("Ф.И.О. представителя", DASH),
+        ("Документ, удостоверяющий личность представителя", DASH),
+    ]
+    t2 = doc.add_table(rows=len(rows2), cols=2)
+    t2.style = "Table Grid"
+    for i, (k, v) in enumerate(rows2):
+        t2.cell(i, 0).paragraphs[0].add_run(k).bold = True
+        t2.cell(i, 1).paragraphs[0].add_run(v)
+    _fix_table_width(t2, [70, 100])
+
+    doc.add_paragraph()
+    doc.add_paragraph("Уведомление об убытии представляется принимающей стороной в срок 7 рабочих "
+                      "дней с даты убытия (ст. 23 Федерального закона от 18.07.2006 №109-ФЗ, "
+                      "п. 45 Правил, утв. постановлением Правительства РФ от 15.01.2007 №9).")
+    doc.add_paragraph()
+    doc.add_paragraph("Представитель принимающей стороны: _______________ / _______________")
+    doc.add_paragraph("Дата подачи: «___» __________ 20__ г.        М.П.")
+
+    filename = f"departure_notice_{employee.id}.docx"
     path = os.path.join(output_dir, filename)
     doc.save(path)
     return path
