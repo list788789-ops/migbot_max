@@ -1,3 +1,4 @@
+from datetime import date
 """
 obligations.py — создание Obligation (регистрация/медосмотр/уведомление МВД) и первого
 RegistrationPeriod для сотрудника.
@@ -78,6 +79,24 @@ def create_obligations_for_employee(session: Session, employee: Employee) -> Non
         ):
             continue
         trigger_date = getattr(employee, rule["trigger_field"])
+
+        # Отложенное создание обязательств увольнения (триггер contract_end_date): если дата
+        # увольнения в БУДУЩЕМ, обязательства уведомлений (расторжение/убытие) ещё НЕ создаём —
+        # срок подачи течёт от ФАКТА увольнения, а не от плана. Cron вызывает эту функцию
+        # регулярно и создаст их, когда contract_end_date наступит (<= сегодня). Так кадровик
+        # не получает горящих задач до дня увольнения.
+        if (
+            rule["trigger_field"] == "contract_end_date"
+            and trigger_date is not None
+            and trigger_date > date.today()
+        ):
+            log.info(
+                "Увольнение employee_id=%s назначено на будущее (%s) — обязательство %s "
+                "отложено до наступления даты",
+                employee.id, trigger_date, rule["type"],
+            )
+            continue
+
         if trigger_date is None:
             log.warning(
                 "Поле %s пустое у employee_id=%s — пропускаю obligation %s",
