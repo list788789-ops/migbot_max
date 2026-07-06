@@ -57,6 +57,9 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.sessions import SessionMiddleware
 
 from models import (
+    User,
+    UserRole,
+    UserStatus,
     Category,
     Consent,
     ConsentMethod,
@@ -128,8 +131,11 @@ def get_db():
 
 # --- Авторизация: один логин/пароль на кадровика, через переменные окружения -
 
-WEBFORMS_USER = os.environ.get("WEBFORMS_USER", "kadrovik")
-WEBFORMS_PASSWORD = os.environ["WEBFORMS_PASSWORD"]
+# Старый общий вход убран (перешли на учётки). Переменные оставлены необязательными,
+# чтобы их удаление/отсутствие не роняло старт. created_by/proof теперь берут реального
+# пользователя из сессии (см. _actor_name).
+WEBFORMS_USER = os.environ.get("WEBFORMS_USER", "system")
+WEBFORMS_PASSWORD = os.environ.get("WEBFORMS_PASSWORD", "")
 SECRET_KEY = os.environ["WEBFORMS_SECRET_KEY"]
 ORG_NAME = os.environ.get("COMPANY_NAME", "ИП Буц Сергей Юрьевич")
 CLINIC_ID = os.environ.get("CLINIC_ID", "pirogova_murmansk")
@@ -154,8 +160,76 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     )
 
 
+def _hash_password(pw: str) -> str:
+    from passlib.hash import bcrypt
+    return bcrypt.hash(pw)
+
+
+def _verify_password(pw: str, pw_hash: str) -> bool:
+    from passlib.hash import bcrypt
+    try:
+        return bcrypt.verify(pw, pw_hash)
+    except Exception:
+        return False
+
+
+def _password_problems(pw: str) -> list[str]:
+    """Требования: 8+ символов, строчная, заглавная, цифра. Возвращает список нарушений."""
+    import re as _re
+    problems = []
+    if len(pw) < 8:
+        problems.append("минимум 8 символов")
+    if not _re.search(r"[a-zа-яё]", pw):
+        problems.append("строчная буква")
+    if not _re.search(r"[A-ZА-ЯЁ]", pw):
+        problems.append("заглавная буква")
+    if not _re.search(r"\d", pw):
+        problems.append("цифра")
+    return problems
+
+
+def _normalize_phone(phone: str) -> str:
+    """Телефон-логин к единому виду: только цифры, ведущая 8 -> 7. Чтобы +7/8/пробелы
+    не создавали разных логинов одному человеку."""
+    digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+    if digits.startswith("8") and len(digits) == 11:
+        digits = "7" + digits[1:]
+    return digits
+
+
+def _current_user(request: Request, db: Session):
+    """Пользователь из сессии или None. Проверяет, что запись существует и APPROVED."""
+    uid = request.session.get("user_id")
+    if not uid:
+        return None
+    user = db.get(User, uid)
+    if user is None or user.status != UserStatus.APPROVED:
+        return None
+    return user
+
+
 def _logged_in(request: Request) -> bool:
-    return bool(request.session.get("logged_in"))
+    return bool(request.session.get("user_id"))
+
+
+def _require_role(request: Request, db: Session, *roles):
+    """Проверяет, что текущий пользователь имеет одну из ролей. Иначе 403.
+    ADMIN проходит везде (полный доступ). Возвращает пользователя при успехе."""
+    user = _current_user(request, db)
+    if user is None:
+        raise HTTPException(401, "Требуется вход")
+    if user.role == UserRole.ADMIN:
+        return user
+    if user.role not in roles:
+        raise HTTPException(403, "Недостаточно прав для этого действия")
+    return user
+
+
+def _actor_name(request: Request, db: Session) -> str:
+    """Имя текущего пользователя для аудита (created_by, proof). Если сессия почему-то пуста —
+    'system'. Заменяет прежний фиксированный WEBFORMS_USER, чтобы след показывал, КТО сделал."""
+    user = _current_user(request, db)
+    return user.full_name if user else "system"
 
 
 def _obligation_status(o, today):
@@ -290,16 +364,17 @@ fieldset legend{{font-size:12px;color:var(--accent-ink);text-transform:uppercase
 </header>
 """
 PAGE_FOOT = "</body></html>"
-def _nav(active: str = "") -> str:
-    """active: 'home' | 'employees' | 'medical' — подсвечивает корневой раздел.
-    Карточка/форма сотрудника -> 'employees'; направление/результат -> 'medical'.
-    Пустое (напр. экран подтверждения) — ничего не подсвечивается, это норм."""
+def _nav(active: str = "", role: str = "") -> str:
+    """active: 'home' | 'employees' | 'medical' | 'admin' — подсвечивает корневой раздел.
+    role: роль пользователя — 'admin' добавляет пункт «Пользователи» (управление доступом)."""
     items = [
         ("home", "/", "Рабочий стол"),
         ("employees", "/employees", "Сотрудники"),
         ("medical", "/medical", "Медкомиссия"),
-        ("", "/logout", "Выйти"),
     ]
+    if role == "admin":
+        items.append(("admin", "/admin/users", "Пользователи"))
+    items.append(("", "/logout", "Выйти"))
     links = "".join(
         f'<a href="{href}"{" class=\"active\"" if key and key == active else ""}>{label}</a>'
         for key, href, label in items
@@ -307,8 +382,8 @@ def _nav(active: str = "") -> str:
     return f"<nav>{links}</nav>"
 
 
-def _render(title: str, body: str, active: str = "") -> str:
-    return PAGE_HEAD.format(title=title, org_name=ORG_NAME) + _nav(active) + body + PAGE_FOOT
+def _render(title: str, body: str, active: str = "", role: str = "") -> str:
+    return PAGE_HEAD.format(title=title, org_name=ORG_NAME) + _nav(active, role) + body + PAGE_FOOT
 
 
 LOGIN_HEAD = """<!doctype html>
@@ -344,31 +419,128 @@ def login_form():
     return LOGIN_HEAD + """
 <form class="auth" method="post" action="/login" autocomplete="on">
 <h1>Миграционный учёт</h1>
-<p class="subtitle">Рабочее место кадровика</p>
+<p class="subtitle">Вход по номеру телефона</p>
 <div class="auth-row">
-<input type="text" name="username" placeholder="Логин" autocomplete="username" required>
+<input type="text" name="phone" placeholder="Телефон" autocomplete="username" required>
 <input type="password" name="password" placeholder="Пароль" autocomplete="current-password" required>
 <button type="submit">Войти</button>
 </div>
+<p style="margin-top:14px;text-align:center"><a href="/register">Нет доступа? Подать заявку</a></p>
 </form>
 </body></html>"""
 
 
-@app.post("/login")
-def login_submit(request: Request, username: str = Form(...), password: str = Form(...)):
-    if username == WEBFORMS_USER and password == WEBFORMS_PASSWORD:
-        request.session["logged_in"] = True
-        return RedirectResponse("/", status_code=303)
+def _login_error(msg: str, code: int = 401):
     return HTMLResponse(
-        LOGIN_HEAD
-        + """
+        LOGIN_HEAD + f"""
 <div class="auth">
 <h1>Миграционный учёт</h1>
-<p class="err">Неверный логин или пароль</p>
+<p class="err">{msg}</p>
 <a class="btn" href="/login">← Назад</a>
 </div>
 </body></html>""",
-        status_code=401,
+        status_code=code,
+    )
+
+
+@app.post("/login")
+def login_submit(request: Request, phone: str = Form(...), password: str = Form(...),
+                 db: Session = Depends(get_db)):
+    """Вход по телефону+паролю. Защита от подбора: 5 неудачных попыток -> блок на час.
+    Проверяем статус (APPROVED) и временную блокировку (locked_until) до проверки пароля."""
+    norm = _normalize_phone(phone)
+    user = db.scalars(select(User).where(User.phone == norm)).first()
+
+    # неизвестный телефон — общая ошибка (не раскрываем, есть ли такой пользователь)
+    if user is None:
+        log.warning("Вход: неизвестный телефон %s", norm)
+        return _login_error("Неверный телефон или пароль")
+
+    now = datetime.utcnow()
+
+    # временная блокировка за подбор
+    if user.locked_until is not None and user.locked_until > now:
+        mins = int((user.locked_until - now).total_seconds() // 60) + 1
+        log.warning("Вход: телефон %s заблокирован ещё %s мин", norm, mins)
+        return _login_error(f"Слишком много попыток. Вход заблокирован на ~{mins} мин.")
+
+    # статус аккаунта
+    if user.status == UserStatus.PENDING:
+        return _login_error("Заявка ещё не одобрена администратором.")
+    if user.status == UserStatus.BLOCKED:
+        return _login_error("Доступ заблокирован администратором.")
+
+    # проверка пароля
+    if not _verify_password(password, user.password_hash):
+        user.failed_attempts = (user.failed_attempts or 0) + 1
+        if user.failed_attempts >= 5:
+            from datetime import timedelta
+            user.locked_until = now + timedelta(hours=1)
+            user.failed_attempts = 0
+            log.warning("Вход: телефон %s — 5 неудач, блок на час", norm)
+            db.commit()
+            return _login_error("Слишком много попыток. Вход заблокирован на 1 час.")
+        db.commit()
+        return _login_error("Неверный телефон или пароль")
+
+    # успех — сброс счётчика, установка сессии
+    user.failed_attempts = 0
+    user.locked_until = None
+    db.commit()
+    request.session["user_id"] = user.id
+    request.session["role"] = user.role.value if user.role else ""
+    return RedirectResponse("/", status_code=303)
+
+
+@app.get("/register", response_class=HTMLResponse)
+def register_form():
+    return LOGIN_HEAD + """
+<form class="auth" method="post" action="/register" autocomplete="on">
+<h1>Заявка на доступ</h1>
+<p class="subtitle">Заполните — администратор одобрит и назначит роль</p>
+<div class="auth-row">
+<input type="text" name="full_name" placeholder="ФИО" required>
+<input type="text" name="phone" placeholder="Телефон" autocomplete="username" required>
+<input type="password" name="password" placeholder="Пароль (8+, буквы, цифра, регистр)" autocomplete="new-password" required>
+<button type="submit">Подать заявку</button>
+</div>
+<p style="margin-top:14px;text-align:center"><a href="/login">← Уже есть доступ</a></p>
+</form>
+</body></html>"""
+
+
+@app.post("/register")
+def register_submit(request: Request, full_name: str = Form(...), phone: str = Form(...),
+                    password: str = Form(...), db: Session = Depends(get_db)):
+    """Открытая регистрация: создаёт пользователя со status=PENDING. Роль НЕ назначается
+    (её даст админ при одобрении). Проверка сложности пароля. Уведомление админу — в bot.py."""
+    norm = _normalize_phone(phone)
+    problems = _password_problems(password)
+    if problems:
+        return _login_error("Пароль слабый: " + ", ".join(problems) + ".")
+    if not norm or len(norm) < 10:
+        return _login_error("Неверный номер телефона.")
+    existing = db.scalars(select(User).where(User.phone == norm)).first()
+    if existing is not None:
+        return _login_error("Пользователь с таким телефоном уже существует.")
+    user = User(
+        phone=norm,
+        password_hash=_hash_password(password),
+        full_name=full_name.strip(),
+        status=UserStatus.PENDING,
+    )
+    db.add(user)
+    db.commit()
+    log.info("Новая заявка на доступ: %s (%s)", full_name, norm)
+    # TODO(bot): уведомить админа в MAX о новой заявке (реализуется в bot.py)
+    return HTMLResponse(
+        LOGIN_HEAD + """
+<div class="auth">
+<h1>Заявка отправлена</h1>
+<p class="subtitle">Администратор одобрит доступ и назначит роль. После этого войдите.</p>
+<a class="btn" href="/login">← К входу</a>
+</div>
+</body></html>""",
     )
 
 
@@ -398,6 +570,129 @@ LOGIN_BG_SVG = """<svg viewBox="0 0 430 760" preserveAspectRatio="xMidYMid slice
 def login_bg():
     return Response(content=LOGIN_BG_SVG, media_type="image/svg+xml",
                     headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.get("/admin/users", response_class=HTMLResponse)
+def admin_users(request: Request, db: Session = Depends(get_db)):
+    """Управление пользователями. Только ADMIN. Список: заявки (PENDING) сверху с кнопками
+    одобрения и выбором роли; активные и заблокированные ниже с действиями."""
+    user = _current_user(request, db)
+    if user is None:
+        return RedirectResponse("/login", status_code=303)
+    if user.role != UserRole.ADMIN:
+        raise HTTPException(403, "Доступ только для администратора")
+
+    users = db.scalars(select(User).order_by(User.created_at.desc())).all()
+    now = datetime.utcnow()
+
+    def _row(u):
+        locked = u.locked_until is not None and u.locked_until > now
+        role_ru = {"prorab": "прораб", "kadrovik": "кадровик", "admin": "админ"}.get(
+            u.role.value if u.role else "", "—")
+        parts = [f'<b>{u.full_name}</b> · {u.phone} · роль: {role_ru}']
+        if u.status == UserStatus.PENDING:
+            parts.append(
+                f'<form method="post" action="/admin/users/{u.id}/approve" style="margin:6px 0">'
+                '<select name="role" required>'
+                '<option value="">— назначить роль —</option>'
+                '<option value="prorab">Прораб (только чтение и скачивание)</option>'
+                '<option value="kadrovik">Кадровик (всё по работникам)</option>'
+                '<option value="admin">Админ</option>'
+                '</select> '
+                '<button type="submit">Одобрить</button></form>'
+            )
+        else:
+            if u.status == UserStatus.BLOCKED:
+                parts.append('<span class="badge red">заблокирован</span> ')
+                parts.append(
+                    f'<form method="post" action="/admin/users/{u.id}/unblock" style="display:inline">'
+                    '<button type="submit">Разблокировать</button></form>')
+            else:
+                parts.append('<span class="badge green">активен</span> ')
+                if u.id != user.id:  # себя не блокируем
+                    parts.append(
+                        f'<form method="post" action="/admin/users/{u.id}/block" style="display:inline">'
+                        '<button type="submit" class="secondary">Заблокировать</button></form>')
+            if locked:
+                mins = int((u.locked_until - now).total_seconds() // 60) + 1
+                parts.append(
+                    f' <span class="badge orange">замок за попытки ~{mins} мин</span>'
+                    f'<form method="post" action="/admin/users/{u.id}/unlock" style="display:inline">'
+                    '<button type="submit">Снять замок</button></form>')
+        return '<fieldset><legend>' + ("заявка" if u.status == UserStatus.PENDING else "пользователь") + '</legend>' + "".join(parts) + '</fieldset>'
+
+    pending = [u for u in users if u.status == UserStatus.PENDING]
+    others = [u for u in users if u.status != UserStatus.PENDING]
+    body = "<h1>Пользователи</h1>"
+    if pending:
+        body += "<h2>Заявки на доступ</h2>" + "".join(_row(u) for u in pending)
+    else:
+        body += '<p class="muted">Новых заявок нет.</p>'
+    body += "<h2>Все пользователи</h2>" + "".join(_row(u) for u in others)
+    return _render("Пользователи", body, active="admin", role="admin")
+
+
+@app.post("/admin/users/{user_id}/approve")
+def admin_approve(user_id: str, request: Request, role: str = Form(...),
+                  db: Session = Depends(get_db)):
+    admin = _current_user(request, db)
+    if admin is None or admin.role != UserRole.ADMIN:
+        raise HTTPException(403, "Только администратор")
+    u = db.get(User, user_id)
+    if u is None:
+        raise HTTPException(404, "Пользователь не найден")
+    if role not in ("prorab", "kadrovik", "admin"):
+        raise HTTPException(400, "Неверная роль")
+    u.role = UserRole(role)
+    u.status = UserStatus.APPROVED
+    u.approved_at = datetime.utcnow()
+    db.commit()
+    return RedirectResponse("/admin/users", status_code=303)
+
+
+@app.post("/admin/users/{user_id}/block")
+def admin_block(user_id: str, request: Request, db: Session = Depends(get_db)):
+    admin = _current_user(request, db)
+    if admin is None or admin.role != UserRole.ADMIN:
+        raise HTTPException(403, "Только администратор")
+    u = db.get(User, user_id)
+    if u is None:
+        raise HTTPException(404, "Пользователь не найден")
+    if u.id == admin.id:
+        raise HTTPException(400, "Нельзя заблокировать себя")
+    u.status = UserStatus.BLOCKED
+    db.commit()
+    return RedirectResponse("/admin/users", status_code=303)
+
+
+@app.post("/admin/users/{user_id}/unblock")
+def admin_unblock(user_id: str, request: Request, db: Session = Depends(get_db)):
+    admin = _current_user(request, db)
+    if admin is None or admin.role != UserRole.ADMIN:
+        raise HTTPException(403, "Только администратор")
+    u = db.get(User, user_id)
+    if u is None:
+        raise HTTPException(404, "Пользователь не найден")
+    u.status = UserStatus.APPROVED
+    u.failed_attempts = 0
+    u.locked_until = None
+    db.commit()
+    return RedirectResponse("/admin/users", status_code=303)
+
+
+@app.post("/admin/users/{user_id}/unlock")
+def admin_unlock(user_id: str, request: Request, db: Session = Depends(get_db)):
+    """Снять временный замок за попытки подбора (не меняя статус)."""
+    admin = _current_user(request, db)
+    if admin is None or admin.role != UserRole.ADMIN:
+        raise HTTPException(403, "Только администратор")
+    u = db.get(User, user_id)
+    if u is None:
+        raise HTTPException(404, "Пользователь не найден")
+    u.failed_attempts = 0
+    u.locked_until = None
+    db.commit()
+    return RedirectResponse("/admin/users", status_code=303)
 
 
 @app.get("/logout")
@@ -535,7 +830,7 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
 
 {recompute_section}
 """
-    return _render("Рабочий стол", body, active="home")
+    return _render("Рабочий стол", body, active="home", role=request.session.get("role",""))
 
 
 # --- Сотрудники: список + единая карточка ------------------------------------
@@ -603,6 +898,7 @@ def employees_list(request: Request, db: Session = Depends(get_db)):
         f'<p><a class="btn" href="/employees/new">+ Добавить сотрудника</a></p>'
         f'{active_section}{awaiting_section}',
         active="employees",
+        role=request.session.get("role", ""),
     )
 
 
@@ -684,7 +980,7 @@ def _new_employee_form_html(values: dict, error: str = "") -> str:
 def employee_new_form(request: Request):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
-    return _render("Новый сотрудник", _new_employee_form_html({}), active="employees")
+    return _render("Новый сотрудник", _new_employee_form_html({}), active="employees", role=request.session.get("role",""))
 
 
 @app.post("/employees/new")
@@ -702,6 +998,7 @@ def employee_create(
 ):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
 
     values = {
         "full_name": full_name, "citizenship": citizenship, "birth_date": birth_date,
@@ -747,7 +1044,7 @@ def employee_create(
             cd = val
 
     if errors:
-        return HTMLResponse(_render("Новый сотрудник", _new_employee_form_html(values, ", ".join(errors)), active="employees"))
+        return HTMLResponse(_render("Новый сотрудник", _new_employee_form_html(values, ", ".join(errors)), active="employees", role=request.session.get("role","")))
 
     emp = Employee(
         full_name=fn,
@@ -762,7 +1059,7 @@ def employee_create(
         address=SITE_ADDRESS,          # адрес площадки по умолчанию
         # address_since НЕ ставим: первый адрес, не переезд — обязательство регистрации не плодим
         consent_status=ConsentStatus.DRAFT,  # согласие отдельно; до него obligations не создаются
-        created_by=WEBFORMS_USER,
+        created_by=_actor_name(request, db),
         language="ru",
     )
     db.add(emp)
@@ -1012,7 +1309,7 @@ value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
 </div>
 <a class="btn secondary" href="/employees">← Ко всем сотрудникам</a>
 </section>"""
-    return _render(emp.full_name, body + SAVE_FORM_JS, active="employees")
+    return _render(emp.full_name, body + SAVE_FORM_JS, active="employees", role=request.session.get("role",""))
 
 
 @app.post("/employees/{employee_id}/entry_date")
@@ -1024,6 +1321,7 @@ def employee_entry_date_submit(
 ):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
 
     emp = db.get(Employee, employee_id)
     if emp is None:
@@ -1073,6 +1371,7 @@ def employee_address_submit(
 ):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
 
     emp = db.get(Employee, employee_id)
     if emp is None:
@@ -1107,6 +1406,7 @@ def employee_contract_date_submit(
 ):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
 
     emp = db.get(Employee, employee_id)
     if emp is None:
@@ -1128,6 +1428,7 @@ def employee_contract_date_submit(
 def employee_consent_confirm_submit(employee_id: str, request: Request, db: Session = Depends(get_db)):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
 
     emp = db.get(Employee, employee_id)
     if emp is None:
@@ -1140,7 +1441,7 @@ def employee_consent_confirm_submit(employee_id: str, request: Request, db: Sess
     consent = Consent(
         employee_id=emp.id,
         method=ConsentMethod.BOT_BUTTON,
-        proof=f"button_click:webforms:{WEBFORMS_USER}:{datetime.now(MSK).isoformat()}",
+        proof=f"button_click:webforms:{_actor_name(request, db)}:{datetime.now(MSK).isoformat()}",
         consent_text_version=CONSENT_TEXT_VERSION,
     )
     db.add(consent)
@@ -1164,6 +1465,7 @@ def employee_dactyloscopy_date_submit(
 ):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
 
     emp = db.get(Employee, employee_id)
     if emp is None:
@@ -1209,6 +1511,7 @@ def employee_save(
     серверный второй шаг ниже. Старые пять роутов полей оставлены рабочими рядом."""
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
 
     emp = db.get(Employee, employee_id)
     if emp is None:
@@ -1261,7 +1564,7 @@ def employee_save(
 </form>
 <a class="btn secondary" href="/employees/{emp.id}">Отмена</a>
 </section>"""
-        return HTMLResponse(_render("Подтверждение", body))
+        return HTMLResponse(_render("Подтверждение", body, role=request.session.get("role","")))
 
     # --- применяем только изменившееся ---
     if entry_changed:
@@ -1411,7 +1714,7 @@ def medical_list(request: Request, db: Session = Depends(get_db)):
 {''.join(awaiting_row(r) for r in awaiting_result) or '<p class="muted">Нет ожидающих результата.</p>'}
 </section>
 """
-    return _render("Медкомиссия", body, active="medical")
+    return _render("Медкомиссия", body, active="medical", role=request.session.get("role",""))
 
 
 @app.post("/medical/{employee_id}/refer")
@@ -1523,6 +1826,7 @@ def employee_labor_contract(
     Блокируется при пустом статусе учёта и пустом табельном. Должность/оклад из формы как есть."""
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
 
     emp = db.get(Employee, employee_id)
     if emp is None:
@@ -1546,7 +1850,6 @@ def employee_labor_contract(
     return RedirectResponse(f"/employees/{employee_id}", status_code=303)
 
 
-@app.post("/employees/{employee_id}/labor_contract/cancel")
 def _render_labor_contract_preview(emp, position, salary, contract_date_str, tab):
     """HTML-предпросмотр трудового договора. Зеркалит текст generate_labor_contract_docx
     в document_templates.py. Меняешь текст там — поменяй и здесь, иначе предпросмотр
@@ -1594,7 +1897,7 @@ def _render_labor_contract_preview(emp, position, salary, contract_date_str, tab
 <a class="btn secondary" href="/employees/{emp.id}">← Назад к карточке</a>
 <button class="btn" onclick="window.print()">Печать</button>
 </div>"""
-    return _render("Предпросмотр договора", body, active="employees")
+    return _render("Предпросмотр договора", body, active="employees", role=request.session.get("role",""))
 
 
 @app.post("/employees/{employee_id}/labor_contract/preview")
@@ -1691,6 +1994,7 @@ def employee_registration_status(
     не трогаем — просто перестаёт быть валидным для новых расчётов."""
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
 
     emp = db.get(Employee, employee_id)
     if emp is None:
@@ -1744,6 +2048,7 @@ def employee_registration_status(
     return RedirectResponse(f"/employees/{employee_id}", status_code=303)
 
 
+@app.post("/employees/{employee_id}/labor_contract/cancel")
 def employee_labor_contract_cancel(
     employee_id: str,
     request: Request,
@@ -1755,6 +2060,7 @@ def employee_labor_contract_cancel(
     Само поле contract_date общее с ручным вводом в карточке, отмена его тоже обнулит."""
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
 
     emp = db.get(Employee, employee_id)
     if emp is None:
@@ -1851,7 +2157,7 @@ def _render_referral_preview(emp: Employee, obligation_id: str, missing_fields: 
 </table>
 </section>
 """
-    return _render("Направление на медосмотр", body, active="medical")
+    return _render("Направление на медосмотр", body, active="medical", role=request.session.get("role",""))
 
 
 @app.post("/medical/{employee_id}/result")
@@ -1870,6 +2176,7 @@ def medical_result(
     webforms.py) снова синхронизируются. См. отложенную задачу по полноценной истории."""
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
 
     if result not in ("done", "failed"):
         raise HTTPException(400, "result должен быть 'done' или 'failed'")
