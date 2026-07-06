@@ -272,8 +272,16 @@ fieldset legend{{font-size:12px;color:var(--accent-ink);text-transform:uppercase
   section.grid h2{{grid-column:1/-1}}
   section.grid .card{{margin-bottom:0}}
   section.narrow{{max-width:440px;margin:0 auto}}
-  section.card-form{{max-width:640px;margin:0 auto}}
+  section.card-form{{max-width:1000px;margin:0 auto}}
+  .card-cols{{display:grid;grid-template-columns:1fr 1fr;gap:20px;align-items:start}}
   a.btn:hover,button:hover{{opacity:.9}}
+  /* Десктоп: кнопки на всю ширину (btn-full) не растягивать во всю колонку — ограничить и
+     прижать влево, иначе на широком экране кнопка-переросток. Мобильный не затронут (media). */
+  .btn-full{{width:auto;min-width:280px;display:inline-block}}
+  /* Поля ввода не на всю ширину колонки — читаемая ширина. */
+  input[type=date],input[type=text],input[type=password],select{{max-width:420px}}
+  /* Форма квитанции: кнопки в ряд, а не столбиком. */
+  fieldset form .btn-full{{margin-right:10px}}
 }}
 </style></head><body>
 <header class="org">
@@ -931,6 +939,8 @@ onsubmit="return confirm(&#39;Отменить договор? Дата дого
     body = f"""
 <h1>{emp.full_name}</h1>
 <section class="card-form">
+<div class="card-cols">
+<div class="card-col">
 <p class="muted">Заполни известные поля и нажми одну кнопку внизу. Пустые поля не трогаются.</p>
 <form id="saveform" method="post" action="/employees/{emp.id}/save">
 <input type="hidden" name="confirmed" value="">
@@ -970,7 +980,8 @@ value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
 
 <button type="submit" class="btn-full">Сохранить</button>
 </form>
-
+</div>
+<div class="card-col">
 <fieldset>
 <legend>Согласие на обработку ПД</legend>
 {consent_block}
@@ -997,7 +1008,8 @@ value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
 <button type="submit" name="kind" value="renewal" class="btn-full">Квитанция: продление пребывания (1000 ₽)</button>
 </form>
 </fieldset>
-
+</div>
+</div>
 <a class="btn secondary" href="/employees">← Ко всем сотрудникам</a>
 </section>"""
     return _render(emp.full_name, body + SAVE_FORM_JS, active="employees")
