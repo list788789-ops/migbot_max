@@ -422,8 +422,9 @@ def generate_labor_contract_docx(
         f"состоит из: Оклад: {salary_fmt} руб.; Районный коэффициент: {DISTRICT_COEFFICIENT}."
     )
     para(
-        "3.2. Заработная плата выплачивается Работнику не реже чем каждые полмесяца путем выдачи "
-        "Работнику наличных денежных средств в кассе Работодателя."
+        "3.2. Заработная плата выплачивается Работнику не реже чем каждые полмесяца путем "
+        "перечисления денежных средств на банковский счёт Работника, реквизиты которого "
+        "Работник сообщает Работодателю в письменном виде."
     )
 
     h("4. ПРАВА И ОБЯЗАННОСТИ СТОРОН")
@@ -454,20 +455,29 @@ def generate_labor_contract_docx(
     para("7.2. Настоящий договор составлен в 2 экземплярах, по одному для каждой из сторон.")
 
     h("8. АДРЕСА СТОРОН И ПОДПИСИ")
-    para(f"Работник: {employee.full_name}, {birth} года рождения")
-    para(f"Паспорт: {passport}, выдан: {DASH}")
-    para(f"Адрес: {SITE_ADDRESS}")
-    para("")
-    para("Подпись: _____________________")
-    para("")
-    para(f"Работодатель: {EMPLOYER_NAME_FULL}")
-    para(f"ИНН: {EMPLOYER_INN} КПП: {EMPLOYER_KPP}")
-    para(f"Юридический адрес: {EMPLOYER_LEGAL_ADDRESS}")
-    para(f"Фактический адрес: {EMPLOYER_ACTUAL_ADDRESS}")
-    para(f"Телефон: {EMPLOYER_PHONE}")
-    para("")
-    para(f"Генеральный директор _____________________ {EMPLOYER_DIRECTOR_SHORT}")
-    para("м.п.")
+    # Две стороны рядом: слева Работник, справа Работодатель. Таблица 1x2 без границ.
+    sig = doc.add_table(rows=1, cols=2)
+    sig.autofit = True
+
+    left = sig.cell(0, 0)
+    left.paragraphs[0].add_run("Работник:").bold = True
+    left.add_paragraph(f"{employee.full_name}, {birth} года рождения")
+    left.add_paragraph(f"Паспорт: {passport}, выдан: {DASH}")
+    left.add_paragraph(f"Адрес: {SITE_ADDRESS}")
+    left.add_paragraph("")
+    left.add_paragraph("Подпись: _______________")
+
+    right = sig.cell(0, 1)
+    right.paragraphs[0].add_run("Работодатель:").bold = True
+    right.add_paragraph(EMPLOYER_NAME_FULL)
+    right.add_paragraph(f"ИНН: {EMPLOYER_INN} КПП: {EMPLOYER_KPP}")
+    right.add_paragraph(f"Юридический адрес: {EMPLOYER_LEGAL_ADDRESS}")
+    right.add_paragraph(f"Фактический адрес: {EMPLOYER_ACTUAL_ADDRESS}")
+    right.add_paragraph(f"Телефон: {EMPLOYER_PHONE}")
+    right.add_paragraph("")
+    right.add_paragraph(f"Ген. директор _______________")
+    right.add_paragraph(EMPLOYER_DIRECTOR_SHORT)
+    right.add_paragraph("м.п.")
 
     safe_tab = tab or "no_tab"
     filename = f"labor_contract_{employee.id}_{safe_tab}.docx"
