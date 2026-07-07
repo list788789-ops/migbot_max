@@ -351,6 +351,15 @@ class Obligation(Base):
     # версии задваивают списки. См. create_obligations_for_employee в obligations.py.
     is_current: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
+    # Ручная отметка о выполнении (2026-07): для обязательств, которые подаются ВОВНЕ и не имеют
+    # своего закрывателя (ЕФС-1 в СФР, уведомление МВД, регистрация). Кадровик отмечает факт
+    # подачи кнопкой в карточке; хранится дата отметки и кто отметил — след для проверки.
+    # Требует ALTER TABLE на проде:
+    #   ALTER TABLE obligations ADD COLUMN done_date DATE;
+    #   ALTER TABLE obligations ADD COLUMN done_by VARCHAR;
+    done_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    done_by: Mapped[str | None] = mapped_column(String, nullable=True)
+
     employee: Mapped["Employee"] = relationship(back_populates="obligations")
     referrals: Mapped[list["Referral"]] = relationship(back_populates="obligation", cascade="all, delete-orphan")
 
