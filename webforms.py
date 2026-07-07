@@ -1106,9 +1106,11 @@ def employee_card(employee_id: str, request: Request, db: Session = Depends(get_
 
     # Тексты справок у полей карточки (значок i с раскрытием). Коротко: что это и что делает.
     help_entry = _help(
-        "Дата въезда в РФ по миграционной карте/штампу. От неё считаются сроки: регистрация "
-        "(30 дней), медосмотр (30 дней), дактилоскопия (30 дней). Пусто — сотрудник ещё не "
-        "прибыл, сроки не идут."
+        "Дата пересечения ГРАНИЦЫ РФ по миграционной карте/штампу — когда иностранец въехал в "
+        "Россию. НЕ дата переезда внутри страны (например, из Москвы в Мурманск): для переезда "
+        "есть поле «Дата, с которой действует адрес» ниже. Пример: въехал в РФ 03.04, приехал на "
+        "объект 15.06 — сюда ставится 03.04. От этой даты идут сроки: регистрация (30 дней ЕАЭС), "
+        "медосмотр, дактилоскопия. Пусто — ещё не прибыл в РФ, сроки не идут."
     )
     help_dact = _help(
         "Дата прохождения дактилоскопии и фотографирования («грин карта»). Заполнение закрывает "
@@ -1119,14 +1121,21 @@ def employee_card(employee_id: str, request: Request, db: Session = Depends(get_
         "Государство, из которого сотрудник въехал в РФ. Информационное поле, на сроки не влияет."
     )
     help_address = _help(
-        "Фактическое место пребывания. Смена адреса на другой создаёт новое обязательство по "
-        "постановке на учёт (срок — как при первичном въезде). Первый ввод адреса обязательство "
-        "не создаёт. «Дата, с которой действует адрес» нужна только при смене."
+        "Фактическое место пребывания в РФ (адрес объекта/общежития). «Дата, с которой действует "
+        "адрес» — день прибытия на ЭТО место (переезд внутри РФ), НЕ дата въезда в страну. Пример: "
+        "въехал в РФ 03.04, прибыл на объект в Белокаменке 15.06 — здесь 15.06. "
+        "СРОК ПОСТАНОВКИ: для граждан Казахстана (ЕАЭС) без ВНЖ и без статуса ВКС — 30 суток с "
+        "даты въезда в РФ (Договор о ЕАЭС, п.6 ст.97). При переезде в другой регион встать на "
+        "учёт по новому адресу нужно, но общий 30-дневный режим сохраняется. Правило «7 дней при "
+        "смене региона» к ним НЕ относится — оно только для ВКС и обладателей ВНЖ. Смена адреса "
+        "создаёт новое обязательство постановки; первый ввод адреса обязательство не создаёт."
     )
     help_contract_date = _help(
-        "Дата заключения трудового договора. Создаёт обязательства: уведомление МВД (3 рабочих "
-        "дня) и ЕФС-1 в СФР (1 рабочий день). Обычно проставляется автоматически при заключении "
-        "договора ниже, но можно ввести вручную."
+        "Дата заключения трудового договора. Это поле (слева) сохраняется кнопкой «Сохранить» и "
+        "создаёт обязательства: уведомление МВД (3 рабочих дня) и ЕФС-1 (1 рабочий день). "
+        "Отдельная «Дата договора» справа, в блоке заключения — это дата, с которой сформируется "
+        "документ при нажатии «Заключить»; она не сохраняется сама по себе, а применяется в момент "
+        "заключения. Если нужно просто зафиксировать дату — используйте это поле слева и «Сохранить»."
     )
     help_contract = _help(
         "Заключение проставит дату договора в карточку и создаст обязательства (уведомление МВД, "
@@ -2038,20 +2047,51 @@ def employee_labor_contract_preview(
         emp, position, salary, contract_date.strftime("%d.%m.%Y"), tab))
 
 
+def _find_soffice() -> str | None:
+    """Ищет бинарь soffice. На Railway/Nixpacks LibreOffice ставится в Nix store и НЕ попадает
+    в PATH — поэтому недостаточно вызвать 'soffice'. Проверяем PATH, затем типовые пути и Nix
+    store. Возвращает путь к бинарю или None."""
+    import shutil, glob
+    # 1) в PATH
+    found = shutil.which("soffice") or shutil.which("libreoffice")
+    if found:
+        return found
+    # 2) типовые пути
+    for p in ("/usr/bin/soffice", "/usr/local/bin/soffice",
+              "/usr/lib/libreoffice/program/soffice", "/opt/libreoffice/program/soffice"):
+        if os.path.exists(p):
+            return p
+    # 3) Nix store (Railway) — ищем soffice в /nix/store/*/bin и program-каталогах
+    for pattern in ("/nix/store/*/bin/soffice",
+                    "/nix/store/*libreoffice*/lib/libreoffice/program/soffice",
+                    "/nix/store/*libreoffice*/program/soffice"):
+        hits = glob.glob(pattern)
+        if hits:
+            return hits[0]
+    return None
+
+
 def _docx_to_pdf(docx_path: str) -> str:
     """Конвертирует docx в pdf через LibreOffice (soffice --headless). Возвращает путь к pdf.
-    Требует libreoffice в контейнере (nixpacks.toml). Для пакета Госуслуг: договор и квитанция
-    отдаются в PDF, но генерируются из одного источника-docx — расхождения версий невозможны.
-    Бросает RuntimeError, если конвертация не удалась (напр. soffice отсутствует)."""
+    Требует libreoffice в контейнере (nixpacks.toml). Ищет soffice не только в PATH, но и в
+    Nix store — на Railway бинарь туда и попадает, минуя PATH (частая причина 'soffice not found').
+    Для пакета Госуслуг: договор и квитанция генерируются из одного docx — расхождения нет."""
     import subprocess
+    soffice = _find_soffice()
+    if soffice is None:
+        raise RuntimeError(
+            "LibreOffice (soffice) не найден в контейнере. Проверьте, что nixpacks.toml с "
+            "'libreoffice' в nixPkgs задеплоен и в build-логе есть его установка."
+        )
     out_dir = os.path.dirname(docx_path)
+    # HOME нужен soffice для профиля; в некоторых контейнерах он не задан -> падение.
+    env = dict(os.environ)
+    env.setdefault("HOME", out_dir)
     try:
         subprocess.run(
-            ["soffice", "--headless", "--convert-to", "pdf", "--outdir", out_dir, docx_path],
-            check=True, capture_output=True, timeout=60,
+            [soffice, "--headless", "--convert-to", "pdf", "--outdir", out_dir, docx_path],
+            check=True, capture_output=True, timeout=90, env=env,
         )
-    except FileNotFoundError:
-        raise RuntimeError("LibreOffice (soffice) не установлен в контейнере — добавьте в nixpacks.toml")
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"Конвертация docx->pdf не удалась: {e.stderr.decode(errors='ignore')[:200]}")
     except subprocess.TimeoutExpired:
