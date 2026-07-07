@@ -164,15 +164,20 @@ S3_SECRET_KEY = os.environ.get("S3_SECRET_KEY", "")
 
 # Разрешённые типы сканов — фиксированный список, чтобы не плодить произвольные ключи.
 # key_prefix: персональные под employee_<id>/, общие (ЕГРН на ВЖК) под common/.
+# Персональные сканы (в карточке работника, свои у каждого).
 SCAN_TYPES = {
     "passport": "Паспорт работника (все страницы)",
     "migration_card": "Миграционная карта",
-    "director_passport": "Паспорт директора (принимающая сторона)",
-    "egrn": "Документ-основание на адрес (уточняется)",
+    "payment": "Исполненная платёжка (оплата госпошлины)",
 }
-# Какие типы общие (один файл на всех), какие персональные (под каждым работником).
-# Паспорт директора и документ-основание — общие: директор и адрес одни для всех.
-SCAN_COMMON_TYPES = {"egrn", "director_passport"}
+# Общие документы (один файл на всех) — на отдельной странице /common-docs (кадровик/админ),
+# не в карточке работника. Директор и адрес подразделения одни для всех работников.
+COMMON_DOC_TYPES = {
+    "director_passport": "Паспорт директора (принимающая сторона)",
+    "address_basis": "Документ-основание на адрес подразделения",
+}
+# Пусто: персональные типы общими не бывают (для _s3_list_for_employee).
+SCAN_COMMON_TYPES = set()
 
 
 def _s3_client():
@@ -250,6 +255,83 @@ def _s3_delete(scan_type: str, employee_id: str | None) -> None:
         client.delete_object(Bucket=S3_BUCKET, Key=key)
     except Exception as e:
         raise RuntimeError(f"Не удалось удалить скан: {str(e)[:200]}")
+
+
+# --- Общие документы (паспорт директора, основание на адрес) — один файл на всех -----------
+def _common_key(doc_type: str) -> str:
+    """Ключ общего документа в бакете: common/<type>."""
+    return f"common/{doc_type}"
+
+
+def _s3_upload_common(doc_type: str, data: bytes, content_type: str) -> None:
+    client = _s3_client()
+    try:
+        client.put_object(Bucket=S3_BUCKET, Key=_common_key(doc_type), Body=data, ContentType=content_type)
+    except Exception as e:
+        raise RuntimeError(f"Не удалось загрузить документ: {str(e)[:200]}")
+
+
+def _s3_list_common() -> dict:
+    """{doc_type: True} для загруженных общих документов. Пусто, если хранилище не настроено."""
+    present = {}
+    try:
+        client = _s3_client()
+    except RuntimeError:
+        return present
+    for dt in COMMON_DOC_TYPES:
+        try:
+            client.head_object(Bucket=S3_BUCKET, Key=_common_key(dt))
+            present[dt] = True
+        except Exception:
+            pass
+    return present
+
+
+def _s3_download_common(doc_type: str):
+    client = _s3_client()
+    try:
+        obj = client.get_object(Bucket=S3_BUCKET, Key=_common_key(doc_type))
+        return obj["Body"].read(), obj.get("ContentType", "application/octet-stream")
+    except Exception as e:
+        raise RuntimeError(f"Документ не найден или недоступен: {str(e)[:200]}")
+
+
+def _s3_delete_common(doc_type: str) -> None:
+    client = _s3_client()
+    try:
+        client.delete_object(Bucket=S3_BUCKET, Key=_common_key(doc_type))
+    except Exception as e:
+        raise RuntimeError(f"Не удалось удалить документ: {str(e)[:200]}")
+
+
+def _package_missing(emp) -> list:
+    """Проверяет комплектность пакета Госуслуг для работника. Возвращает список недостающего
+    (человекочитаемые названия). Пустой список = пакет полный, можно выгружать."""
+    missing = []
+    # персональные сканы
+    present = _s3_list_for_employee(emp.id)
+    for st, label in SCAN_TYPES.items():
+        if not present.get(st):
+            missing.append(label)
+    # общие документы
+    common = _s3_list_common()
+    for dt, label in COMMON_DOC_TYPES.items():
+        if not common.get(dt):
+            missing.append(label)
+    # договор (нужна дата договора, чтобы сгенерировать)
+    if emp.contract_date is None:
+        missing.append("Трудовой договор (не заключён)")
+    return missing
+
+
+def _ext_for(ct: str) -> str:
+    if "pdf" in ct:
+        return "pdf"
+    if "jpeg" in ct or "jpg" in ct:
+        return "jpg"
+    if "png" in ct:
+        return "png"
+    return "bin"
 
 
 
@@ -484,6 +566,9 @@ def _nav(active: str = "", role: str = "") -> str:
         ("employees", "/employees", "Сотрудники"),
         ("medical", "/medical", "Медкомиссия"),
     ]
+    # Общие документы (паспорт директора, основание на адрес) — кадровику и админу, не прорабу.
+    if role in ("admin", "kadrovik"):
+        items.append(("common", "/common-docs", "Общие документы"))
     if role == "admin":
         items.append(("admin", "/admin/users", "Пользователи"))
     items.append(("", "/logout", "Выйти"))
@@ -1234,13 +1319,29 @@ onsubmit="return confirm(&#39;Удалить скан?&#39;)">
 <button type="submit">Загрузить</button></form>
 {_actions}
 </div>'''
+        # Проверка комплектности пакета: если чего-то нет — показываем список, кнопку выгрузки
+        # не даём (пакет не должен выходить дырявым и уходить на Госуслуги с отказом).
+        _missing = _package_missing(emp)
+        if _missing:
+            _pkg_block = ('<p class="muted">Пакет пока неполный. Не хватает:</p><ul>'
+                          + "".join(f"<li>{html.escape(_m)}</li>" for _m in _missing)
+                          + "</ul><p class=\"muted\">Догрузите недостающее (общие документы — на "
+                          '<a href="/common-docs">странице общих документов</a>).</p>')
+        else:
+            _pkg_block = f'''<p style="color:#1a7f37">Пакет полный ✓</p>
+<form method="post" action="/employees/{emp.id}/package">
+<button type="submit" class="btn-full">Выгрузить пакет (ZIP) для Госуслуг</button>
+</form>'''
+
         _scans_section = f'''
 <fieldset>
-<legend>Пакет для Госуслуг — сканы</legend>
-<p class="muted">Загрузите сканы для постановки на учёт: PDF или фото, каждый документ отдельным
-файлом, до 15 МБ. ЕГРН — общий документ на жильё (ВЖК), одинаковый для всех работников.
-Договор и квитанцию берите из блоков выше (кнопки «.pdf для Госуслуг»).</p>
+<legend>Пакет для Госуслуг</legend>
+<p class="muted">Персональные сканы работника: паспорт, миграционная карта, исполненная платёжка
+(подтверждение оплаты госпошлины из банка). PDF или фото, до 15 МБ. Общие документы (паспорт
+директора, основание на адрес) — на <a href="/common-docs">отдельной странице</a>.</p>
 {_rows}
+<hr>
+{_pkg_block}
 </fieldset>'''
 
     # Тексты справок у полей карточки (значок i с раскрытием). Коротко: что это и что делает.
@@ -1571,8 +1672,6 @@ value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
 <input type="text" name="payer_name" placeholder="Иванов И. И." value="{_last_payer}">
 <button type="submit" name="kind" value="registration" class="btn-full">Квитанция: постановка на учёт (500 ₽) — .docx</button>
 <button type="submit" name="kind" value="renewal" class="btn-full">Квитанция: продление пребывания (1000 ₽) — .docx</button>
-<button type="submit" name="kind" value="registration" formaction="/employees/{emp.id}/duty_receipt_pdf" class="secondary btn-full">Постановка — .pdf (для Госуслуг)</button>
-<button type="submit" name="kind" value="renewal" formaction="/employees/{emp.id}/duty_receipt_pdf" class="secondary btn-full">Продление — .pdf (для Госуслуг)</button>
 </form>
 </fieldset>
 {_scans_section}
@@ -2361,36 +2460,6 @@ def employee_duty_receipt(
     return FileResponse(path, filename=filename)
 
 
-@app.post("/employees/{employee_id}/duty_receipt_pdf")
-def employee_duty_receipt_pdf(
-    employee_id: str,
-    request: Request,
-    kind: str = Form(...),
-    payer_name: str = Form(""),
-    db: Session = Depends(get_db),
-):
-    """PDF-версия квитанции для пакета Госуслуг. docx -> PDF через LibreOffice."""
-    if not _logged_in(request):
-        return RedirectResponse("/login", status_code=303)
-    emp = db.get(Employee, employee_id)
-    if emp is None:
-        raise HTTPException(404, "Сотрудник не найден")
-    if kind not in ("registration", "renewal"):
-        raise HTTPException(400, "Неизвестный тип пошлины")
-    if (payer_name or "").strip():
-        request.session["last_payer"] = payer_name.strip()
-    try:
-        docx_path = generate_duty_receipt_docx(kind, employee=emp, payer_name=payer_name)
-        pdf_path = _docx_to_pdf(docx_path)
-    except RuntimeError as e:
-        raise HTTPException(500, f"PDF недоступен: {e}")
-    except Exception:
-        raise HTTPException(500, "Не удалось сгенерировать PDF квитанции. Проверьте логи.")
-    kind_ru = "постановка" if kind == "registration" else "продление"
-    filename = f"Квитанция_{kind_ru}_{emp.full_name.replace(' ', '_')}.pdf"
-    return FileResponse(pdf_path, filename=filename, media_type="application/pdf")
-
-
 @app.post("/employees/{employee_id}/registration_status")
 def employee_registration_status(
     employee_id: str,
@@ -2614,6 +2683,139 @@ def employee_scan_delete(
     except RuntimeError as e:
         raise HTTPException(500, str(e))
     return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+
+# --- Общие документы (страница кадровика/админа) --------------------------------------------
+@app.get("/common-docs", response_class=HTMLResponse)
+def common_docs_page(request: Request, db: Session = Depends(get_db)):
+    """Страница общих документов: паспорт директора, документ-основание на адрес подразделения.
+    Один файл на всех работников. Доступ — кадровик/админ, не прораб (паспортные данные)."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    present = _s3_list_common()
+    rows = ""
+    for dt, label in COMMON_DOC_TYPES.items():
+        has = present.get(dt, False)
+        status = '<span style="color:#1a7f37">загружен ✓</span>' if has else '<span class="muted">нет</span>'
+        actions = ""
+        if has:
+            actions = f'''<form method="post" action="/common-docs/download" style="display:inline">
+<input type="hidden" name="doc_type" value="{dt}">
+<button type="submit" class="secondary">Скачать</button></form>
+<form method="post" action="/common-docs/delete" style="display:inline"
+onsubmit="return confirm(&#39;Удалить документ?&#39;)">
+<input type="hidden" name="doc_type" value="{dt}">
+<button type="submit" class="secondary">Удалить</button></form>'''
+        rows += f'''<div style="margin:8px 0;padding:10px;border:1px solid #e6e9ee;border-radius:8px">
+<b>{label}</b> — {status}<br>
+<form method="post" action="/common-docs/upload" enctype="multipart/form-data" style="display:inline">
+<input type="hidden" name="doc_type" value="{dt}">
+<input type="file" name="file" accept="application/pdf,image/*" required>
+<button type="submit">Загрузить</button></form>
+{actions}
+</div>'''
+    body = f'''<section class="card">
+<h1>Общие документы</h1>
+<p class="muted">Документы, единые для всех работников: паспорт директора (принимающая сторона)
+и документ-основание на адрес подразделения. Входят в каждый пакет Госуслуг. PDF или фото, до 15 МБ.</p>
+{rows}
+<a class="btn secondary" href="/employees">← К сотрудникам</a>
+</section>'''
+    return _render("Общие документы", body, active="common", role=request.session.get("role", ""))
+
+
+@app.post("/common-docs/upload")
+async def common_docs_upload(request: Request, doc_type: str = Form(...),
+                             file: UploadFile = File(...), db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    if doc_type not in COMMON_DOC_TYPES:
+        raise HTTPException(400, "Неизвестный тип документа.")
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "Пустой файл.")
+    if len(data) > 15 * 1024 * 1024:
+        raise HTTPException(400, "Файл больше 15 МБ.")
+    try:
+        _s3_upload_common(doc_type, data, file.content_type or "application/octet-stream")
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+    return RedirectResponse("/common-docs", status_code=303)
+
+
+@app.post("/common-docs/download")
+def common_docs_download(request: Request, doc_type: str = Form(...), db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    if doc_type not in COMMON_DOC_TYPES:
+        raise HTTPException(400, "Неизвестный тип документа.")
+    try:
+        data, ct = _s3_download_common(doc_type)
+    except RuntimeError as e:
+        raise HTTPException(404, str(e))
+    fn = f"{COMMON_DOC_TYPES[doc_type].split('(')[0].strip().replace(' ', '_')}.{_ext_for(ct)}"
+    return Response(content=data, media_type=ct,
+                    headers={"Content-Disposition": f'attachment; filename="{fn}"'})
+
+
+@app.post("/common-docs/delete")
+def common_docs_delete(request: Request, doc_type: str = Form(...), db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    if doc_type not in COMMON_DOC_TYPES:
+        raise HTTPException(400, "Неизвестный тип документа.")
+    try:
+        _s3_delete_common(doc_type)
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+    return RedirectResponse("/common-docs", status_code=303)
+
+
+@app.post("/employees/{employee_id}/package")
+def employee_package(employee_id: str, request: Request, db: Session = Depends(get_db)):
+    """Выгрузка полного пакета Госуслуг одним ZIP: персональные сканы (паспорт, миграционная
+    карта, платёжка) + общие (паспорт директора, основание на адрес) + договор PDF.
+    Если чего-то не хватает — отказ с перечнем (пакет не должен выходить дырявым)."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+    missing = _package_missing(emp)
+    if missing:
+        raise HTTPException(400, "Пакет неполный, не хватает: " + "; ".join(missing))
+
+    import io, zipfile
+    buf = io.BytesIO()
+    safe_name = (emp.full_name or "работник").replace(" ", "_")
+    try:
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            # персональные сканы
+            for st, label in SCAN_TYPES.items():
+                data, ct = _s3_download(st, employee_id)
+                z.writestr(f"{label.split('(')[0].strip()}.{_ext_for(ct)}", data)
+            # общие документы
+            for dt, label in COMMON_DOC_TYPES.items():
+                data, ct = _s3_download_common(dt)
+                z.writestr(f"{label.split('(')[0].strip()}.{_ext_for(ct)}", data)
+            # договор в PDF (генерируется из docx)
+            docx_path = generate_labor_contract_docx(emp, position="Монтажник", salary="30000",
+                                                     contract_date=emp.contract_date)
+            pdf_path = _docx_to_pdf(docx_path)
+            with open(pdf_path, "rb") as f:
+                z.writestr("Трудовой_договор.pdf", f.read())
+    except RuntimeError as e:
+        raise HTTPException(500, f"Не удалось собрать пакет: {e}")
+    except Exception:
+        raise HTTPException(500, "Ошибка сборки пакета. Проверьте логи.")
+    buf.seek(0)
+    return Response(content=buf.read(), media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="Пакет_Госуслуги_{safe_name}.zip"'})
 
 
 @app.post("/employees/{employee_id}/termination/cancel")
