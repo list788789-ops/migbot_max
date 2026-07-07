@@ -684,9 +684,14 @@ def generate_duty_receipt_docx(kind: str, employee=None, payer_name: str = "", o
     def _build_part(part_title: str) -> None:
         head = doc.add_paragraph()
         head.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        # Заголовок части держится со следующим содержимым — часть не начинается в самом низу листа
+        # с переносом таблицы/QR на новую страницу.
+        head.paragraph_format.keep_with_next = True
+        head.paragraph_format.space_before = _Pt(2)
+        head.paragraph_format.space_after = _Pt(1)
         r = head.add_run(part_title)
         r.bold = True
-        r.font.size = _Pt(14)
+        r.font.size = _Pt(13)
         sub = doc.add_paragraph()
         sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
         sr = sub.add_run("Форма № ПД-4сб (налог)")
@@ -726,16 +731,22 @@ def generate_duty_receipt_docx(kind: str, employee=None, payer_name: str = "", o
         foot = doc.add_table(rows=1, cols=2)
         foot.autofit = True
         if qr_ok:
-            foot.cell(0, 0).paragraphs[0].add_run().add_picture(qr_path, width=_In(1.4))
+            foot.cell(0, 0).paragraphs[0].add_run().add_picture(qr_path, width=_In(1.1))
         else:
             foot.cell(0, 0).paragraphs[0].add_run("(QR недоступен)").font.size = _Pt(7)
         rc = foot.cell(0, 1)
         p1 = rc.paragraphs[0]; p1.add_run("Плательщик (подпись) _______________"); _tiny(p1)
+        p1.paragraph_format.keep_together = True
         p2 = rc.add_paragraph(); p2.add_run("Дата _______________"); _tiny(p2)
+        p2.paragraph_format.keep_together = True
         p3 = rc.add_paragraph(); p3.add_run("Отсканируйте QR в банковском приложении для оплаты"); _tiny(p3, 7)
 
     _build_part("ИЗВЕЩЕНИЕ")
-    doc.add_paragraph("- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -")
+    _sep = doc.add_paragraph("- - - - - - - - - - - - - - - - - - - - - - - - - - - - - -")
+    _sep.paragraph_format.space_before = _Pt(2)
+    _sep.paragraph_format.space_after = _Pt(2)
+    for _r in _sep.runs:
+        _r.font.size = _Pt(8)
     _build_part("КВИТАНЦИЯ")
 
     filename = f"duty_receipt_{kind}.docx"
