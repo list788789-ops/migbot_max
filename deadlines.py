@@ -66,12 +66,14 @@ DEADLINE_RULES: dict[Category, list[dict]] = {
         },
         {
             # Смена места пребывания. НЕ льгота ЕАЭС (она только на первичный въезд).
-            # Вахта (Белокаменка) = 1 рабочий день с прибытия. Born-amber: жёлтая с создания.
+            # Работники живут в ВЖК заказчика (Новатэк), НЕ по адресу работодателя ТСМ ->
+            # вахтовый 1-дневный срок (ч.3.1 + п.2 ч.3 ст.20, ч.2 ст.21 №109-ФЗ) НЕ применяется,
+            # действует ОБЩИЙ срок 7 рабочих дней (ч.3 ст.20). Принимающая сторона — владелец ВЖК.
             "type": ObligationType.REGISTRATION,
             "trigger_field": "address_since",
-            "deadline_value": 1,
+            "deadline_value": 7,
             "deadline_unit": DeadlineUnit.WORKING_DAY,
-            "lead_days": 1,
+            "lead_days": 7,
         },
         {
             "type": ObligationType.CONTRACT_NOTICE,
