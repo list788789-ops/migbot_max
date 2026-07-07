@@ -193,6 +193,14 @@ class Employee(Base):
     # пропускается в create_obligations_for_employee, как и любое другое пустое trigger_field.
     address_since: Mapped[date | None] = mapped_column(Date, nullable=True)
 
+    # --- дата окончания срока регистрации по адресу (2026-07) ---
+    # На Госуслугах в уведомлении о прибытии печатается НЕ дата начала, а «срок пребывания до»
+    # (дата окончания). Это поле хранит её — то, что реально стоит в отрывной части уведомления.
+    # Справочное: НЕ триггер обязательства (постановку считает address_since), а фактическая
+    # дата из документа для сверки и напоминания о продлении. Требует ALTER TABLE на проде:
+    #   ALTER TABLE employees ADD COLUMN registration_valid_until DATE;
+    registration_valid_until: Mapped[date | None] = mapped_column(Date, nullable=True)
+
     # --- дата прохождения дактилоскопии (2026-07) ---
     # NULL = не пройдена: обязанность DACTYLOSCOPY активна и горит от entry_date+30.
     # Заполнено = пройдена: обработчик в webforms.py переводит текущую DACTYLOSCOPY в DONE.
