@@ -1311,13 +1311,13 @@ def employee_card(employee_id: str, request: Request, db: Session = Depends(get_
 onsubmit="return confirm(&#39;Удалить скан?&#39;)">
 <input type="hidden" name="scan_type" value="{_st}">
 <button type="submit" class="secondary">Удалить</button></form>'''
-            _rows += f'''<div style="margin:8px 0;padding:8px;border:1px solid #e6e9ee;border-radius:8px">
-<b>{_label}</b> — {_status}<br>
-<form method="post" action="/employees/{emp.id}/scan/upload" enctype="multipart/form-data" style="display:inline">
+            _rows += f'''<div style="margin:12px 0;padding:12px;border:1px solid #e6e9ee;border-radius:8px">
+<b>{_label}</b> — {_status}
+<form method="post" action="/employees/{emp.id}/scan/upload" enctype="multipart/form-data" style="margin-top:8px">
 <input type="hidden" name="scan_type" value="{_st}">
-<input type="file" name="file" accept="application/pdf,image/*" required>
-<button type="submit">Загрузить</button></form>
-{_actions}
+<input type="file" name="file" accept="application/pdf,image/*" required style="display:block;width:100%;margin:8px 0;padding:10px;border:1px solid #d9dde3;border-radius:8px;background:#fff;font-size:16px">
+<button type="submit" class="btn-full">Загрузить</button></form>
+<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">{_actions}</div>
 </div>'''
         # Проверка комплектности пакета: если чего-то нет — показываем список, кнопку выгрузки
         # не даём (пакет не должен выходить дырявым и уходить на Госуслуги с отказом).
@@ -2707,13 +2707,13 @@ def common_docs_page(request: Request, db: Session = Depends(get_db)):
 onsubmit="return confirm(&#39;Удалить документ?&#39;)">
 <input type="hidden" name="doc_type" value="{dt}">
 <button type="submit" class="secondary">Удалить</button></form>'''
-        rows += f'''<div style="margin:8px 0;padding:10px;border:1px solid #e6e9ee;border-radius:8px">
-<b>{label}</b> — {status}<br>
-<form method="post" action="/common-docs/upload" enctype="multipart/form-data" style="display:inline">
+        rows += f'''<div style="margin:12px 0;padding:12px;border:1px solid #e6e9ee;border-radius:8px">
+<b>{label}</b> — {status}
+<form method="post" action="/common-docs/upload" enctype="multipart/form-data" style="margin-top:8px">
 <input type="hidden" name="doc_type" value="{dt}">
-<input type="file" name="file" accept="application/pdf,image/*" required>
-<button type="submit">Загрузить</button></form>
-{actions}
+<input type="file" name="file" accept="application/pdf,image/*" required style="display:block;width:100%;margin:8px 0;padding:10px;border:1px solid #d9dde3;border-radius:8px;background:#fff;font-size:16px">
+<button type="submit" class="btn-full">Загрузить</button></form>
+<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">{actions}</div>
 </div>'''
     body = f'''<section class="card">
 <h1>Общие документы</h1>
