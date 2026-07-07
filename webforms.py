@@ -50,7 +50,7 @@ import logging
 import os
 from datetime import date, datetime, timedelta, timezone
 
-from fastapi import Depends, FastAPI, Form, HTTPException, Request
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -148,6 +148,107 @@ CONSENT_TEXT_VERSION = os.environ.get("CONSENT_TEXT_VERSION", "v1")
 
 app = FastAPI()
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, session_cookie="migbot_session")
+
+
+# --- Хранилище сканов (S3-совместимое, Cloud.ru Object Storage) --------------
+# Сканы для пакета Госуслуг (паспорт, миграционная карта, выписка ЕГРН на ВЖК) хранятся в
+# приватном бакете Cloud.ru. Ключи — только в переменных окружения Railway, не в коде.
+# Доступ к сканам: кадровик и админ (не прораб) — проверяется в роутах.
+# Если boto3 не установлен или ключи не заданы — функции бросают понятную ошибку, старт не
+# роняется (аналогично graceful-обработке holidays/qrcode).
+S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "")        # напр. https://s3.cloud.ru (без имени бакета!)
+S3_BUCKET = os.environ.get("S3_BUCKET", "")            # напр. migbot51-scan
+S3_REGION = os.environ.get("S3_REGION", "ru-central-1")
+S3_ACCESS_KEY = os.environ.get("S3_ACCESS_KEY", "")
+S3_SECRET_KEY = os.environ.get("S3_SECRET_KEY", "")
+
+# Разрешённые типы сканов — фиксированный список, чтобы не плодить произвольные ключи.
+# key_prefix: персональные под employee_<id>/, общие (ЕГРН на ВЖК) под common/.
+SCAN_TYPES = {
+    "passport": "Паспорт (все страницы)",
+    "migration_card": "Миграционная карта",
+    "egrn": "Выписка ЕГРН на жильё (ВЖК)",
+}
+# Какие типы общие (одна на всех), какие персональные.
+SCAN_COMMON_TYPES = {"egrn"}
+
+
+def _s3_client():
+    """Возвращает boto3 S3-клиент для Cloud.ru или бросает RuntimeError с понятной причиной.
+    Ключи читаются из окружения Railway. boto3 импортируется лениво — его отсутствие не роняет
+    старт приложения, а даёт ошибку только при реальной попытке работы со сканами."""
+    if not (S3_ENDPOINT and S3_BUCKET and S3_ACCESS_KEY and S3_SECRET_KEY):
+        raise RuntimeError(
+            "Хранилище сканов не настроено: заданы не все переменные S3_ENDPOINT/S3_BUCKET/"
+            "S3_ACCESS_KEY/S3_SECRET_KEY. Проверьте переменные окружения на Railway."
+        )
+    try:
+        import boto3
+    except ImportError:
+        raise RuntimeError("Библиотека boto3 не установлена (добавьте boto3 в requirements).")
+    return boto3.client(
+        "s3",
+        endpoint_url=S3_ENDPOINT,
+        region_name=S3_REGION,
+        aws_access_key_id=S3_ACCESS_KEY,
+        aws_secret_access_key=S3_SECRET_KEY,
+    )
+
+
+def _scan_key(scan_type: str, employee_id: str | None) -> str:
+    """Ключ объекта в бакете. Общие типы (ЕГРН) — под common/, персональные — под employee_<id>/."""
+    if scan_type in SCAN_COMMON_TYPES:
+        return f"common/{scan_type}"
+    return f"employee_{employee_id}/{scan_type}"
+
+
+def _s3_upload(scan_type: str, employee_id: str | None, data: bytes, content_type: str) -> None:
+    """Загружает скан в бакет. Бросает RuntimeError при проблемах (не настроено/нет доступа)."""
+    client = _s3_client()
+    key = _scan_key(scan_type, employee_id)
+    try:
+        client.put_object(Bucket=S3_BUCKET, Key=key, Body=data, ContentType=content_type)
+    except Exception as e:
+        raise RuntimeError(f"Не удалось загрузить скан в хранилище: {str(e)[:200]}")
+
+
+def _s3_list_for_employee(employee_id: str) -> dict:
+    """Возвращает {scan_type: True} для сканов, которые есть в бакете по этому работнику
+    (персональные + общие). Если хранилище не настроено — пустой словарь, без падения."""
+    present = {}
+    try:
+        client = _s3_client()
+    except RuntimeError:
+        return present
+    for scan_type in SCAN_TYPES:
+        key = _scan_key(scan_type, employee_id)
+        try:
+            client.head_object(Bucket=S3_BUCKET, Key=key)
+            present[scan_type] = True
+        except Exception:
+            pass
+    return present
+
+
+def _s3_download(scan_type: str, employee_id: str | None):
+    """Возвращает (bytes, content_type) скана или бросает RuntimeError, если нет/недоступен."""
+    client = _s3_client()
+    key = _scan_key(scan_type, employee_id)
+    try:
+        obj = client.get_object(Bucket=S3_BUCKET, Key=key)
+        return obj["Body"].read(), obj.get("ContentType", "application/octet-stream")
+    except Exception as e:
+        raise RuntimeError(f"Скан не найден или недоступен: {str(e)[:200]}")
+
+
+def _s3_delete(scan_type: str, employee_id: str | None) -> None:
+    client = _s3_client()
+    key = _scan_key(scan_type, employee_id)
+    try:
+        client.delete_object(Bucket=S3_BUCKET, Key=key)
+    except Exception as e:
+        raise RuntimeError(f"Не удалось удалить скан: {str(e)[:200]}")
+
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -1099,6 +1200,41 @@ def employee_card(employee_id: str, request: Request, db: Session = Depends(get_
     # Плательщик госпошлины, запомненный на сессию (prefill поля). Экранируем — уходит в HTML-атрибут.
     _last_payer = html.escape(request.session.get("last_payer", ""), quote=True)
 
+    # Секция сканов для пакета Госуслуг — только для пишущих (кадровик/админ), паспортные
+    # данные прорабу недоступны. Показывает, какие сканы загружены, даёт загрузить/скачать/удалить.
+    _scans_section = ""
+    if can_write:
+        _present = _s3_list_for_employee(emp.id)
+        _rows = ""
+        for _st, _label in SCAN_TYPES.items():
+            _has = _present.get(_st, False)
+            _status = '<span style="color:#1a7f37">загружен ✓</span>' if _has else '<span class="muted">нет</span>'
+            _actions = ""
+            if _has:
+                _actions = f'''<form method="post" action="/employees/{emp.id}/scan/download" style="display:inline">
+<input type="hidden" name="scan_type" value="{_st}">
+<button type="submit" class="secondary">Скачать</button></form>
+<form method="post" action="/employees/{emp.id}/scan/delete" style="display:inline"
+onsubmit="return confirm(&#39;Удалить скан?&#39;)">
+<input type="hidden" name="scan_type" value="{_st}">
+<button type="submit" class="secondary">Удалить</button></form>'''
+            _rows += f'''<div style="margin:8px 0;padding:8px;border:1px solid #e6e9ee;border-radius:8px">
+<b>{_label}</b> — {_status}<br>
+<form method="post" action="/employees/{emp.id}/scan/upload" enctype="multipart/form-data" style="display:inline">
+<input type="hidden" name="scan_type" value="{_st}">
+<input type="file" name="file" accept="application/pdf,image/*" required>
+<button type="submit">Загрузить</button></form>
+{_actions}
+</div>'''
+        _scans_section = f'''
+<fieldset>
+<legend>Пакет для Госуслуг — сканы</legend>
+<p class="muted">Загрузите сканы для постановки на учёт: PDF или фото, каждый документ отдельным
+файлом, до 15 МБ. ЕГРН — общий документ на жильё (ВЖК), одинаковый для всех работников.
+Договор и квитанцию берите из блоков выше (кнопки «.pdf для Госуслуг»).</p>
+{_rows}
+</fieldset>'''
+
     # Роль: прораб — только чтение и скачивание, формы записи ему не показываем (сервер их
     # тоже режет 403, но кнопки-впустую путают). can_write = не прораб.
     _cu = _current_user(request, db)
@@ -1431,6 +1567,7 @@ value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
 <button type="submit" name="kind" value="renewal" formaction="/employees/{emp.id}/duty_receipt_pdf" class="secondary btn-full">Продление — .pdf (для Госуслуг)</button>
 </form>
 </fieldset>
+{_scans_section}
 </div>
 </div>
 <a class="btn secondary" href="/employees">← Ко всем сотрудникам</a>
@@ -2363,6 +2500,83 @@ def employee_departure_notice(employee_id: str, request: Request, db: Session = 
         raise HTTPException(500, "Не удалось сгенерировать уведомление об убытии.")
     fn = f"Уведомление_убытие_{emp.full_name.replace(' ', '_')}.docx"
     return FileResponse(path, filename=fn)
+
+
+@app.post("/employees/{employee_id}/scan/upload")
+async def employee_scan_upload(
+    employee_id: str,
+    request: Request,
+    scan_type: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """Загрузка скана (паспорт/миграционная карта/ЕГРН) в хранилище. Доступ — кадровик/админ.
+    ЕГРН — общий файл (один на всех), паспорт/карта — персональные под работником."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    if scan_type not in SCAN_TYPES:
+        raise HTTPException(400, "Неизвестный тип скана.")
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "Пустой файл.")
+    if len(data) > 15 * 1024 * 1024:
+        raise HTTPException(400, "Файл больше 15 МБ — сожмите или разбейте.")
+    ct = file.content_type or "application/octet-stream"
+    eid = None if scan_type in SCAN_COMMON_TYPES else employee_id
+    try:
+        _s3_upload(scan_type, eid, data, ct)
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+
+@app.post("/employees/{employee_id}/scan/download")
+def employee_scan_download(
+    employee_id: str,
+    request: Request,
+    scan_type: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    """Скачивание скана. Доступ — кадровик/админ (паспортные данные прорабу недоступны)."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    if scan_type not in SCAN_TYPES:
+        raise HTTPException(400, "Неизвестный тип скана.")
+    eid = None if scan_type in SCAN_COMMON_TYPES else employee_id
+    try:
+        data, ct = _s3_download(scan_type, eid)
+    except RuntimeError as e:
+        raise HTTPException(404, str(e))
+    ext = "pdf" if "pdf" in ct else ("jpg" if "jpeg" in ct or "jpg" in ct else "bin")
+    fn = f"{SCAN_TYPES[scan_type].split('(')[0].strip().replace(' ', '_')}.{ext}"
+    return Response(content=data, media_type=ct,
+                    headers={"Content-Disposition": f'attachment; filename="{fn}"'})
+
+
+@app.post("/employees/{employee_id}/scan/delete")
+def employee_scan_delete(
+    employee_id: str,
+    request: Request,
+    scan_type: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    """Удаление скана. Доступ — кадровик/админ."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    if scan_type not in SCAN_TYPES:
+        raise HTTPException(400, "Неизвестный тип скана.")
+    eid = None if scan_type in SCAN_COMMON_TYPES else employee_id
+    try:
+        _s3_delete(scan_type, eid)
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
 
 
 @app.post("/employees/{employee_id}/termination/cancel")
