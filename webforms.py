@@ -1293,6 +1293,49 @@ def employee_card(employee_id: str, request: Request, db: Session = Depends(get_
     _cu = _current_user(request, db)
     can_write = bool(_cu and _cu.role != UserRole.PRORAB)
 
+    # Блок обязательств и сроков в карточке: показывает активные (с кнопкой «Отметить поданным»
+    # для тех, что подаются вовне — ЕФС-1, уведомление МВД, регистрация) и выполненные
+    # (с датой/автором отметки и кнопкой отмены). Только для пишущих (кадровик/админ).
+    _obligations_section = ""
+    if can_write:
+        _obs = sorted(
+            [o for o in emp.obligations if o.is_current],
+            key=lambda o: (o.status == ObligationStatus.DONE, o.deadline_date),
+        )
+        if _obs:
+            _ob_rows = ""
+            for _o in _obs:
+                _olabel = OBLIGATION_LABELS.get(_o.type, _o.type.value)
+                _dl = _o.deadline_date.strftime("%d.%m.%Y")
+                if _o.status == ObligationStatus.DONE:
+                    _who = html.escape(_o.done_by or "—")
+                    _when = _o.done_date.strftime("%d.%m.%Y") if _o.done_date else "—"
+                    _ob_rows += f'''<div style="margin:8px 0;padding:10px;border:1px solid #e6e9ee;border-radius:8px;background:#f6faf7">
+<b>{_olabel}</b> — <span style="color:#1a7f37">выполнено ✓</span><br>
+<span class="muted">отмечено {_when}, {_who}. Срок был до {_dl}.</span>
+<form method="post" action="/employees/{emp.id}/obligation/reopen" style="margin-top:6px"
+onsubmit="return confirm(&#39;Вернуть обязательство в работу?&#39;)">
+<input type="hidden" name="obligation_id" value="{_o.id}">
+<button type="submit" class="secondary">Отменить отметку</button></form>
+</div>'''
+                else:
+                    _overdue = _o.status == ObligationStatus.OVERDUE
+                    _mark = "🔴 просрочено" if _overdue else "🟡 в работе"
+                    _ob_rows += f'''<div style="margin:8px 0;padding:10px;border:1px solid #e6e9ee;border-radius:8px">
+<b>{_olabel}</b> — {_mark}, срок до {_dl}
+<form method="post" action="/employees/{emp.id}/obligation/mark_done" style="margin-top:6px">
+<input type="hidden" name="obligation_id" value="{_o.id}">
+<button type="submit" class="btn-full">Отметить поданным</button></form>
+</div>'''
+            _obligations_section = f'''
+<fieldset>
+<legend>Обязательства и сроки</legend>
+<p class="muted">Отметьте «поданным» то, что уже подали в ведомство (ЕФС-1 в СФР, уведомление
+МВД, постановка на учёт). Отметка фиксирует дату и кто отметил. Обязательства с собственным
+закрытием (медосмотр — результатом, дактилоскопия — датой) закрываются в своих блоках.</p>
+{_ob_rows}
+</fieldset>'''
+
     # Секция сканов для пакета Госуслуг — только для пишущих (кадровик/админ), паспортные
     # данные прорабу недоступны. Показывает, какие сканы загружены, даёт загрузить/скачать/удалить.
     _scans_section = ""
@@ -1674,6 +1717,7 @@ value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
 <button type="submit" name="kind" value="renewal" class="btn-full">Квитанция: продление пребывания (1000 ₽) — .docx</button>
 </form>
 </fieldset>
+{_obligations_section}
 {_scans_section}
 </div>
 </div>
@@ -2606,6 +2650,54 @@ def employee_departure_notice(employee_id: str, request: Request, db: Session = 
         raise HTTPException(500, "Не удалось сгенерировать уведомление об убытии.")
     fn = f"Уведомление_убытие_{emp.full_name.replace(' ', '_')}.docx"
     return FileResponse(path, filename=fn)
+
+
+@app.post("/employees/{employee_id}/obligation/mark_done")
+def employee_obligation_mark_done(
+    employee_id: str,
+    request: Request,
+    obligation_id: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    """Ручная отметка обязательства как поданного (ЕФС-1, уведомление МВД, регистрация и др.,
+    что подаётся вовне и не имеет своего закрывателя). Пишет DONE + дату + автора. Кадровик/админ."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    ob = db.get(Obligation, obligation_id)
+    if ob is None or ob.employee_id != employee_id:
+        raise HTTPException(404, "Обязательство не найдено")
+    if ob.status == ObligationStatus.DONE:
+        return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+    ob.status = ObligationStatus.DONE
+    ob.done_date = date.today()
+    ob.done_by = _actor_name(request, db)
+    db.add(ob)
+    db.commit()
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+
+@app.post("/employees/{employee_id}/obligation/reopen")
+def employee_obligation_reopen(
+    employee_id: str,
+    request: Request,
+    obligation_id: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    """Отмена ошибочной отметки: возвращает обязательство в работу. Пересчёт статуса
+    (PENDING/OVERDUE) сделает cron при следующем прогоне; ставим PENDING, снимаем дату/автора."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    ob = db.get(Obligation, obligation_id)
+    if ob is None or ob.employee_id != employee_id:
+        raise HTTPException(404, "Обязательство не найдено")
+    ob.status = ObligationStatus.PENDING
+    ob.done_date = None
+    ob.done_by = None
+    db.add(ob)
+    db.commit()
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
 
 
 @app.post("/employees/{employee_id}/scan/upload")
