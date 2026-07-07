@@ -165,12 +165,14 @@ S3_SECRET_KEY = os.environ.get("S3_SECRET_KEY", "")
 # Разрешённые типы сканов — фиксированный список, чтобы не плодить произвольные ключи.
 # key_prefix: персональные под employee_<id>/, общие (ЕГРН на ВЖК) под common/.
 SCAN_TYPES = {
-    "passport": "Паспорт (все страницы)",
+    "passport": "Паспорт работника (все страницы)",
     "migration_card": "Миграционная карта",
-    "egrn": "Выписка ЕГРН на жильё (ВЖК)",
+    "director_passport": "Паспорт директора (принимающая сторона)",
+    "egrn": "Документ-основание на адрес (уточняется)",
 }
-# Какие типы общие (одна на всех), какие персональные.
-SCAN_COMMON_TYPES = {"egrn"}
+# Какие типы общие (один файл на всех), какие персональные (под каждым работником).
+# Паспорт директора и документ-основание — общие: директор и адрес одни для всех.
+SCAN_COMMON_TYPES = {"egrn", "director_passport"}
 
 
 def _s3_client():
@@ -1478,6 +1480,11 @@ value="{emp.dactyloscopy_date.isoformat() if emp.dactyloscopy_date else ''}">
 <input type="text" name="address" data-orig="{emp.address or ''}" value="{emp.address or ''}">
 <label>Дата, с которой действует этот адрес</label>
 <input type="date" name="address_since" max="{today_s}" value="{emp.address_since.isoformat() if emp.address_since else today_s}">
+<label>Срок регистрации до (из уведомления Госуслуг)</label>
+<input type="date" name="registration_valid_until" value="{emp.registration_valid_until.isoformat() if emp.registration_valid_until else ''}">
+<p class="muted">Дата окончания срока пребывания — та, что стоит в отрывной части уведомления
+(«срок пребывания до»). На Госуслугах даты начала нет, печатается только эта. Справочно, для
+напоминания о продлении.</p>
 {help_address}
 </fieldset>
 <fieldset>
@@ -1631,6 +1638,7 @@ def employee_address_submit(
     request: Request,
     address: str = Form(...),
     address_since: date = Form(...),
+    registration_valid_until: str = Form(""),
     db: Session = Depends(get_db),
 ):
     if not _logged_in(request):
@@ -1641,21 +1649,49 @@ def employee_address_submit(
     if emp is None:
         raise HTTPException(404, "Сотрудник не найден")
 
+    # Дата окончания регистрации — справочная, из уведомления Госуслуг. Пустая строка -> None.
+    if registration_valid_until.strip():
+        try:
+            emp.registration_valid_until = date.fromisoformat(registration_valid_until.strip())
+        except ValueError:
+            raise HTTPException(400, "Некорректная дата окончания регистрации.")
+    else:
+        emp.registration_valid_until = None
+
     previous_address = (emp.address or "").strip()
     new_address = address.strip()
-    is_real_change = previous_address != "" and previous_address != new_address
+    previous_since = emp.address_since
+    first_address_ever = previous_address == ""
 
+    # Дата теперь сохраняется ВСЕГДА (вариант Б), а не только при смене адреса — раньше правка
+    # только даты (адрес тот же) игнорировалась, дата "не сохранялась". Исключение: самый первый
+    # ввод адреса не создаёт обязательство регистрации (это не переезд), но дату всё равно пишем.
     emp.address = new_address
-    if is_real_change:
-        emp.address_since = address_since
-    # Если previous_address был пуст — это первый ввод адреса, address_since НЕ трогаем
-    # (остаётся тем, что было — обычно None), чтобы не создать ложное обязательство
-    # по несуществующей смене места пребывания.
+    emp.address_since = address_since
+
+    # Пересоздать обязательство регистрации нужно, если это НЕ первый ввод адреса И реально
+    # изменилось то, от чего считается дедлайн: адрес или дата начала пребывания.
+    address_changed = (not first_address_ever) and previous_address != new_address
+    since_changed = (not first_address_ever) and previous_since != address_since
+    need_reobligate = address_changed or since_changed
 
     db.commit()
     db.refresh(emp)
 
-    if is_real_change and emp.consent_status == ConsentStatus.CONFIRMED:
+    if need_reobligate and emp.consent_status == ConsentStatus.CONFIRMED:
+        # Удаляем незакрытое обязательство регистрации-ПЕРЕЕЗДА по СТАРОЙ дате и создаём по новой,
+        # чтобы дедлайн соответствовал текущей address_since (вариант Б). Различаем от первичной
+        # регистрации (та привязана к entry_date) по trigger_date == старая address_since:
+        # сносим только обязательство, чей триггер совпадал с прежним address_since.
+        from models import Obligation, ObligationStatus
+        if previous_since is not None:
+            db.query(Obligation).filter(
+                Obligation.employee_id == emp.id,
+                Obligation.type == ObligationType.REGISTRATION,
+                Obligation.trigger_date == previous_since,
+                Obligation.status != ObligationStatus.DONE,
+            ).delete(synchronize_session=False)
+            db.commit()
         create_obligations_for_employee(db, emp)
 
     return RedirectResponse(f"/employees/{employee_id}", status_code=303)
