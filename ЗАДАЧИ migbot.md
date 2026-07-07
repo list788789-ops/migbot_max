@@ -6,6 +6,18 @@
 ---
 
 ## В работе сейчас
+- PDF для Госуслуг (2026-07, ЧАСТИЧНО): договор и квитанция отдаются в PDF через конвертацию
+  docx->pdf (LibreOffice, soffice --headless). Хелпер _docx_to_pdf в webforms, роуты
+  /labor_contract/download_pdf и /duty_receipt_pdf, PDF-кнопки в карточке. ОДИН источник
+  (docx), PDF всегда совпадает — договор НЕ дублируется в reportlab (решение после спора:
+  LibreOffice снимает дублирование). ДЕПЛОЙ: нужен nixpacks.toml с libreoffice в nixPkgs
+  (файл создан; если в репо уже был nixpacks.toml — добавить 'libreoffice', не затирать).
+  Railway Hobby: 8 ГБ RAM/сервис — LibreOffice влезает, OOM не грозит; soffice запускается
+  разово на секунды. requirements без изменений (LibreOffice — системный, не pip).
+  ОСТАЛОСЬ (ждёт S3): раздел «Пакет для Госуслуг» с чек-листом + загрузка сканов паспорта/
+  миграционной карты/ЕГРН в Cloud.ru S3 (15 ГБ free tier, один бакет). Доступ к сканам —
+  кадровик/админ, НЕ прораб. Ключи S3 -> env Railway (S3_ACCESS_KEY/SECRET_KEY/BUCKET/ENDPOINT),
+  boto3 в requirements. 152-ФЗ: приватный бакет, хранение в РФ, доступ по ролям.
 - Увольнение/снятие с учёта: ГОТОВО (все 5 файлов). document_templates: 2 генератора
   (termination_notice ф.№8/536 + departure_notice убытие), реквизиты ТСМ, ОКВЭД/ОГРН прочерком.
   webforms: секция увольнения в блоке договора (дата+основание, валидация не раньше договора,
