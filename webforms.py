@@ -1233,6 +1233,11 @@ onsubmit="return confirm(&#39;Отменить оформление увольн
 <input type="hidden" name="salary" value="30000">
 <button type="submit" class="btn-full">Скачать .docx</button>
 </form>
+<form method="post" action="/employees/{emp.id}/labor_contract/download_pdf">
+<input type="hidden" name="position" value="Монтажник">
+<input type="hidden" name="salary" value="30000">
+<button type="submit" class="secondary btn-full">Скачать .pdf (для Госуслуг)</button>
+</form>
 {_cancel}
 {_termination}'''
         else:
@@ -1251,7 +1256,7 @@ onsubmit="return confirm(&#39;Отменить оформление увольн
 <input type="text" name="salary" value="30000">
 {help_salary}
 <label>Дата договора</label>
-<input type="date" name="contract_date" max="{today_s}" value="{today_s}">
+<input type="date" name="contract_date" max="{today_s}" value="{emp.contract_date.isoformat() if emp.contract_date else today_s}">
 <button type="submit" formaction="/employees/{emp.id}/labor_contract/preview" class="secondary btn-full">Предпросмотр</button>
 <button type="submit" onsubmit="return true" class="btn-full">Заключить трудовой договор</button>
 </form>
@@ -1326,7 +1331,7 @@ value="{emp.dactyloscopy_date.isoformat() if emp.dactyloscopy_date else ''}">
 <label>Адрес</label>
 <input type="text" name="address" data-orig="{emp.address or ''}" value="{emp.address or ''}">
 <label>Дата, с которой действует этот адрес</label>
-<input type="date" name="address_since" max="{today_s}" value="{today_s}">
+<input type="date" name="address_since" max="{today_s}" value="{emp.address_since.isoformat() if emp.address_since else today_s}">
 {help_address}
 </fieldset>
 <fieldset>
@@ -1411,8 +1416,10 @@ value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
 <form method="post" action="/employees/{emp.id}/duty_receipt">
 <label>Ф.И.О. плательщика (инициалы)</label>
 <input type="text" name="payer_name" placeholder="Иванов И. И." value="{_last_payer}">
-<button type="submit" name="kind" value="registration" class="btn-full">Квитанция: постановка на учёт (500 ₽)</button>
-<button type="submit" name="kind" value="renewal" class="btn-full">Квитанция: продление пребывания (1000 ₽)</button>
+<button type="submit" name="kind" value="registration" class="btn-full">Квитанция: постановка на учёт (500 ₽) — .docx</button>
+<button type="submit" name="kind" value="renewal" class="btn-full">Квитанция: продление пребывания (1000 ₽) — .docx</button>
+<button type="submit" name="kind" value="registration" formaction="/employees/{emp.id}/duty_receipt_pdf" class="secondary btn-full">Постановка — .pdf (для Госуслуг)</button>
+<button type="submit" name="kind" value="renewal" formaction="/employees/{emp.id}/duty_receipt_pdf" class="secondary btn-full">Продление — .pdf (для Госуслуг)</button>
 </form>
 </fieldset>
 </div>
@@ -2031,6 +2038,30 @@ def employee_labor_contract_preview(
         emp, position, salary, contract_date.strftime("%d.%m.%Y"), tab))
 
 
+def _docx_to_pdf(docx_path: str) -> str:
+    """Конвертирует docx в pdf через LibreOffice (soffice --headless). Возвращает путь к pdf.
+    Требует libreoffice в контейнере (nixpacks.toml). Для пакета Госуслуг: договор и квитанция
+    отдаются в PDF, но генерируются из одного источника-docx — расхождения версий невозможны.
+    Бросает RuntimeError, если конвертация не удалась (напр. soffice отсутствует)."""
+    import subprocess
+    out_dir = os.path.dirname(docx_path)
+    try:
+        subprocess.run(
+            ["soffice", "--headless", "--convert-to", "pdf", "--outdir", out_dir, docx_path],
+            check=True, capture_output=True, timeout=60,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("LibreOffice (soffice) не установлен в контейнере — добавьте в nixpacks.toml")
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Конвертация docx->pdf не удалась: {e.stderr.decode(errors='ignore')[:200]}")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Конвертация docx->pdf превысила таймаут")
+    pdf_path = os.path.splitext(docx_path)[0] + ".pdf"
+    if not os.path.exists(pdf_path):
+        raise RuntimeError("PDF не создан после конвертации")
+    return pdf_path
+
+
 @app.post("/employees/{employee_id}/labor_contract/download")
 def employee_labor_contract_download(
     employee_id: str,
@@ -2055,6 +2086,35 @@ def employee_labor_contract_download(
         raise HTTPException(500, "Не удалось сгенерировать договор. Проверьте логи сервиса.")
     filename = f"Трудовой_договор_{emp.full_name.replace(' ', '_')}.docx"
     return FileResponse(path, filename=filename)
+
+
+@app.post("/employees/{employee_id}/labor_contract/download_pdf")
+def employee_labor_contract_download_pdf(
+    employee_id: str,
+    request: Request,
+    position: str = Form("Монтажник"),
+    salary: str = Form("30000"),
+    db: Session = Depends(get_db),
+):
+    """PDF-версия договора для пакета Госуслуг. Генерирует docx и конвертирует в PDF через
+    LibreOffice — один источник (docx), PDF всегда совпадает. Требует libreoffice в контейнере."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+    if emp.contract_date is None:
+        raise HTTPException(400, "Договор не заключён — сначала нажмите «Заключить».")
+    try:
+        docx_path = generate_labor_contract_docx(emp, position=position, salary=salary,
+                                                 contract_date=emp.contract_date)
+        pdf_path = _docx_to_pdf(docx_path)
+    except RuntimeError as e:
+        raise HTTPException(500, f"PDF недоступен: {e}")
+    except Exception:
+        raise HTTPException(500, "Не удалось сгенерировать PDF договора. Проверьте логи.")
+    filename = f"Трудовой_договор_{emp.full_name.replace(' ', '_')}.pdf"
+    return FileResponse(pdf_path, filename=filename, media_type="application/pdf")
 
 
 @app.post("/employees/{employee_id}/duty_receipt")
@@ -2085,6 +2145,36 @@ def employee_duty_receipt(
     kind_ru = "постановка" if kind == "registration" else "продление"
     filename = f"Квитанция_{kind_ru}_{emp.full_name.replace(' ', '_')}.docx"
     return FileResponse(path, filename=filename)
+
+
+@app.post("/employees/{employee_id}/duty_receipt_pdf")
+def employee_duty_receipt_pdf(
+    employee_id: str,
+    request: Request,
+    kind: str = Form(...),
+    payer_name: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    """PDF-версия квитанции для пакета Госуслуг. docx -> PDF через LibreOffice."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+    if kind not in ("registration", "renewal"):
+        raise HTTPException(400, "Неизвестный тип пошлины")
+    if (payer_name or "").strip():
+        request.session["last_payer"] = payer_name.strip()
+    try:
+        docx_path = generate_duty_receipt_docx(kind, employee=emp, payer_name=payer_name)
+        pdf_path = _docx_to_pdf(docx_path)
+    except RuntimeError as e:
+        raise HTTPException(500, f"PDF недоступен: {e}")
+    except Exception:
+        raise HTTPException(500, "Не удалось сгенерировать PDF квитанции. Проверьте логи.")
+    kind_ru = "постановка" if kind == "registration" else "продление"
+    filename = f"Квитанция_{kind_ru}_{emp.full_name.replace(' ', '_')}.pdf"
+    return FileResponse(pdf_path, filename=filename, media_type="application/pdf")
 
 
 @app.post("/employees/{employee_id}/registration_status")
