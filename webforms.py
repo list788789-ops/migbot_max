@@ -568,9 +568,10 @@ fieldset legend{{font-size:12px;color:var(--accent-ink);text-transform:uppercase
 """
 PAGE_FOOT = """
 <button id="scrollTopBtn" onclick="window.scrollTo({top:0,behavior:'smooth'})"
-  style="display:none;position:fixed;right:16px;bottom:16px;z-index:999;width:48px;height:48px;
-  border:none;border-radius:50%;background:#4a90e2;color:#fff;font-size:24px;line-height:1;
-  box-shadow:0 4px 12px rgba(20,24,30,.25);cursor:pointer" aria-label="Наверх">&#8593;</button>
+  style="display:none;position:fixed;right:14px;bottom:calc(24px + env(safe-area-inset-bottom,0px));
+  z-index:999;width:52px;height:52px;border:none;border-radius:50%;background:#4a90e2;color:#fff;
+  font-size:26px;line-height:52px;text-align:center;padding:0;
+  box-shadow:0 4px 14px rgba(20,24,30,.30);cursor:pointer" aria-label="Наверх">&#8593;</button>
 <script>
 (function(){
   var btn = document.getElementById('scrollTopBtn');
@@ -2858,8 +2859,12 @@ async def employee_scan_upload(
 
     warn = ""
     if scan_type in PAYMENT_SCAN_TYPES:
-        if _payment_surname_check(data, emp.full_name or "") is False:
-            warn = "?warn=payment_surname"
+        # Проверка ФИО не должна ронять загрузку ни при каких условиях — оборачиваем весь вызов.
+        try:
+            if _payment_surname_check(data, emp.full_name or "") is False:
+                warn = "?warn=payment_surname"
+        except Exception:
+            warn = ""
 
     eid = None if scan_type in SCAN_COMMON_TYPES else employee_id
     try:
