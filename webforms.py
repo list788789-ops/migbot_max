@@ -168,8 +168,11 @@ S3_SECRET_KEY = os.environ.get("S3_SECRET_KEY", "")
 SCAN_TYPES = {
     "passport": "Паспорт работника (все страницы)",
     "migration_card": "Миграционная карта",
-    "payment": "Исполненная платёжка (оплата госпошлины)",
+    "payment_registration": "Исполненная платёжка — постановка на учёт (500 ₽)",
+    "payment_renewal": "Исполненная платёжка — продление регистрации (1000 ₽)",
 }
+# Платёжки, для которых при загрузке проверяем фамилию работника в назначении платежа (PDF).
+PAYMENT_SCAN_TYPES = {"payment_registration", "payment_renewal"}
 # Общие документы (один файл на всех) — на отдельной странице /common-docs (кадровик/админ),
 # не в карточке работника. Директор и адрес подразделения одни для всех работников.
 COMMON_DOC_TYPES = {
@@ -310,9 +313,13 @@ def _package_missing(emp) -> list:
     """Проверяет комплектность пакета Госуслуг для работника. Возвращает список недостающего
     (человекочитаемые названия). Пустой список = пакет полный, можно выгружать."""
     missing = []
-    # персональные сканы
+    # персональные сканы. Платёжки (PAYMENT_SCAN_TYPES) пока НЕ обязательны для комплектности —
+    # логика двух госпошлин (постановка/продление) будет позже; до неё не требуем обе платёжки,
+    # иначе пакет всегда «неполный». Обязательны паспорт и миграционная карта.
     present = _s3_list_for_employee(emp.id)
     for st, label in SCAN_TYPES.items():
+        if st in PAYMENT_SCAN_TYPES:
+            continue
         if not present.get(st):
             missing.append(label)
     # общие документы
@@ -1280,6 +1287,15 @@ def employee_card(employee_id: str, request: Request, db: Session = Depends(get_
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
 
+    _warn_banner = ""
+    if request.query_params.get("warn") == "payment_surname":
+        _warn_banner = (
+            '<div style="margin:12px 0;padding:12px;border:1px solid #e0a800;border-radius:8px;'
+            'background:#fff8e1;color:#7a5c00">⚠ В загруженной платёжке не найдена фамилия '
+            'работника в назначении платежа. Проверьте вручную, что платёжка относится к этому '
+            'сотруднику (или текст не распознан, если это скан).</div>'
+        )
+
     emp = db.get(Employee, employee_id)
     if emp is None:
         raise HTTPException(404, "Сотрудник не найден")
@@ -1513,17 +1529,27 @@ onsubmit="return confirm(&#39;Отменить оформление увольн
 <label>Дата увольнения (расторжения договора)</label>
 <input type="date" name="termination_date" min="{emp.contract_date.isoformat()}" value="{today_s}">
 <label>Основание расторжения</label>
-<select name="basis">
+<select name="basis" id="basis_select" onchange="_toggleBasisNote()">
 <option value="по собственному желанию">По собственному желанию</option>
 <option value="по инициативе работодателя">По инициативе работодателя</option>
 <option value="по соглашению сторон">По соглашению сторон</option>
 <option value="истечение срока договора">Истечение срока договора</option>
 <option value="иное">Иное (указать в примечании)</option>
 </select>
-<label>Примечание к основанию (если «иное»)</label>
+<div id="basis_note_wrap" style="display:none">
+<label>Примечание к основанию</label>
 <input type="text" name="basis_note" placeholder="">
+</div>
 <button type="submit" class="btn-full">Оформить увольнение</button>
-</form>'''
+</form>
+<script>
+function _toggleBasisNote(){{
+  var sel = document.getElementById('basis_select');
+  var wrap = document.getElementById('basis_note_wrap');
+  if (sel && wrap) wrap.style.display = (sel.value === 'иное') ? 'block' : 'none';
+}}
+_toggleBasisNote();
+</script>'''
 
             _post = f'''
 <p class="muted">Договор заключён {emp.contract_date.strftime("%d.%m.%Y")}.</p>
@@ -1544,7 +1570,11 @@ onsubmit="return confirm(&#39;Отменить оформление увольн
         # До заключения: форма с предпросмотром и заключением. Предпросмотр (formaction preview)
         # ничего не пишет — только показывает HTML по введённым данным. Заключение пишет дату
         # и создаёт обязательства. Скачивание доступно только после заключения (блок _post).
-        contract_block = f"""
+        # Форма заключения показывается ТОЛЬКО пока договор НЕ заключён. После заключения
+        # (contract_date задана) видны лишь скачивание и «Отменить договор» (блок _post) —
+        # чтобы нельзя было заключить повторно. Отмена договора вернёт форму заключения.
+        if emp.contract_date is None:
+            _conclude_form = f"""
 <p class="muted">Номер договора: {_contract_no}. Дата по умолчанию — сегодня; можно изменить.</p>
 {help_contract}
 <form method="post" action="/employees/{emp.id}/labor_contract">
@@ -1555,10 +1585,13 @@ onsubmit="return confirm(&#39;Отменить оформление увольн
 <input type="text" name="salary" value="30000">
 {help_salary}
 <label>Дата договора</label>
-<input type="date" name="contract_date" max="{today_s}" value="{emp.contract_date.isoformat() if emp.contract_date else today_s}">
+<input type="date" name="contract_date" max="{today_s}" value="{today_s}">
 <button type="submit" formaction="/employees/{emp.id}/labor_contract/preview" class="secondary btn-full">Предпросмотр</button>
-<button type="submit" onsubmit="return true" class="btn-full">Заключить трудовой договор</button>
-</form>
+<button type="submit" class="btn-full">Заключить трудовой договор</button>
+</form>"""
+        else:
+            _conclude_form = ""
+        contract_block = f"""{_conclude_form}
 {_post}"""
 
     # Секция статуса учёта. Отдельная форма со своим confirm — смена пересоздаёт
@@ -1691,6 +1724,7 @@ value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
             contract_block = '<p class="muted">Договор недоступен: не задан статус учёта или табельный номер.</p>'
 
     body = f"""
+{_warn_banner}
 <h1>{emp.full_name}</h1>
 <section class="card-form">
 <div class="card-cols">
@@ -2731,6 +2765,27 @@ def employee_obligation_reopen(
 
 
 @app.post("/employees/{employee_id}/scan/upload")
+def _payment_surname_check(pdf_bytes: bytes, full_name: str) -> bool | None:
+    """Проверяет, встречается ли фамилия работника в тексте PDF-платёжки (назначение платежа).
+    True — нашли; False — не нашли (повод предупредить); None — не смогли прочитать (скан без
+    текста/не PDF). Ищем по ФАМИЛИИ как подстроке — устойчиво к падежам/инициалам."""
+    if not full_name or not full_name.strip():
+        return None
+    surname = full_name.strip().split()[0].lower()
+    if len(surname) < 3:
+        return None
+    try:
+        import io
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        text = "".join((p.extract_text() or "") for p in reader.pages).lower()
+        if not text.strip():
+            return None
+        return surname in text
+    except Exception:
+        return None
+
+
 async def employee_scan_upload(
     employee_id: str,
     request: Request,
@@ -2754,12 +2809,18 @@ async def employee_scan_upload(
     if len(data) > 15 * 1024 * 1024:
         raise HTTPException(400, "Файл больше 15 МБ — сожмите или разбейте.")
     ct = file.content_type or "application/octet-stream"
+
+    warn = ""
+    if scan_type in PAYMENT_SCAN_TYPES:
+        if _payment_surname_check(data, emp.full_name or "") is False:
+            warn = "?warn=payment_surname"
+
     eid = None if scan_type in SCAN_COMMON_TYPES else employee_id
     try:
         _s3_upload(scan_type, eid, data, ct)
     except RuntimeError as e:
         raise HTTPException(500, str(e))
-    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+    return RedirectResponse(f"/employees/{employee_id}{warn}", status_code=303)
 
 
 @app.post("/employees/{employee_id}/scan/download")
