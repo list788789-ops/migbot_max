@@ -566,7 +566,21 @@ fieldset legend{{font-size:12px;color:var(--accent-ink);text-transform:uppercase
 <div class="page-title">Миграционный учёт — {title}</div>
 </header>
 """
-PAGE_FOOT = "</body></html>"
+PAGE_FOOT = """
+<button id="scrollTopBtn" onclick="window.scrollTo({top:0,behavior:'smooth'})"
+  style="display:none;position:fixed;right:16px;bottom:16px;z-index:999;width:48px;height:48px;
+  border:none;border-radius:50%;background:#4a90e2;color:#fff;font-size:24px;line-height:1;
+  box-shadow:0 4px 12px rgba(20,24,30,.25);cursor:pointer" aria-label="Наверх">&#8593;</button>
+<script>
+(function(){
+  var btn = document.getElementById('scrollTopBtn');
+  if(!btn) return;
+  window.addEventListener('scroll', function(){
+    btn.style.display = (window.scrollY > 300) ? 'block' : 'none';
+  });
+})();
+</script>
+</body></html>"""
 def _nav(active: str = "", role: str = "") -> str:
     """active: 'home' | 'employees' | 'medical' | 'admin' — подсвечивает корневой раздел.
     role: роль пользователя — 'admin' добавляет пункт «Пользователи» (управление доступом)."""
@@ -1076,8 +1090,10 @@ def employees_list(request: Request, db: Session = Depends(get_db)):
                     f'<div class="muted-line">{type_label} · '
                     f'до {o.deadline_date.strftime("%d.%m.%Y")}</div>'
                 )
+        # data-search: ФИО + табельный в нижнем регистре — по нему фильтрует JS-поиск.
+        _search_key = f"{e.full_name or ''} {e.tab_number or ''}".lower()
         return (
-            f'<div class="card">{e.full_name} {chip}<br>'
+            f'<div class="card emp-row" data-search="{html.escape(_search_key, quote=True)}">{e.full_name} {chip}<br>'
             f'<span class="muted-line">{cit}</span>{ob_line}'
             f'<a class="btn" href="/employees/{e.id}">Открыть карточку</a></div>'
         )
@@ -1097,11 +1113,41 @@ def employees_list(request: Request, db: Session = Depends(get_db)):
             f'<section class="grid"><h2>Ожидают прибытия ({len(awaiting)})</h2>{awaiting_rows}</section>'
         )
 
+    _search_box = (
+        '<input type="text" id="empSearch" placeholder="Поиск по ФИО или табельному номеру…" '
+        'oninput="_filterEmployees()" '
+        'style="width:100%;font-size:16px;padding:12px 14px;margin:8px 0 4px;border:1px solid #b8c0cc;'
+        'border-radius:12px;background:#fff">'
+        '<p class="muted" id="empSearchEmpty" style="display:none">Никого не найдено.</p>'
+    )
+    _search_js = """
+<script>
+function _filterEmployees(){
+  var q = (document.getElementById('empSearch').value || '').toLowerCase().trim();
+  var rows = document.querySelectorAll('.emp-row');
+  var shown = 0;
+  rows.forEach(function(r){
+    var key = r.getAttribute('data-search') || '';
+    var match = q === '' || key.indexOf(q) !== -1;
+    r.style.display = match ? '' : 'none';
+    if(match) shown++;
+  });
+  var empty = document.getElementById('empSearchEmpty');
+  if(empty) empty.style.display = (shown === 0 && q !== '') ? 'block' : 'none';
+  // скрыть заголовки секций, если в них никого не осталось
+  document.querySelectorAll('.grid').forEach(function(sec){
+    var vis = sec.querySelectorAll('.emp-row:not([style*="display: none"])').length;
+    sec.style.display = (q !== '' && vis === 0) ? 'none' : '';
+  });
+}
+</script>"""
     return _render(
         "Сотрудники",
         f'<h1>Сотрудники ({len(employees)})</h1>'
         f'<p><a class="btn" href="/employees/new">+ Добавить сотрудника</a></p>'
-        f'{active_section}{awaiting_section}',
+        f'{_search_box}'
+        f'{active_section}{awaiting_section}'
+        f'{_search_js}',
         active="employees",
         role=request.session.get("role", ""),
     )
