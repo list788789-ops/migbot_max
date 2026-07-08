@@ -1475,7 +1475,8 @@ onsubmit="return confirm(&#39;Удалить скан?&#39;)">
 {_check_row}
 <form method="post" action="/employees/{emp.id}/scan/upload" enctype="multipart/form-data" style="margin-top:8px">
 <input type="hidden" name="scan_type" value="{_st}">
-<input type="file" name="file" accept="application/pdf,image/*" required style="display:block;width:100%;margin:8px 0;padding:10px;border:1px solid #d9dde3;border-radius:8px;background:#fff;font-size:16px">
+<input type="file" name="files" accept="application/pdf,image/*" multiple required style="display:block;width:100%;margin:8px 0;padding:10px;border:1px solid #d9dde3;border-radius:8px;background:#fff;font-size:16px">
+<p class="muted" style="margin:4px 0 0;font-size:13px">Можно выбрать несколько PDF (напр. паспорт на 2 страницах) — объединятся в один файл.</p>
 <button type="submit" class="btn-full">Загрузить</button></form>
 <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">{_actions}</div>
 </div>'''
@@ -2960,11 +2961,12 @@ async def employee_scan_upload(
     employee_id: str,
     request: Request,
     scan_type: str = Form(...),
-    file: UploadFile = File(...),
+    files: list[UploadFile] = File(...),
     db: Session = Depends(get_db),
 ):
-    """Загрузка скана (паспорт/миграционная карта/ЕГРН) в хранилище. Доступ — кадровик/админ.
-    ЕГРН — общий файл (один на всех), паспорт/карта — персональные под работником."""
+    """Загрузка скана в хранилище. Доступ — кадровик/админ. Можно выбрать НЕСКОЛЬКО файлов
+    (напр. паспорт на 2 страницах — два PDF): они склеиваются в один PDF под одним ключом,
+    чтобы вторая загрузка не затирала первую. Один файл — сохраняется как есть."""
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
     _require_role(request, db, UserRole.KADROVIK)
@@ -2973,12 +2975,42 @@ async def employee_scan_upload(
     emp = db.get(Employee, employee_id)
     if emp is None:
         raise HTTPException(404, "Сотрудник не найден")
-    data = await file.read()
-    if not data:
+
+    # Читаем все выбранные файлы.
+    parts = []
+    for f in files:
+        b = await f.read()
+        if b:
+            parts.append((b, f.content_type or "application/octet-stream"))
+    if not parts:
         raise HTTPException(400, "Пустой файл.")
+
+    if len(parts) == 1:
+        # один файл — как есть
+        data, ct = parts[0]
+    else:
+        # несколько файлов — склеиваем в один PDF (страницы документа). Все части должны быть
+        # PDF; если среди них есть не-PDF, склейка PDF невозможна — просим PDF.
+        try:
+            import io
+            from pypdf import PdfWriter, PdfReader
+            writer = PdfWriter()
+            for b, pct in parts:
+                if "pdf" not in (pct or "").lower():
+                    raise ValueError("не PDF")
+                reader = PdfReader(io.BytesIO(b))
+                for page in reader.pages:
+                    writer.add_page(page)
+            out = io.BytesIO()
+            writer.write(out)
+            data = out.getvalue()
+            ct = "application/pdf"
+        except Exception:
+            raise HTTPException(400, "Несколько файлов можно объединить только если все они PDF. "
+                                     "Загрузите страницы в формате PDF (по одному листу на файл).")
+
     if len(data) > 15 * 1024 * 1024:
-        raise HTTPException(400, "Файл больше 15 МБ — сожмите или разбейте.")
-    ct = file.content_type or "application/octet-stream"
+        raise HTTPException(400, "Итоговый файл больше 15 МБ — сожмите страницы.")
 
     # Для платёжек: проверяем фамилию И сумму. Если хоть что-то не сошлось (или чужая сумма) —
     # помечаем скан «требует проверки» (метка check=1 в метаданных S3), но НЕ блокируем загрузку.
