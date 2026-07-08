@@ -1493,7 +1493,7 @@ onsubmit="return confirm(&#39;Удалить скан?&#39;)">
 </form>'''
 
         _scans_section = f'''
-<fieldset>
+<fieldset id="scans-section">
 <legend>Пакет для Госуслуг</legend>
 <p class="muted">Персональные сканы работника: паспорт, миграционная карта, исполненная платёжка
 (подтверждение оплаты госпошлины из банка). PDF или фото, до 15 МБ. Общие документы (паспорт
@@ -1857,7 +1857,31 @@ value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
 </div>
 <a class="btn secondary" href="/employees">← Ко всем сотрудникам</a>
 </section>"""
-    return _render(emp.full_name, body + SAVE_FORM_JS, active="employees", role=request.session.get("role",""))
+    # Кнопка «вниз к сканам» — только на карточке (там есть секция #scans-section). Скроллит к
+    # секции пакета/сканов; видна, пока секция ниже экрана. Стиль как у глобальной «вверх».
+    _down_btn = """
+<button id="scrollDownBtn" onclick="document.getElementById('scans-section') && document.getElementById('scans-section').scrollIntoView({behavior:'smooth'})"
+  style="display:none;position:fixed !important;right:12px;bottom:calc(70px + env(safe-area-inset-bottom,0px));
+  z-index:999;width:46px !important;height:46px !important;min-height:0 !important;min-width:0 !important;
+  padding:0 !important;margin:0 !important;border:none;border-radius:50% !important;
+  background:rgba(74,144,226,.9);color:#fff;font-size:22px;line-height:46px !important;text-align:center;
+  box-shadow:0 3px 10px rgba(20,24,30,.28);cursor:pointer" aria-label="К сканам">&#8595;</button>
+<script>
+(function(){
+  var btn = document.getElementById('scrollDownBtn');
+  var sec = document.getElementById('scans-section');
+  if(!btn || !sec) return;
+  function upd(){
+    var r = sec.getBoundingClientRect();
+    // видна, пока верх секции ниже нижней границы экрана (ещё не доскроллили)
+    btn.style.display = (r.top > window.innerHeight - 60) ? 'block' : 'none';
+  }
+  window.addEventListener('scroll', upd);
+  window.addEventListener('resize', upd);
+  upd();
+})();
+</script>"""
+    return _render(emp.full_name, body + SAVE_FORM_JS + _down_btn, active="employees", role=request.session.get("role",""))
 
 
 @app.post("/employees/{employee_id}/entry_date")
