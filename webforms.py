@@ -3071,8 +3071,15 @@ def _ocr_id_card(image_bytes: bytes) -> dict:
         return {}
     d = best.to_dict()
     res = {}
-    surname = (d.get("surname") or "").replace("<", " ").strip()
-    names = (d.get("names") or "").replace("<", " ").strip()
+
+    def _clean_mrz_name(raw):
+        # MRZ-имя: разделители '<' -> пробел, оставляем только части длиной >1 (одиночные буквы —
+        # артефакты распознавания, как хвост 'K' от <<K<<). Возвращаем очищенную строку.
+        parts = [p for p in (raw or "").replace("<", " ").split() if len(p) > 1]
+        return " ".join(parts)
+
+    surname = _clean_mrz_name(d.get("surname"))
+    names = _clean_mrz_name(d.get("names"))
     res["full_name_translit"] = " ".join(p for p in [_translit_iso(surname), _translit_iso(names)] if p)
     res["passport_number"] = (d.get("number") or "").replace("<", "").strip()
     dob = (d.get("date_of_birth") or "").strip()
