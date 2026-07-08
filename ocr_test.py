@@ -52,6 +52,24 @@ pre{{white-space:pre-wrap;word-break:break-word;background:#fff;padding:8px;bord
 </body></html>"""
 
 
+def _translit_to_cyrillic(s: str) -> str:
+    """Обратная транслитерация латиница->кириллица для ЧЕРНОВИКА ФИО. ВНИМАНИЕ: неоднозначна —
+    BALGABAYEV->Балгабайев (офиц. Балгабаев), ZHUNISSOV->Жуниссов (офиц. Жунисов). Даёт
+    правдоподобное, но НЕ гарантированно точное написание. Только подсказка, кадровик ОБЯЗАН
+    сверить с кириллицей на лицевой стороне удостоверения."""
+    if not s:
+        return ""
+    s = s.upper()
+    for lat, cyr in [("SHCH","Щ"),("KH","Х"),("ZH","Ж"),("CH","Ч"),("SH","Ш"),
+                     ("YU","Ю"),("YA","Я"),("YO","Ё"),("TS","Ц")]:
+        s = s.replace(lat, cyr)
+    single = {"A":"А","B":"Б","V":"В","G":"Г","D":"Д","E":"Е","Z":"З","I":"И","Y":"Й",
+              "K":"К","L":"Л","M":"М","N":"Н","O":"О","P":"П","R":"Р","S":"С","T":"Т",
+              "U":"У","F":"Ф","H":"Х","C":"К","J":"Ж","Q":"К","W":"В","X":"КС"}
+    out = "".join(single.get(ch, ch) for ch in s)
+    return out.capitalize()
+
+
 def _run_ocr(image_bytes: bytes) -> str:
     """Прогоняет passporteye по фото, возвращает HTML с результатом."""
     try:
@@ -104,6 +122,7 @@ def _run_ocr(image_bytes: bytes) -> str:
     # Достаём из сырого текста вручную. Проверка: 12 цифр, первые 6 = дата рождения (ГГММДД).
     iin = None
     citizenship_raw = None
+    citizenship_corrected = False
     try:
         raw = (d.get("raw_text", "") or "")
         lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
@@ -115,9 +134,16 @@ def _run_ocr(image_bytes: bytes) -> str:
                 iin = opt1[:12]
         if len(lines) >= 2:
             l2 = lines[1].replace(" ", "")
-            # гражданство: позиции 15-18 второй строки (надёжнее, чем разбор библиотеки)
+            # гражданство: позиции 15-18 второй строки. OCR часто искажает Z<->L, Z<->2 —
+            # KAZ читается как KAL/KA2/KAI. Раз все работники граждане Казахстана, распознанное
+            # «похоже на KAZ» нормализуем в KAZ (с пометкой), точное KAZ оставляем как есть.
             cand = l2[15:18]
-            if cand.isalpha():
+            if cand == "KAZ":
+                citizenship_raw = "KAZ"
+            elif cand[:2] == "KA":  # KAL, KA2, KAI и т.п. — искажённое KAZ
+                citizenship_raw = "KAZ"
+                citizenship_corrected = True
+            elif cand.isalpha():
                 citizenship_raw = cand
     except Exception:
         pass
@@ -129,13 +155,16 @@ def _run_ocr(image_bytes: bytes) -> str:
         ("Номер документа", d.get("number")),
         ("Проверка номера (контр. сумма)", "✓ ок" if d.get("valid_number") else "✗ НЕ сошлась"),
         ("Фамилия (латиницей)", d.get("surname")),
+        ("Фамилия (транслит, ЧЕРНОВИК)", _translit_to_cyrillic(d.get("surname") or "")),
         ("Имя (латиницей)", d.get("names")),
+        ("Имя (транслит, ЧЕРНОВИК)", _translit_to_cyrillic(d.get("names") or "")),
         ("Дата рождения (ГГММДД)", d.get("date_of_birth")),
         ("Проверка даты рожд.", "✓ ок" if d.get("valid_date_of_birth") else "✗ НЕ сошлась"),
         ("Срок действия (ГГММДД)", d.get("expiration_date")),
         ("Проверка срока", "✓ ок" if d.get("valid_expiration_date") else "✗ НЕ сошлась"),
         ("Пол", d.get("sex")),
-        ("Гражданство (из MRZ)", citizenship_raw or d.get("nationality")),
+        ("Гражданство (из MRZ)", (citizenship_raw or d.get("nationality") or "—")
+            + (" (скорректировано из искажённого OCR)" if citizenship_corrected else "")),
         ("ИИН (из optional MRZ)", iin or d.get("personal_number") or "не извлечён"),
         ("Общая валидность MRZ", "✓ всё сошлось" if d.get("valid_score", 0) == 100 else f"частично ({d.get('valid_score')}%)"),
     ]
