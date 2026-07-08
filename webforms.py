@@ -2976,13 +2976,17 @@ def employee_scan_download(
     _require_role(request, db, UserRole.KADROVIK)
     if scan_type not in SCAN_TYPES:
         raise HTTPException(400, "Неизвестный тип скана.")
+    emp = db.get(Employee, employee_id)
+    _fio = (emp.full_name if emp else "").strip().replace(" ", "_")
     eid = None if scan_type in SCAN_COMMON_TYPES else employee_id
     try:
         data, ct = _s3_download(scan_type, eid)
     except RuntimeError as e:
         raise HTTPException(404, str(e))
     ext = "pdf" if "pdf" in ct else ("jpg" if "jpeg" in ct or "jpg" in ct else "bin")
-    fn = f"{SCAN_TYPES[scan_type].split('(')[0].strip().replace(' ', '_')}.{ext}"
+    _type_name = SCAN_TYPES[scan_type].split('(')[0].strip().replace(' ', '_')
+    # ФИО впереди, затем тип — чтобы в загрузках не путать файлы разных работников.
+    fn = f"{_fio}_{_type_name}.{ext}" if _fio else f"{_type_name}.{ext}"
     return Response(content=data, media_type=ct,
                     headers={"Content-Disposition": _content_disposition(fn)})
 
@@ -3156,7 +3160,8 @@ def employee_package(employee_id: str, request: Request, db: Session = Depends(g
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
             for st, label in SCAN_TYPES.items():
                 data, ct = _s3_download(st, employee_id)
-                z.writestr(f"{label.split('(')[0].strip()}.{_ext_for(ct)}", data)
+                _tn = label.split('(')[0].strip().replace(' ', '_')
+                z.writestr(f"{safe_name}_{_tn}.{_ext_for(ct)}", data)
             for dt, label in COMMON_DOC_TYPES.items():
                 data, ct = _s3_download_common(dt)
                 z.writestr(f"{label.split('(')[0].strip()}.{_ext_for(ct)}", data)
