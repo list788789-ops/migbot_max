@@ -130,6 +130,11 @@ class ObligationStatus(str, enum.Enum):
     PENDING = "pending"
     DONE = "done"
     OVERDUE = "overdue"
+    # Снято при увольнении: обязательство стало неактуальным, т.к. работник уволен и убыл.
+    # НЕ то же, что DONE (не исполнено) и не OVERDUE (не должно висеть в просроченных).
+    # Все выборки горящих/просроченных обязаны исключать CANCELLED.
+    # Требует ALTER TYPE на проде: ALTER TYPE obligationstatus ADD VALUE 'CANCELLED';
+    CANCELLED = "cancelled"
 
 
 class ExamStatus(str, enum.Enum):
