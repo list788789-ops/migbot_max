@@ -2957,6 +2957,30 @@ def _payment_surname_check(pdf_bytes: bytes, full_name: str) -> bool | None:
 
 
 @app.post("/employees/{employee_id}/scan/upload")
+def _process_image(data: bytes) -> bytes:
+    """Обработка фото перед сохранением: автоповорот по EXIF (чтобы документ не был боком),
+    ужатие разрешения (не больше 2000px по длинной стороне — качество документа не страдает) и
+    сжатие в JPG качества 85. Уменьшает вес телефонных снимков в разы. Возвращает JPG-байты.
+    Если это не изображение — возвращает исходные байты без изменений."""
+    try:
+        import io
+        from PIL import Image, ImageOps
+        im = Image.open(io.BytesIO(data))
+        im = ImageOps.exif_transpose(im)  # поворот по EXIF
+        if im.mode != "RGB":
+            im = im.convert("RGB")
+        # ужать, если больше 2000px по длинной стороне
+        maxside = 2000
+        if max(im.size) > maxside:
+            ratio = maxside / max(im.size)
+            im = im.resize((int(im.width * ratio), int(im.height * ratio)))
+        out = io.BytesIO()
+        im.save(out, format="JPEG", quality=85, optimize=True)
+        return out.getvalue()
+    except Exception:
+        return data  # не изображение или ошибка — как есть
+
+
 async def employee_scan_upload(
     employee_id: str,
     request: Request,
@@ -2986,8 +3010,11 @@ async def employee_scan_upload(
         raise HTTPException(400, "Пустой файл.")
 
     if len(parts) == 1:
-        # один файл — как есть
         data, ct = parts[0]
+        # одиночное фото — обрабатываем (поворот/сжатие), PDF — оставляем как есть
+        if "pdf" not in (ct or "").lower() and "image" in (ct or "").lower():
+            data = _process_image(data)
+            ct = "image/jpeg"
     else:
         # Несколько файлов — склеиваем в один PDF. Поддерживаем PDF И изображения (PNG/JPG):
         # фото страниц удостоверения конвертируются в страницы PDF, PDF-части добавляются как есть.
@@ -3004,8 +3031,9 @@ async def employee_scan_upload(
                     for page in reader.pages:
                         writer.add_page(page)
                 else:
-                    # изображение -> одностраничный PDF -> добавить страницу
-                    im = Image.open(io.BytesIO(b))
+                    # изображение -> обработка (поворот/сжатие) -> одностраничный PDF -> страница
+                    pb = _process_image(b)
+                    im = Image.open(io.BytesIO(pb))
                     if im.mode != "RGB":
                         im = im.convert("RGB")
                     tmp = io.BytesIO()
@@ -3501,6 +3529,17 @@ def medical_result(
 
     db.commit()
     return RedirectResponse("/medical", status_code=303)
+
+
+# --- ВРЕМЕННО: тестовый роут OCR (/ocr-test). Убрать после проверки passporteye ---------------
+# Изолированный тест распознавания MRZ с фото удостоверения. Требует passporteye в requirements
+# и tesseract-ocr в RAILPACK_DEPLOY_APT_PACKAGES. После теста удалить: эти 4 строки, файл
+# ocr_test.py, passporteye из requirements, tesseract из apt-переменной.
+try:
+    import ocr_test
+    ocr_test.register(app)
+except Exception:
+    pass  # если ocr_test.py не подключён/удалён — рабочая система не падает
 
 
 # --- Деплой на Railway (кратко) ---------------------------------------------
