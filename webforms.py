@@ -568,9 +568,10 @@ fieldset legend{{font-size:12px;color:var(--accent-ink);text-transform:uppercase
 """
 PAGE_FOOT = """
 <button id="scrollTopBtn" onclick="window.scrollTo({top:0,behavior:'smooth'})"
-  style="display:none;position:fixed;right:12px;bottom:calc(16px + env(safe-area-inset-bottom,0px));
-  z-index:999;width:42px;height:42px;border:none;border-radius:50%;background:rgba(74,144,226,.88);
-  color:#fff;font-size:20px;line-height:42px;text-align:center;padding:0;
+  style="display:none;position:fixed !important;right:12px;bottom:calc(16px + env(safe-area-inset-bottom,0px));
+  z-index:999;width:46px !important;height:46px !important;min-height:0 !important;min-width:0 !important;
+  padding:0 !important;margin:0 !important;border:none;border-radius:50% !important;
+  background:rgba(74,144,226,.9);color:#fff;font-size:22px;line-height:46px !important;text-align:center;
   box-shadow:0 3px 10px rgba(20,24,30,.28);cursor:pointer" aria-label="Наверх">&#8593;</button>
 <script>
 (function(){
