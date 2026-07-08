@@ -2857,14 +2857,33 @@ def employee_obligation_reopen(
 PAYMENT_EXPECTED_AMOUNT = {"payment_registration": 500, "payment_renewal": 1000}
 
 
+def _extract_payment_amounts(text: str) -> set:
+    """Извлекает суммы платежа по МАРКЕРАМ «Сумма платежа» / «Итого» / «Сумма», а не по всему
+    тексту — иначе числа в реквизитах (ОКТМО, КБК, счета, УИН) дают ложные совпадения.
+    Возвращает набор целых рублей, найденных рядом с маркерами."""
+    import re
+    t = text.replace("\xa0", " ")
+    amounts = set()
+    for marker in ["Сумма платежа", "Итого", "Сумма"]:
+        for m in re.finditer(marker, t, re.IGNORECASE):
+            tail = t[m.end():m.end() + 40]
+            num = re.search(r"([\d\s]{1,12}),?\d{0,2}\s*(?:руб|₽|р\.)", tail)
+            if num:
+                val = num.group(1).replace(" ", "").strip()
+                if val.isdigit():
+                    amounts.add(int(val))
+    return amounts
+
+
 def _payment_amount_check(pdf_bytes: bytes, scan_type: str) -> bool | None:
-    """Проверяет, не загружена ли платёжка НЕ на ту сумму (одна в другую). Принцип: ловим
-    присутствие ЧУЖОЙ суммы. Для слота 500 — если в тексте есть «1000», это чужая (метка).
-    Для слота 1000 — если нет «1000», но есть «500», это чужая (метка).
-    True — сумма ок; False — чужая сумма (повод для метки); None — текст не прочитан (скан)."""
+    """Проверяет сумму платёжки по маркеру «Сумма платежа»/«Итого» (надёжнее, чем поиск числа
+    по всему тексту — реквизиты не мешают). Сравнивает с ожидаемой суммой слота (500/1000).
+    True — ожидаемая сумма найдена и чужой нет; False — найдена чужая сумма (метка);
+    None — текст не прочитан (скан) или маркер суммы не найден (другой формат чека)."""
     expected = PAYMENT_EXPECTED_AMOUNT.get(scan_type)
     if expected is None:
         return None
+    other = 1000 if expected == 500 else 500
     try:
         import io
         from pypdf import PdfReader
@@ -2872,17 +2891,14 @@ def _payment_amount_check(pdf_bytes: bytes, scan_type: str) -> bool | None:
         text = "".join((p.extract_text() or "") for p in reader.pages)
         if not text.strip():
             return None
-        digits = text.replace(" ", "")  # «1 000» -> «1000»
-        has_1000 = "1000" in digits
-        has_500 = "500" in digits
-        if expected == 500:
-            # слот постановки: чужая сумма = 1000
-            return not has_1000
-        else:
-            # слот продления: чужая = только 500 без 1000
-            if has_1000:
-                return True
-            return not has_500
+        amounts = _extract_payment_amounts(text)
+        if not amounts:
+            return None  # маркер суммы не найден — не проверяем (не блокируем зря)
+        if other in amounts and expected not in amounts:
+            return False  # найдена ТОЛЬКО чужая сумма -> точно не тот слот
+        if expected in amounts:
+            return True   # ожидаемая сумма есть
+        return False      # ожидаемой нет, но какая-то сумма есть -> подозрительно
     except Exception:
         return None
 
