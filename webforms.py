@@ -2812,11 +2812,11 @@ def employee_obligation_reopen(
     return RedirectResponse(f"/employees/{employee_id}", status_code=303)
 
 
-@app.post("/employees/{employee_id}/scan/upload")
 def _payment_surname_check(pdf_bytes: bytes, full_name: str) -> bool | None:
     """Проверяет, встречается ли фамилия работника в тексте PDF-платёжки (назначение платежа).
     True — нашли; False — не нашли (повод предупредить); None — не смогли прочитать (скан без
-    текста/не PDF). Ищем по ФАМИЛИИ как подстроке — устойчиво к падежам/инициалам."""
+    текста/не PDF). Ищем по ФАМИЛИИ как подстроке — устойчиво к падежам/инициалам.
+    ЭТО ХЕЛПЕР, НЕ РОУТ — декоратор @app.post должен стоять над employee_scan_upload ниже."""
     if not full_name or not full_name.strip():
         return None
     surname = full_name.strip().split()[0].lower()
@@ -2834,6 +2834,7 @@ def _payment_surname_check(pdf_bytes: bytes, full_name: str) -> bool | None:
         return None
 
 
+@app.post("/employees/{employee_id}/scan/upload")
 async def employee_scan_upload(
     employee_id: str,
     request: Request,
