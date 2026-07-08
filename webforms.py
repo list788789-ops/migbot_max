@@ -333,6 +333,16 @@ def _package_missing(emp) -> list:
     return missing
 
 
+def _content_disposition(filename: str) -> str:
+    """Заголовок Content-Disposition с именем файла, безопасным для HTTP (latin-1 only).
+    Русские имена кодируем по RFC 5987 (filename*=UTF-8''...), плюс ASCII-запасной filename,
+    иначе UnicodeEncodeError: latin-1 не кодирует кириллицу в заголовке."""
+    from urllib.parse import quote
+    ascii_name = filename.encode("ascii", "ignore").decode("ascii") or "file"
+    quoted = quote(filename)
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quoted}"
+
+
 def _ext_for(ct: str) -> str:
     if "pdf" in ct:
         return "pdf"
@@ -2897,7 +2907,7 @@ def employee_scan_download(
     ext = "pdf" if "pdf" in ct else ("jpg" if "jpeg" in ct or "jpg" in ct else "bin")
     fn = f"{SCAN_TYPES[scan_type].split('(')[0].strip().replace(' ', '_')}.{ext}"
     return Response(content=data, media_type=ct,
-                    headers={"Content-Disposition": f'attachment; filename="{fn}"'})
+                    headers={"Content-Disposition": _content_disposition(fn)})
 
 
 @app.post("/employees/{employee_id}/scan/delete")
@@ -2994,7 +3004,7 @@ def common_docs_download(request: Request, doc_type: str = Form(...), db: Sessio
         raise HTTPException(404, str(e))
     fn = f"{COMMON_DOC_TYPES[doc_type].split('(')[0].strip().replace(' ', '_')}.{_ext_for(ct)}"
     return Response(content=data, media_type=ct,
-                    headers={"Content-Disposition": f'attachment; filename="{fn}"'})
+                    headers={"Content-Disposition": _content_disposition(fn)})
 
 
 @app.post("/common-docs/delete")
@@ -3049,7 +3059,7 @@ def employee_package(employee_id: str, request: Request, db: Session = Depends(g
         raise HTTPException(500, "Ошибка сборки пакета. Проверьте логи.")
     buf.seek(0)
     return Response(content=buf.read(), media_type="application/zip",
-                    headers={"Content-Disposition": f'attachment; filename="Пакет_Госуслуги_{safe_name}.zip"'})
+                    headers={"Content-Disposition": _content_disposition(f"Пакет_Госуслуги_{safe_name}.zip")})
 
 
 @app.post("/employees/{employee_id}/termination/cancel")
