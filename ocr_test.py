@@ -98,6 +98,30 @@ def _run_ocr(image_bytes: bytes) -> str:
                 'Попробуйте более ровное фото стороны с MRZ при хорошем свете.</div>')
 
     d = mrz.to_dict()
+
+    # ИИН passporteye не выделяет отдельным полем, но в казахском удостоверении (формат TD1)
+    # он лежит в optional-данных ПЕРВОЙ строки MRZ: 12 цифр после номера и его контрольной цифры.
+    # Достаём из сырого текста вручную. Проверка: 12 цифр, первые 6 = дата рождения (ГГММДД).
+    iin = None
+    citizenship_raw = None
+    try:
+        raw = (d.get("raw_text", "") or "")
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        if lines:
+            l1 = lines[0].replace(" ", "")
+            # optional first line: символы с 15-й позиции (после IDKAZ+9номер+1контр)
+            opt1 = l1[15:].replace("<", "")
+            if len(opt1) >= 12 and opt1[:12].isdigit():
+                iin = opt1[:12]
+        if len(lines) >= 2:
+            l2 = lines[1].replace(" ", "")
+            # гражданство: позиции 15-18 второй строки (надёжнее, чем разбор библиотеки)
+            cand = l2[15:18]
+            if cand.isalpha():
+                citizenship_raw = cand
+    except Exception:
+        pass
+
     # ключевые поля + валидность (контрольные суммы)
     fields = [
         ("Тип документа", d.get("type")),
@@ -111,8 +135,8 @@ def _run_ocr(image_bytes: bytes) -> str:
         ("Срок действия (ГГММДД)", d.get("expiration_date")),
         ("Проверка срока", "✓ ок" if d.get("valid_expiration_date") else "✗ НЕ сошлась"),
         ("Пол", d.get("sex")),
-        ("Гражданство", d.get("nationality")),
-        ("Личный номер / ИИН", d.get("personal_number")),
+        ("Гражданство (из MRZ)", citizenship_raw or d.get("nationality")),
+        ("ИИН (из optional MRZ)", iin or d.get("personal_number") or "не извлечён"),
         ("Общая валидность MRZ", "✓ всё сошлось" if d.get("valid_score", 0) == 100 else f"частично ({d.get('valid_score')}%)"),
     ]
     rows = "".join(
