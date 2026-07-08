@@ -57,19 +57,45 @@ def _run_ocr(image_bytes: bytes) -> str:
     try:
         import io
         from passporteye import read_mrz
+        from PIL import Image, ImageOps
     except ImportError:
         return ('<div class="res err">passporteye не установлен. Добавьте в requirements '
                 '<code>passporteye&gt;=2.2</code> и tesseract-ocr в apt-пакеты Railway, '
                 'передеплойте.</div>')
-    try:
-        mrz = read_mrz(io.BytesIO(image_bytes))
-    except Exception as e:
-        return f'<div class="res err">Ошибка распознавания: {_html.escape(str(e)[:300])}</div>'
 
+    # НОРМАЛИЗАЦИЯ: телефонные фото удостоверения часто повёрнуты (MRZ идёт вертикально).
+    # Пробуем автоповорот по EXIF + перебор 4 поворотов (0/90/180/270). Берём тот результат,
+    # где у passporteye валидность MRZ выше (контрольные суммы) — не угадываем, а проверяем.
+    try:
+        base = Image.open(io.BytesIO(image_bytes))
+        base = ImageOps.exif_transpose(base)
+        if base.mode != "RGB":
+            base = base.convert("RGB")
+    except Exception as e:
+        return f'<div class="res err">Не удалось открыть изображение: {_html.escape(str(e)[:200])}</div>'
+
+    best = None
+    best_score = -1
+    best_angle = 0
+    for angle in (0, 90, 180, 270):
+        try:
+            rot = base.rotate(angle, expand=True)
+            buf = io.BytesIO()
+            rot.save(buf, format="PNG")
+            buf.seek(0)
+            m = read_mrz(buf)
+            if m is not None:
+                score = m.to_dict().get("valid_score", 0)
+                if score > best_score:
+                    best_score, best, best_angle = score, m, angle
+        except Exception:
+            continue
+
+    mrz = best
     if mrz is None:
-        return ('<div class="res err">MRZ-зона не найдена на фото. Возможные причины: '
-                'снята не та сторона (нужна с 3 строками латиницей внизу), блик, наклон, '
-                'обрезан край, низкое качество. Попробуйте более ровное фото стороны с MRZ.</div>')
+        return ('<div class="res err">MRZ-зона не найдена ни при одном повороте. Причины: '
+                'блик, сильный наклон, обрезан край, низкое качество, не та сторона. '
+                'Попробуйте более ровное фото стороны с MRZ при хорошем свете.</div>')
 
     d = mrz.to_dict()
     # ключевые поля + валидность (контрольные суммы)
@@ -94,7 +120,7 @@ def _run_ocr(image_bytes: bytes) -> str:
         for k, v in fields
     )
     raw = _html.escape(str(d.get("raw_text", "") or ""))
-    return (f'<div class="res"><b>MRZ распознана.</b> Проверьте поля и контрольные суммы — '
+    return (f'<div class="res"><b>MRZ распознана (поворот {best_angle}°).</b> Проверьте поля и контрольные суммы — '
             f'«✗ НЕ сошлась» означает ошибку распознавания в этом поле:'
             f'<table>{rows}</table>'
             f'<p class="muted">Сырой текст MRZ (как распозналось):</p><pre>{raw}</pre>'
