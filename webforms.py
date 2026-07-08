@@ -1203,10 +1203,26 @@ def _new_employee_form_html(values: dict, error: str = "") -> str:
         for c in CITIZENSHIP_OPTIONS
     )
     err = f'<div class="warning-banner">Заполни обязательные поля: {html.escape(error)}</div>' if error else ""
+    ocr_note = ""
+    if v.get("_ocr_filled"):
+        ocr_note = ('<div style="margin:12px 0;padding:12px;border:1px solid #e0a800;border-radius:8px;'
+                    'background:#fff8e1;color:#7a5c00">⚠ Поля предзаполнены распознаванием (ТЕСТ). '
+                    'ОБЯЗАТЕЛЬНО проверьте, особенно ФИО — сверьте с кириллицей на лицевой стороне '
+                    'удостоверения (транслит может отличаться от официального написания).</div>')
     return f"""
 <h1>Новый сотрудник</h1>
 <section class="card-form">
 {err}
+<fieldset>
+<legend>⚡ Распознать из фото удостоверения (ТЕСТ)</legend>
+<p class="muted">Фото стороной с MRZ (3 строки латиницей внизу). Поля заполнятся распознанными
+данными — проверьте их. Тестовая функция.</p>
+<form method="post" action="/employees/new/ocr" enctype="multipart/form-data">
+<input type="file" name="photo" accept="image/*" required style="display:block;width:100%;margin:8px 0;padding:10px;border:1px solid #d9dde3;border-radius:8px;background:#fff;font-size:16px">
+<button type="submit" class="secondary btn-full">Распознать и заполнить</button>
+</form>
+</fieldset>
+{ocr_note}
 <form method="post" action="/employees/new">
 
 <fieldset>
@@ -1232,6 +1248,12 @@ def _new_employee_form_html(values: dict, error: str = "") -> str:
 <label>Номер</label>
 <input type="text" name="passport_number" value="{html.escape(v.get('passport_number',''))}">
 <p class="muted">Для нац. удостоверения РК серия «ID». Для загранпаспорта — впиши свою серию.</p>
+</fieldset>
+
+<fieldset>
+<legend>ИИН (необязательно)</legend>
+<input type="text" name="iin" value="{html.escape(v.get('iin',''))}" placeholder="12 цифр">
+<p class="muted">Индивидуальный идентификационный номер (Казахстан). Можно распознать из фото.</p>
 </fieldset>
 
 <fieldset>
@@ -1265,6 +1287,41 @@ def employee_new_form(request: Request):
     return _render("Новый сотрудник", _new_employee_form_html({}), active="employees", role=request.session.get("role",""))
 
 
+@app.post("/employees/new/ocr", response_class=HTMLResponse)
+async def employee_new_ocr(request: Request, photo: UploadFile = File(...),
+                           db: Session = Depends(get_db)):
+    """ТЕСТ: распознаёт удостоверение и перерисовывает форму создания с предзаполненными полями
+    (ФИО-транслит черновик, дата рождения, номер паспорта, ИИН, гражданство). Ничего не сохраняет
+    — только заполняет форму для проверки кадровиком."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    data = await photo.read()
+    if not data:
+        return HTMLResponse(_render("Новый сотрудник",
+            _new_employee_form_html({}, "пустой файл фото"), active="employees",
+            role=request.session.get("role", "")))
+    ocr = _ocr_id_card(data)
+    if not ocr:
+        vals = {"_ocr_failed": True}
+        note = ("Не удалось распознать MRZ (нужна библиотека passporteye и tesseract, либо фото "
+                "нечёткое/не та сторона). Заполните форму вручную.")
+        return HTMLResponse(_render("Новый сотрудник",
+            _new_employee_form_html(vals, note), active="employees",
+            role=request.session.get("role", "")))
+    values = {
+        "full_name": ocr.get("full_name_translit", ""),
+        "citizenship": ocr.get("citizenship") if ocr.get("citizenship") in CITIZENSHIP_OPTIONS else "Казахстан",
+        "birth_date": ocr.get("birth_date", ""),
+        "passport_series": "ID",
+        "passport_number": ocr.get("passport_number", ""),
+        "iin": ocr.get("iin", ""),
+        "_ocr_filled": True,
+    }
+    return HTMLResponse(_render("Новый сотрудник", _new_employee_form_html(values),
+        active="employees", role=request.session.get("role", "")))
+
+
 @app.post("/employees/new")
 def employee_create(
     request: Request,
@@ -1273,6 +1330,7 @@ def employee_create(
     birth_date: str = Form(""),
     passport_series: str = Form("ID"),
     passport_number: str = Form(""),
+    iin: str = Form(""),
     entry_date: str = Form(""),
     contract_date: str = Form(""),
     phone: str = Form(""),
@@ -1284,7 +1342,7 @@ def employee_create(
 
     values = {
         "full_name": full_name, "citizenship": citizenship, "birth_date": birth_date,
-        "passport_series": passport_series, "passport_number": passport_number,
+        "passport_series": passport_series, "passport_number": passport_number, "iin": iin,
         "entry_date": entry_date, "contract_date": contract_date, "phone": phone,
     }
 
@@ -1335,6 +1393,7 @@ def employee_create(
         birth_date=bd,
         passport_series=ps,
         passport_number=pn,
+        iin=(iin.strip() or None),
         entry_date=ed,
         contract_date=cd,
         phone=(phone.strip() or None),
@@ -2957,6 +3016,93 @@ def _payment_surname_check(pdf_bytes: bytes, full_name: str) -> bool | None:
 
 
 @app.post("/employees/{employee_id}/scan/upload")
+def _translit_iso(s: str) -> str:
+    """Обратный транслит латиница->кириллица для ЧЕРНОВИКА ФИО. Неоднозначен — только подсказка
+    под ручную сверку с кириллицей на карте. Эвристика: казахское -AYEV/-AYEVA -> -аев/-аева."""
+    if not s:
+        return ""
+    s = s.upper().strip()
+    suffix = ""
+    for lat, cyr in [("AYEVA", "аева"), ("AYEV", "аев"), ("EEVA", "еева"), ("EEV", "еев")]:
+        if s.endswith(lat):
+            suffix = cyr
+            s = s[:-len(lat)]
+            break
+    for lat, cyr in [("SHCH","Щ"),("KH","Х"),("ZH","Ж"),("CH","Ч"),("SH","Ш"),
+                     ("YU","Ю"),("YA","Я"),("YO","Ё"),("TS","Ц")]:
+        s = s.replace(lat, cyr)
+    single = {"A":"А","B":"Б","V":"В","G":"Г","D":"Д","E":"Е","Z":"З","I":"И","Y":"Й",
+              "K":"К","L":"Л","M":"М","N":"Н","O":"О","P":"П","R":"Р","S":"С","T":"Т",
+              "U":"У","F":"Ф","H":"Х","C":"К","J":"Ж","Q":"К","W":"В","X":"КС"}
+    out = "".join(single.get(ch, ch) for ch in s) + suffix
+    return out.capitalize()
+
+
+def _ocr_id_card(image_bytes: bytes) -> dict:
+    """Распознаёт MRZ удостоверения (passporteye) с перебором поворотов. Возвращает dict полей
+    для формы: full_name_translit, birth_date(ISO), passport_number, iin, citizenship. Пустой
+    dict, если MRZ не распознана или passporteye не установлен. ФИО — черновик под сверку."""
+    try:
+        import io
+        from passporteye import read_mrz
+        from PIL import Image, ImageOps
+    except ImportError:
+        return {}
+    try:
+        base = Image.open(io.BytesIO(image_bytes))
+        base = ImageOps.exif_transpose(base)
+        if base.mode != "RGB":
+            base = base.convert("RGB")
+    except Exception:
+        return {}
+    best, best_score = None, -1
+    for angle in (0, 90, 180, 270):
+        try:
+            rot = base.rotate(angle, expand=True)
+            buf = io.BytesIO(); rot.save(buf, format="PNG"); buf.seek(0)
+            m = read_mrz(buf)
+            if m is not None:
+                sc = m.to_dict().get("valid_score", 0)
+                if sc > best_score:
+                    best, best_score = m, sc
+        except Exception:
+            continue
+    if best is None:
+        return {}
+    d = best.to_dict()
+    res = {}
+    surname = (d.get("surname") or "").replace("<", " ").strip()
+    names = (d.get("names") or "").replace("<", " ").strip()
+    res["full_name_translit"] = " ".join(p for p in [_translit_iso(surname), _translit_iso(names)] if p)
+    res["passport_number"] = (d.get("number") or "").replace("<", "").strip()
+    dob = (d.get("date_of_birth") or "").strip()
+    res["birth_date"] = ""
+    if len(dob) == 6 and dob.isdigit():
+        import datetime as _dt
+        yy, mm, dd = int(dob[:2]), dob[2:4], dob[4:6]
+        cur_yy = _dt.date.today().year % 100
+        year = 1900 + yy if yy > cur_yy else 2000 + yy
+        try:
+            _dt.date(year, int(mm), int(dd))
+            res["birth_date"] = f"{year:04d}-{mm}-{dd}"
+        except Exception:
+            res["birth_date"] = ""
+    iin = ""
+    try:
+        raw = (d.get("raw_text", "") or "")
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        if lines:
+            opt1 = lines[0].replace(" ", "")[15:].replace("<", "")
+            if len(opt1) >= 12 and opt1[:12].isdigit():
+                iin = opt1[:12]
+    except Exception:
+        pass
+    res["iin"] = iin
+    nat = (d.get("nationality") or "").strip()
+    res["citizenship"] = "Казахстан" if nat[:2] == "KA" else nat
+    return res
+
+
 def _process_image(data: bytes) -> bytes:
     """Обработка фото перед сохранением: автоповорот по EXIF (чтобы документ не был боком),
     ужатие разрешения (не больше 2000px по длинной стороне — качество документа не страдает) и
