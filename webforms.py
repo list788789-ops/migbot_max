@@ -1476,7 +1476,7 @@ onsubmit="return confirm(&#39;Удалить скан?&#39;)">
 <form method="post" action="/employees/{emp.id}/scan/upload" enctype="multipart/form-data" style="margin-top:8px">
 <input type="hidden" name="scan_type" value="{_st}">
 <input type="file" name="files" accept="application/pdf,image/*" multiple required style="display:block;width:100%;margin:8px 0;padding:10px;border:1px solid #d9dde3;border-radius:8px;background:#fff;font-size:16px">
-<p class="muted" style="margin:4px 0 0;font-size:13px">Можно выбрать несколько PDF (напр. паспорт на 2 страницах) — объединятся в один файл.</p>
+<p class="muted" style="margin:4px 0 0;font-size:13px">Можно выбрать несколько файлов сразу (напр. 2 фото удостоверения — лицевая и оборотная) — склеятся в один PDF.</p>
 <button type="submit" class="btn-full">Загрузить</button></form>
 <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">{_actions}</div>
 </div>'''
@@ -2989,25 +2989,37 @@ async def employee_scan_upload(
         # один файл — как есть
         data, ct = parts[0]
     else:
-        # несколько файлов — склеиваем в один PDF (страницы документа). Все части должны быть
-        # PDF; если среди них есть не-PDF, склейка PDF невозможна — просим PDF.
+        # Несколько файлов — склеиваем в один PDF. Поддерживаем PDF И изображения (PNG/JPG):
+        # фото страниц удостоверения конвертируются в страницы PDF, PDF-части добавляются как есть.
+        # Итог — один многостраничный PDF под одним ключом (вторая страница не затирает первую).
         try:
             import io
             from pypdf import PdfWriter, PdfReader
+            from PIL import Image
             writer = PdfWriter()
             for b, pct in parts:
-                if "pdf" not in (pct or "").lower():
-                    raise ValueError("не PDF")
-                reader = PdfReader(io.BytesIO(b))
-                for page in reader.pages:
-                    writer.add_page(page)
+                low = (pct or "").lower()
+                if "pdf" in low:
+                    reader = PdfReader(io.BytesIO(b))
+                    for page in reader.pages:
+                        writer.add_page(page)
+                else:
+                    # изображение -> одностраничный PDF -> добавить страницу
+                    im = Image.open(io.BytesIO(b))
+                    if im.mode != "RGB":
+                        im = im.convert("RGB")
+                    tmp = io.BytesIO()
+                    im.save(tmp, format="PDF")
+                    tmp.seek(0)
+                    for page in PdfReader(tmp).pages:
+                        writer.add_page(page)
             out = io.BytesIO()
             writer.write(out)
             data = out.getvalue()
             ct = "application/pdf"
         except Exception:
-            raise HTTPException(400, "Несколько файлов можно объединить только если все они PDF. "
-                                     "Загрузите страницы в формате PDF (по одному листу на файл).")
+            raise HTTPException(400, "Не удалось объединить файлы. Загрузите страницы как PDF "
+                                     "или фото (PNG/JPG) — они склеятся в один PDF.")
 
     if len(data) > 15 * 1024 * 1024:
         raise HTTPException(400, "Итоговый файл больше 15 МБ — сожмите страницы.")
