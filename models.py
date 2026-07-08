@@ -181,6 +181,9 @@ class Employee(Base):
     birth_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     passport_series: Mapped[str | None] = mapped_column(String, nullable=True)
     passport_number: Mapped[str | None] = mapped_column(String, nullable=True)
+    # ИИН (12 цифр, Казахстан). Из MRZ удостоверения или вручную. Требует ALTER на проде:
+    #   ALTER TABLE employees ADD COLUMN iin VARCHAR;
+    iin: Mapped[str | None] = mapped_column(String, nullable=True)
     address: Mapped[str | None] = mapped_column(Text, nullable=True)
     entry_country: Mapped[str | None] = mapped_column(String, nullable=True)  # "откуда въехал"
     # Свободный текст, не дата: в таблице это либо дата+заметка ("25.07.2026 Хостел"), либо пусто.
