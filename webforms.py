@@ -168,6 +168,7 @@ S3_SECRET_KEY = os.environ.get("S3_SECRET_KEY", "")
 SCAN_TYPES = {
     "passport": "Паспорт работника (все страницы)",
     "migration_card": "Миграционная карта",
+    "arrival_notice": "Уведомление о прибытии (отрывная часть с Госуслуг)",
     "payment_registration": "Исполненная платёжка — постановка на учёт (500 ₽)",
     "payment_renewal": "Исполненная платёжка — продление регистрации (1000 ₽)",
 }
@@ -334,8 +335,11 @@ def _package_missing(emp, present: dict | None = None, common: dict | None = Non
     if common is None:
         common = _s3_list_common()
     missing = []
+    # Не требуем для комплектности: платёжки (логика пошлин позже) и уведомление о прибытии
+    # (это подтверждение постановки на учёт, а не документ, подаваемый В пакете Госуслуг).
+    _optional = PAYMENT_SCAN_TYPES | {"arrival_notice"}
     for st, label in SCAN_TYPES.items():
-        if st in PAYMENT_SCAN_TYPES:
+        if st in _optional:
             continue
         _i = present.get(st) or {}
         if not _i.get("present"):
@@ -2073,6 +2077,7 @@ def employee_save(
     contract_date: str = Form(""),
     address: str = Form(""),
     address_since: str = Form(""),
+    registration_valid_until: str = Form(""),
     dactyloscopy_date: str = Form(""),
     confirmed: str = Form(""),
     db: Session = Depends(get_db),
