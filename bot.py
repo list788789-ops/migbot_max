@@ -424,7 +424,7 @@ async def _execute_delete_employee(responder: "_Responder", employee_id: str) ->
             await responder.send("Сотрудник уже удалён или не найден.")
             return
         full_name = employee.full_name
-        session.delete(employee)  # каскад удалит consents/obligations/documents/
+        session.delete(employee)  # каскад удалит consents/obligations/
         # registration_periods/referrals/invoices — см. cascade="all, delete-orphan" в models.py
         session.commit()
 
