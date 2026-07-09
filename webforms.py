@@ -867,6 +867,13 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
     awaiting_result = db.scalars(
         select(Referral).where(Referral.exam_status == ExamStatus.REFERRED)
     ).all()
+    # Из тех, кому нужно направление — у кого прошло >=5 дней от въезда ("пора выдавать").
+    _today_dash = date.today()
+    urge_referral = 0
+    for _o in need_referral:
+        _emp_u = db.get(Employee, _o.employee_id)
+        if _emp_u and _emp_u.entry_date and (_today_dash - _emp_u.entry_date).days >= 5:
+            urge_referral += 1
 
     def attention_row(e: Employee, badges: list[str]) -> str:
         return (
@@ -921,7 +928,7 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
 <section>
 <h2>Медкомиссия</h2>
 <div class="card">Нужно направление: {len(need_referral)}<br>
-Ждут результата: {len(awaiting_result)}<br>
+{('<b style="color:#c47f00">Пора выдать (5+ дней от въезда): ' + str(urge_referral) + '</b><br>') if urge_referral else ''}Ждут результата: {len(awaiting_result)}<br>
 <a class="btn" href="/medical">Открыть раздел</a></div>
 </section>
 
@@ -2245,9 +2252,20 @@ def medical_list(request: Request, db: Session = Depends(get_db)):
     def awaiting_row(r: Referral) -> str:
         emp = r.employee if hasattr(r, "employee") else None
         name = emp.full_name if emp else db.get(Employee, r.employee_id).full_name
+        # Внутренний дедлайн 14 дней от направления: 10 дней на врачей + 4 на справку.
+        _days = (date.today() - r.referral_date).days
+        _left = 14 - _days
+        if _days > 14:
+            _status = f'<b style="color:#b00">⚠ Справка просрочена (прошло {_days} дн., внутренний срок 14)</b>'
+        elif _days >= 10:
+            _status = f'<b style="color:#c47f00">Ждём справку — прошло {_days} дн. из 14 (осталось {_left})</b>'
+        else:
+            _status = f'<span class="muted">идёт: прошло {_days} дн. из 14 (комиссию пройти к 10-му дню)</span>'
         return (
             f'<div class="card">{name}<br>'
             f'<span class="muted">направлен {r.referral_date.isoformat()}</span><br>'
+            f'{_status}<br>'
+            f'<span class="muted" style="font-size:13px">Завершение — загрузка скана справки в карточке работника.</span><br>'
             f'<form class="inline" method="post" action="/medical/{r.employee_id}/result">'
             f'<input type="hidden" name="result" value="done">'
             f'<button type="submit">✅ Пройдено</button></form>'
@@ -3077,6 +3095,41 @@ def _process_image(data: bytes) -> bytes:
         return data  # не изображение или ошибка — как есть
 
 
+def _close_medical_on_cert(db, employee_id: str) -> None:
+    """Скан справки загружен -> медкомиссия пройдена: Referral=COMPLETED (+result_date),
+    связанное Obligation(MEDICAL_EXAM)=DONE. Останавливает отсчёт 14 дней."""
+    from models import Referral, ExamStatus, Obligation, ObligationType, ObligationStatus
+    refs = db.scalars(
+        select(Referral).where(Referral.employee_id == employee_id)
+        .where(Referral.exam_status != ExamStatus.COMPLETED)
+    ).all()
+    for r in refs:
+        r.exam_status = ExamStatus.COMPLETED
+        if not r.result_date:
+            r.result_date = date.today()
+        ob = db.get(Obligation, r.obligation_id)
+        if ob is not None and ob.status != ObligationStatus.DONE:
+            ob.status = ObligationStatus.DONE
+    db.commit()
+
+
+def _reopen_medical_on_cert_delete(db, employee_id: str) -> None:
+    """Скан справки удалён -> откат медкомиссии: Referral обратно REFERRED, Obligation в PENDING.
+    Возобновляет отсчёт (скан — единственный критерий завершения)."""
+    from models import Referral, ExamStatus, Obligation, ObligationStatus
+    refs = db.scalars(
+        select(Referral).where(Referral.employee_id == employee_id)
+        .where(Referral.exam_status == ExamStatus.COMPLETED)
+    ).all()
+    for r in refs:
+        r.exam_status = ExamStatus.REFERRED
+        r.result_date = None
+        ob = db.get(Obligation, r.obligation_id)
+        if ob is not None and ob.status == ObligationStatus.DONE:
+            ob.status = ObligationStatus.PENDING
+    db.commit()
+
+
 @app.post("/employees/{employee_id}/scan/upload")
 async def employee_scan_upload(
     employee_id: str,
@@ -3179,6 +3232,9 @@ async def employee_scan_upload(
         _s3_upload(scan_type, eid, data, ct, metadata=_meta)
     except RuntimeError as e:
         raise HTTPException(500, str(e))
+    # Скан справки медкомиссии -> закрываем медобязательство (COMPLETED/DONE).
+    if scan_type == "medical_certificate":
+        _close_medical_on_cert(db, employee_id)
     return RedirectResponse(f"/employees/{employee_id}{warn}", status_code=303)
 
 
@@ -3252,6 +3308,9 @@ def employee_scan_delete(
         _s3_delete(scan_type, eid)
     except RuntimeError as e:
         raise HTTPException(500, str(e))
+    # Удалён скан справки -> откат медкомиссии в ожидание.
+    if scan_type == "medical_certificate":
+        _reopen_medical_on_cert_delete(db, employee_id)
     return RedirectResponse(f"/employees/{employee_id}", status_code=303)
 
 
