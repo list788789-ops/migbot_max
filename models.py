@@ -184,6 +184,12 @@ class Employee(Base):
     # ИИН (12 цифр, Казахстан). Из MRZ удостоверения или вручную. Требует ALTER на проде:
     #   ALTER TABLE employees ADD COLUMN iin VARCHAR;
     iin: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Вид документа: "id" (удостоверение TD1) или "passport" (загранпаспорт TD3). Из OCR.
+    #   ALTER TABLE employees ADD COLUMN doc_type VARCHAR;
+    doc_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Чекбокс: все страницы паспорта загружены (система не считает страницы, подтверждает кадровик).
+    #   ALTER TABLE employees ADD COLUMN passport_all_pages BOOLEAN DEFAULT FALSE;
+    passport_all_pages: Mapped[bool] = mapped_column(Boolean, default=False)
     address: Mapped[str | None] = mapped_column(Text, nullable=True)
     entry_country: Mapped[str | None] = mapped_column(String, nullable=True)  # "откуда въехал"
     # Свободный текст, не дата: в таблице это либо дата+заметка ("25.07.2026 Хостел"), либо пусто.
