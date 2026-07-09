@@ -150,12 +150,6 @@ class PaymentStatus(str, enum.Enum):
     PAID = "paid"
 
 
-class DocumentType(str, enum.Enum):
-    PASSPORT_TRANSLATION = "passport_translation"
-    MEDICAL_CERTIFICATE = "medical_certificate"
-    REGISTRATION_PROOF = "registration_proof"
-
-
 class Employee(Base):
     __tablename__ = "employees"
 
@@ -246,7 +240,6 @@ class Employee(Base):
 
     consents: Mapped[list["Consent"]] = relationship(back_populates="employee", cascade="all, delete-orphan")
     obligations: Mapped[list["Obligation"]] = relationship(back_populates="employee", cascade="all, delete-orphan")
-    documents: Mapped[list["Document"]] = relationship(back_populates="employee", cascade="all, delete-orphan")
     registration_periods: Mapped[list["RegistrationPeriod"]] = relationship(
         back_populates="employee", cascade="all, delete-orphan"
     )
@@ -410,17 +403,3 @@ class Invoice(Base):
     invoice_document: Mapped[str | None] = mapped_column(String, nullable=True)  # file_id сгенерированного счёта
 
     referral: Mapped["Referral"] = relationship(back_populates="invoices")
-
-
-class Document(Base):
-    __tablename__ = "documents"
-
-    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
-    employee_id: Mapped[str] = mapped_column(ForeignKey("employees.id"), nullable=False)
-
-    type: Mapped[DocumentType] = mapped_column(Enum(DocumentType), nullable=False)
-    file_id: Mapped[str] = mapped_column(String, nullable=False)  # ссылка/id вложения в MAX
-    uploaded_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    verified: Mapped[bool] = mapped_column(Boolean, default=False)  # ручная верификация кадровиком
-
-    employee: Mapped["Employee"] = relationship(back_populates="documents")
