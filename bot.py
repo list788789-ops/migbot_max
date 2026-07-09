@@ -154,15 +154,37 @@ class _Responder:
 
 
 def _build_main_menu() -> InlineKeyboardBuilder:
+    """Главное меню — разделы. Пункты внутри разделов: _build_section_menu().
+    Структура расширяемая: чтобы добавить пункт — допиши в нужный раздел ниже."""
     builder = InlineKeyboardBuilder()
-    builder.row(CallbackButton(text="➕ Добавить сотрудника", payload="menu:add_employee"))
-    builder.row(CallbackButton(text="📋 Список сотрудников", payload="menu:employees"))
-    builder.row(CallbackButton(text="⏳ Без даты въезда", payload="menu:incomplete"))
-    builder.row(CallbackButton(text="🗑 Удалить сотрудника (тест)", payload="menu:delete_employee"))
-    builder.row(CallbackButton(text="🖊 Ожидают согласия", payload="menu:pending_consent"))
-    builder.row(CallbackButton(text="🗓 Без даты договора", payload="menu:contractdate"))
-    builder.row(CallbackButton(text="📎 Документы работника", payload="menu:docpick"))
+    builder.row(CallbackButton(text="👥 Сотрудники", payload="menu:section:employees"))
+    builder.row(CallbackButton(text="⚠️ Требует внимания", payload="menu:section:attention"))
+    builder.row(CallbackButton(text="📊 Отчёты", payload="menu:section:reports"))
     return builder
+
+
+def _build_section_menu(section: str) -> InlineKeyboardBuilder:
+    """Подменю раздела. Внизу каждого — кнопка «Назад» в главное меню (menu:main)."""
+    builder = InlineKeyboardBuilder()
+    if section == "employees":
+        builder.row(CallbackButton(text="➕ Добавить сотрудника", payload="menu:add_employee"))
+        builder.row(CallbackButton(text="📋 Список сотрудников", payload="menu:employees"))
+        builder.row(CallbackButton(text="📎 Документы работника", payload="menu:docpick"))
+    elif section == "attention":
+        builder.row(CallbackButton(text="⏳ Без даты въезда", payload="menu:incomplete"))
+        builder.row(CallbackButton(text="🗓 Без даты договора", payload="menu:contractdate"))
+        builder.row(CallbackButton(text="🖊 Ожидают согласия", payload="menu:pending_consent"))
+    elif section == "reports":
+        builder.row(CallbackButton(text="🚧 Раздел в разработке", payload="menu:main"))
+    builder.row(CallbackButton(text="⬅️ Назад", payload="menu:main"))
+    return builder
+
+
+_SECTION_TITLES = {
+    "employees": "👥 Сотрудники",
+    "attention": "⚠️ Требует внимания",
+    "reports": "📊 Отчёты (в разработке)",
+}
 
 
 async def _start_add_employee_flow(responder: "_Responder") -> None:
@@ -536,6 +558,16 @@ async def on_callback(event: MessageCallback):
         return
 
     responder = _Responder(event)
+
+    # Навигация по разделам меню.
+    if payload == "menu:main":
+        await responder.send(text="Главное меню:", attachments=[_build_main_menu().as_markup()])
+        return
+    if payload.startswith("menu:section:"):
+        section = payload.split(":", 2)[2]
+        title = _SECTION_TITLES.get(section, "Раздел")
+        await responder.send(text=title, attachments=[_build_section_menu(section).as_markup()])
+        return
 
     if payload == "menu:add_employee":
         await _start_add_employee_flow(responder)
