@@ -494,12 +494,19 @@ async def _deliver_document_list(responder: "_Responder", employee_id: str) -> N
     present = _s3_list_for_employee(employee_id)
     available = [(st, SCAN_TYPES[st]) for st in SCAN_TYPES if (present.get(st) or {}).get("present")]
     if not available:
-        await responder.send(f"У {full_name} нет загруженных документов.")
+        # даже если документов нет — даём кнопку возврата к списку работников (не тупик)
+        builder = InlineKeyboardBuilder()
+        builder.row(CallbackButton(text="⬅️ Назад к списку", payload="menu:docpick"))
+        await responder.send(
+            text=f"У {full_name} нет загруженных документов.",
+            attachments=[builder.as_markup()],
+        )
         return
 
     builder = InlineKeyboardBuilder()
     for st, label in available:
         builder.row(CallbackButton(text=label[:60], payload=f"docget:{employee_id}:{st}"))
+    builder.row(CallbackButton(text="⬅️ Назад к списку", payload="menu:docpick"))
     await responder.send(
         text=f"Документы: {full_name}\nВыберите документ для скачивания:",
         attachments=[builder.as_markup()],
