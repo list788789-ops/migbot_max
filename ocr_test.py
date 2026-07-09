@@ -124,27 +124,34 @@ def _run_ocr(image_bytes: bytes) -> str:
     citizenship_raw = None
     citizenship_corrected = False
     try:
+        import re as _re
         raw = (d.get("raw_text", "") or "")
-        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-        if lines:
-            l1 = lines[0].replace(" ", "")
-            # optional first line: символы с 15-й позиции (после IDKAZ+9номер+1контр)
-            opt1 = l1[15:].replace("<", "")
-            if len(opt1) >= 12 and opt1[:12].isdigit():
-                iin = opt1[:12]
-        if len(lines) >= 2:
-            l2 = lines[1].replace(" ", "")
-            # гражданство: позиции 15-18 второй строки. OCR часто искажает Z<->L, Z<->2 —
-            # KAZ читается как KAL/KA2/KAI. Раз все работники граждане Казахстана, распознанное
-            # «похоже на KAZ» нормализуем в KAZ (с пометкой), точное KAZ оставляем как есть.
-            cand = l2[15:18]
-            if cand == "KAZ":
-                citizenship_raw = "KAZ"
-            elif cand[:2] == "KA":  # KAL, KA2, KAI и т.п. — искажённое KAZ
-                citizenship_raw = "KAZ"
-                citizenship_corrected = True
-            elif cand.isalpha():
-                citizenship_raw = cand
+        dob6 = (d.get("date_of_birth") or "").strip()
+        lines = [ln.replace(" ", "") for ln in raw.splitlines() if ln.strip()]
+        # ИИН по СТРУКТУРЕ: TD1 (ID, 3 стр ~30) — optional 1-й строки; TD3 (загранпаспорт,
+        # 2 стр ~44) — optional 2-й строки (поз. 28-42). Первые 6 цифр = дата рождения.
+        optionals = []
+        if len(lines) >= 3 and len(lines[0]) <= 32:
+            optionals.append(lines[0][15:])
+        if len(lines) >= 2 and len(lines[1]) >= 40:
+            optionals.append(lines[1][28:42])
+        for opt in optionals:
+            digits = opt.replace("<", "")
+            done = False
+            for m in _re.finditer(r"\d{12}", digits):
+                if dob6 and m.group()[:6] == dob6:
+                    iin = m.group(); done = True; break
+            if done:
+                break
+            if len(digits) == 12 and digits.isdigit():
+                iin = digits; break
+        # гражданство: нормализуем искажённое KAZ (passporteye даёт nationality; KA?->KAZ)
+        _nat = (d.get("nationality") or "").strip()
+        if _nat == "KAZ":
+            citizenship_raw = "KAZ"
+        elif _nat[:2] == "KA":
+            citizenship_raw = "KAZ"
+            citizenship_corrected = True
     except Exception:
         pass
 
