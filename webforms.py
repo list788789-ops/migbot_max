@@ -2962,14 +2962,34 @@ def _ocr_id_card(image_bytes: bytes) -> dict:
             res["birth_date"] = f"{year:04d}-{mm}-{dd}"
         except Exception:
             res["birth_date"] = ""
+    # ИИН (12 цифр) — ищем в OPTIONAL-поле MRZ по СТРУКТУРЕ формата (не regex по всей строке,
+    # иначе цепляются невыровненные окна из соседних полей). ID-карта (TD1, 3 строки ~30):
+    # optional в конце 1-й строки. Загранпаспорт (TD3, 2 строки ~44): optional в 2-й строке
+    # (позиции 28-42). Подтверждаем: первые 6 цифр ИИН = дата рождения.
     iin = ""
     try:
+        import re as _re
         raw = (d.get("raw_text", "") or "")
-        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-        if lines:
-            opt1 = lines[0].replace(" ", "")[15:].replace("<", "")
-            if len(opt1) >= 12 and opt1[:12].isdigit():
-                iin = opt1[:12]
+        dob6 = (d.get("date_of_birth") or "").strip()  # ГГММДД
+        lines = [ln.replace(" ", "") for ln in raw.splitlines() if ln.strip()]
+        optionals = []
+        if len(lines) >= 3 and len(lines[0]) <= 32:      # TD1 — ID-карта
+            optionals.append(lines[0][15:])
+        if len(lines) >= 2 and len(lines[1]) >= 40:      # TD3 — загранпаспорт
+            optionals.append(lines[1][28:42])
+        for opt in optionals:
+            digits = opt.replace("<", "")
+            matched = False
+            for m in _re.finditer(r"\d{12}", digits):
+                if dob6 and m.group()[:6] == dob6:
+                    iin = m.group()
+                    matched = True
+                    break
+            if matched:
+                break
+            if len(digits) == 12 and digits.isdigit():
+                iin = digits
+                break
     except Exception:
         pass
     res["iin"] = iin
