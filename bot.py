@@ -40,6 +40,7 @@
 import asyncio
 import logging
 import os
+import tempfile
 from datetime import datetime, timezone, timedelta
 
 MSK = timezone(timedelta(hours=3))  # Мурманская обл. — московское время, без перехода на летнее с 2014
@@ -70,6 +71,9 @@ from models import (
 )
 from obligations import create_obligations_for_employee
 from consent_texts import get_consent_text  # см. consent_texts.py
+from s3_storage import (
+    SCAN_TYPES, _s3_list_for_employee, _s3_download, _ext_for,
+)
 from document_templates import (
     TEST_ALLOW_MISSING_FIELDS,
     check_consent_fields,
@@ -157,6 +161,7 @@ def _build_main_menu() -> InlineKeyboardBuilder:
     builder.row(CallbackButton(text="🗑 Удалить сотрудника (тест)", payload="menu:delete_employee"))
     builder.row(CallbackButton(text="🖊 Ожидают согласия", payload="menu:pending_consent"))
     builder.row(CallbackButton(text="🗓 Без даты договора", payload="menu:contractdate"))
+    builder.row(CallbackButton(text="📎 Документы работника", payload="menu:docpick"))
     return builder
 
 
@@ -194,6 +199,7 @@ PICKER_PAGE_SIZE = 25  # запас от подтверждённого лими
 
 PICKER_TITLES = {
     "empdate": "Без даты въезда",
+    "docpick": "Выберите работника — посмотреть документы",
     "delpick": "Выберите сотрудника для удаления (тест, необратимо)",
     "consentpick": "Ожидают согласия",
     "contractdate": "Без даты договора",
@@ -209,6 +215,8 @@ def _picker_employees(session: Session, prefix: str) -> list[Employee]:
             .all()
         )
     if prefix == "delpick":
+        return session.query(Employee).order_by(Employee.full_name).all()
+    if prefix == "docpick":
         return session.query(Employee).order_by(Employee.full_name).all()
     if prefix == "consentpick":
         return (
@@ -429,6 +437,73 @@ async def on_incomplete(event: MessageCreated):
     await _deliver_picker(_Responder(event), "empdate")
 
 
+async def _deliver_document_list(responder: "_Responder", employee_id: str) -> None:
+    """Показывает загруженные документы работника кнопками. Скачивание — по нажатию (docget)."""
+    with Session(engine) as session:
+        employee = session.get(Employee, employee_id)
+        if employee is None:
+            await responder.send("Сотрудник не найден.")
+            return
+        full_name = employee.full_name
+
+    present = _s3_list_for_employee(employee_id)
+    available = [(st, SCAN_TYPES[st]) for st in SCAN_TYPES if (present.get(st) or {}).get("present")]
+    if not available:
+        await responder.send(f"У {full_name} нет загруженных документов.")
+        return
+
+    builder = InlineKeyboardBuilder()
+    for st, label in available:
+        builder.row(CallbackButton(text=label[:60], payload=f"docget:{employee_id}:{st}"))
+    await responder.send(
+        text=f"Документы: {full_name}\nВыберите документ для скачивания:",
+        attachments=[builder.as_markup()],
+    )
+
+
+async def _send_employee_document(responder: "_Responder", employee_id: str, scan_type: str) -> None:
+    """Скачивает документ из S3 и отправляет файлом в чат. Имя файла — ФИО_тип.ext."""
+    if scan_type not in SCAN_TYPES:
+        await responder.send("Неизвестный тип документа.")
+        return
+    with Session(engine) as session:
+        employee = session.get(Employee, employee_id)
+        if employee is None:
+            await responder.send("Сотрудник не найден.")
+            return
+        full_name = employee.full_name
+
+    try:
+        data, ct = _s3_download(scan_type, employee_id)
+    except RuntimeError as e:
+        await responder.send(f"Не удалось получить документ: {e}")
+        return
+
+    # временный файл с осмысленным именем (ФИО_тип.ext) — MAX покажет его как имя вложения
+    fio = (full_name or "работник").replace(" ", "_")
+    type_name = SCAN_TYPES[scan_type].split("(")[0].strip().replace(" ", "_")
+    ext = _ext_for(ct)
+    fname = f"{fio}_{type_name}.{ext}"
+    tmpdir = tempfile.mkdtemp()
+    path = os.path.join(tmpdir, fname)
+    try:
+        with open(path, "wb") as f:
+            f.write(data)
+        await responder.send(
+            text=f"Документ: {full_name} — {SCAN_TYPES[scan_type]}",
+            attachments=[InputMedia(path=path)],
+        )
+    except Exception:
+        log.exception("Не удалось отправить документ %s работника %s", scan_type, employee_id)
+        await responder.send("Ошибка отправки файла. Попробуйте ещё раз.")
+    finally:
+        try:
+            os.remove(path)
+            os.rmdir(tmpdir)
+        except Exception:
+            pass
+
+
 @dp.message_callback()
 async def on_callback(event: MessageCallback):
     """Единая точка входа для всех кнопок: главное меню (payload='menu:...') и выбор
@@ -497,6 +572,22 @@ async def on_callback(event: MessageCallback):
 
     if payload == "menu:delete_employee":
         await _deliver_picker(responder, "delpick")
+        return
+
+    if payload == "menu:docpick":
+        await _deliver_picker(responder, "docpick")
+        return
+
+    if payload.startswith("docpick:"):
+        # выбран работник — показываем его загруженные документы кнопками
+        employee_id = payload.split(":", 1)[1]
+        await _deliver_document_list(responder, employee_id)
+        return
+
+    if payload.startswith("docget:"):
+        # скачать конкретный документ: docget:<employee_id>:<scan_type>
+        _, employee_id, scan_type = payload.split(":", 2)
+        await _send_employee_document(responder, employee_id, scan_type)
         return
 
     if payload.startswith("delpick:"):
