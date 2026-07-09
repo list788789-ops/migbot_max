@@ -2931,7 +2931,6 @@ def employee_passport_pages(
     return RedirectResponse(f"/employees/{employee_id}", status_code=303)
 
 
-@app.post("/employees/{employee_id}/scan/upload")
 def _translit_iso(s: str) -> str:
     """Обратный транслит латиница->кириллица для ЧЕРНОВИКА ФИО. Неоднозначен — только подсказка
     под ручную сверку с кириллицей на карте. Эвристика: казахское -AYEV/-AYEVA -> -аев/-аева."""
@@ -3078,6 +3077,7 @@ def _process_image(data: bytes) -> bytes:
         return data  # не изображение или ошибка — как есть
 
 
+@app.post("/employees/{employee_id}/scan/upload")
 async def employee_scan_upload(
     employee_id: str,
     request: Request,
