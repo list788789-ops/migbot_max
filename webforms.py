@@ -983,8 +983,11 @@ def employees_list(request: Request, db: Session = Depends(get_db)):
             f'<a class="btn" href="/employees/{e.id}">Открыть карточку</a></div>'
         )
 
-    active = [e for e in employees if e.entry_date is not None]
-    awaiting = [e for e in employees if e.entry_date is None]
+    # Уволенные (contract_end_date заполнен) -> в архив, из основного списка убираем.
+    working = [e for e in employees if e.contract_end_date is None]
+    active = [e for e in working if e.entry_date is not None]
+    awaiting = [e for e in working if e.entry_date is None]
+    archived_count = sum(1 for e in employees if e.contract_end_date is not None)
 
     active_rows = "".join(row(e) for e in active) or '<p class="muted">Нет активных сотрудников.</p>'
     active_section = (
@@ -1026,16 +1029,51 @@ function _filterEmployees(){
   });
 }
 </script>"""
+    _archive_link = (
+        f'<a class="btn secondary" href="/archive">Архив уволенных ({archived_count})</a>'
+        if archived_count else ''
+    )
     return _render(
         "Сотрудники",
-        f'<h1>Сотрудники ({len(employees)})</h1>'
-        f'<p><a class="btn" href="/employees/new">+ Добавить сотрудника</a></p>'
+        f'<h1>Сотрудники ({len(working)})</h1>'
+        f'<p><a class="btn" href="/employees/new">+ Добавить сотрудника</a> {_archive_link}</p>'
         f'{_search_box}'
         f'{active_section}{awaiting_section}'
         f'{_search_js}',
         active="employees",
         role=request.session.get("role", ""),
     )
+
+
+@app.get("/archive", response_class=HTMLResponse)
+def employees_archive(request: Request, db: Session = Depends(get_db)):
+    """Архив уволенных сотрудников (contract_end_date заполнен). Их обязательства (уведомление
+    об убытии и пр.) остаются в задачах/дашборде — здесь только список для истории/справок."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    archived = db.scalars(
+        select(Employee).where(Employee.contract_end_date.is_not(None))
+        .order_by(Employee.full_name)
+    ).all()
+    if not archived:
+        body = ('<h1>Архив уволенных</h1>'
+                '<p class="muted">Уволенных сотрудников нет.</p>'
+                '<p><a class="btn secondary" href="/employees">← К сотрудникам</a></p>')
+        return _render("Архив", body, active="employees", role=request.session.get("role", ""))
+    rows = ""
+    for e in archived:
+        _end = e.contract_end_date.isoformat() if e.contract_end_date else "—"
+        rows += (
+            f'<div class="card"><b>{html.escape(e.full_name)}</b><br>'
+            f'<span class="muted">уволен: {_end}</span><br>'
+            f'<a class="btn secondary" href="/employees/{e.id}">Открыть карточку</a></div>'
+        )
+    body = (
+        f'<h1>Архив уволенных ({len(archived)})</h1>'
+        f'<p><a class="btn secondary" href="/employees">← К действующим сотрудникам</a></p>'
+        f'<section class="grid">{rows}</section>'
+    )
+    return _render("Архив", body, active="employees", role=request.session.get("role", ""))
 
 
 # --- Создание нового сотрудника ---------------------------------------------
