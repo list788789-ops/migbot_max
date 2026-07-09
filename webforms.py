@@ -190,6 +190,12 @@ def _package_missing(emp, present: dict | None = None, common: dict | None = Non
             missing.append(label)
     if emp.contract_date is None:
         missing.append("Трудовой договор (не заключён)")
+    # Для загранпаспорта — нужны все страницы (подтверждается чекбоксом кадровика).
+    _is_passport = (emp.doc_type == "passport") or (
+        not emp.doc_type and (emp.passport_series or "").strip().upper() != "ID"
+    )
+    if _is_passport and not getattr(emp, "passport_all_pages", False):
+        missing.append("Паспорт: подтвердите загрузку всех страниц")
     return missing
 
 
@@ -1096,6 +1102,7 @@ def _new_employee_form_html(values: dict, error: str = "") -> str:
 <input type="text" name="iin" value="{html.escape(v.get('iin',''))}" placeholder="12 цифр">
 <p class="muted">Индивидуальный идентификационный номер (Казахстан). Можно распознать из фото.</p>
 </fieldset>
+<input type="hidden" name="doc_type" value="{html.escape(v.get('doc_type',''))}">
 
 <fieldset>
 <legend>Дата въезда (необязательно)</legend>
@@ -1150,13 +1157,18 @@ async def employee_new_ocr(request: Request, photo: UploadFile = File(...),
         return HTMLResponse(_render("Новый сотрудник",
             _new_employee_form_html(vals, note), active="employees",
             role=request.session.get("role", "")))
+    _dtype = ocr.get("doc_type", "id")
+    # Серия: для удостоверения (id) — "ID"; для загранпаспорта — обычно нет отдельной серии,
+    # весь номер в поле «номер», серию оставляем пустой (кадровик уточнит).
+    _series = "ID" if _dtype == "id" else ""
     values = {
         "full_name": ocr.get("full_name_translit", ""),
         "citizenship": ocr.get("citizenship") if ocr.get("citizenship") in CITIZENSHIP_OPTIONS else "Казахстан",
         "birth_date": ocr.get("birth_date", ""),
-        "passport_series": "ID",
+        "passport_series": _series,
         "passport_number": ocr.get("passport_number", ""),
         "iin": ocr.get("iin", ""),
+        "doc_type": _dtype,
         "_ocr_filled": True,
     }
     return HTMLResponse(_render("Новый сотрудник", _new_employee_form_html(values),
@@ -1172,6 +1184,7 @@ def employee_create(
     passport_series: str = Form("ID"),
     passport_number: str = Form(""),
     iin: str = Form(""),
+    doc_type: str = Form(""),
     entry_date: str = Form(""),
     contract_date: str = Form(""),
     phone: str = Form(""),
@@ -1235,6 +1248,7 @@ def employee_create(
         passport_series=ps,
         passport_number=pn,
         iin=(iin.strip() or None),
+        doc_type=(doc_type.strip() or None),
         entry_date=ed,
         contract_date=cd,
         phone=(phone.strip() or None),
@@ -1421,6 +1435,20 @@ onsubmit="return confirm(&#39;Удалить скан?&#39;)">
 <button type="submit" class="btn-full">Выгрузить пакет (ZIP) для Госуслуг</button>
 </form>'''
 
+        # Тип документа: passport явно, или (пусто И серия не "ID") -> считаем паспортом.
+        _is_passport = (emp.doc_type == "passport") or (
+            not emp.doc_type and (emp.passport_series or "").strip().upper() != "ID"
+        )
+        _passport_pages_block = ""
+        if _is_passport:
+            _checked = "checked" if getattr(emp, "passport_all_pages", False) else ""
+            _passport_pages_block = f'''<div style="margin:12px 0;padding:12px;border:1px solid #e0a800;border-radius:8px;background:#fff8e1">
+<b>Загранпаспорт:</b> нужны сканы ВСЕХ страниц (не только разворот с фото).
+<form method="post" action="/employees/{emp.id}/passport_pages" style="margin-top:8px">
+<label style="display:flex;align-items:center;gap:8px">
+<input type="checkbox" name="all_pages" {_checked} onchange="this.form.submit()">
+Все страницы паспорта загружены
+</label></form></div>'''
         _scans_section = f'''
 <fieldset id="scans-section">
 <legend>Пакет для Госуслуг</legend>
@@ -1428,6 +1456,7 @@ onsubmit="return confirm(&#39;Удалить скан?&#39;)">
 (подтверждение оплаты госпошлины из банка). PDF или фото, до 15 МБ. Общие документы (паспорт
 директора, основание на адрес) — на <a href="/common-docs">отдельной странице</a>.</p>
 {_rows}
+{_passport_pages_block}
 <hr>
 {_pkg_block}
 </fieldset>'''
@@ -1780,10 +1809,10 @@ value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
 <button type="submit" name="kind" value="renewal" class="btn-full">Квитанция: продление пребывания (1000 ₽) — .docx</button>
 </form>
 </fieldset>
+</div>
+</div>
 {_obligations_section}
 {_scans_section}
-</div>
-</div>
 <a class="btn secondary" href="/employees">← Ко всем сотрудникам</a>
 </section>"""
     # Кнопка «вниз к сканам» — только на карточке (там есть секция #scans-section). Скроллит к
@@ -2883,6 +2912,25 @@ def _payment_surname_check(pdf_bytes: bytes, full_name: str) -> bool | None:
         return None
 
 
+@app.post("/employees/{employee_id}/passport_pages")
+def employee_passport_pages(
+    employee_id: str,
+    request: Request,
+    all_pages: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    """Сохраняет чекбокс «все страницы паспорта загружены» (подтверждение кадровика)."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+    emp.passport_all_pages = bool(all_pages)  # чекбокс отмечен -> "on", иначе пусто
+    db.commit()
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+
 @app.post("/employees/{employee_id}/scan/upload")
 def _translit_iso(s: str) -> str:
     """Обратный транслит латиница->кириллица для ЧЕРНОВИКА ФИО. Неоднозначен — только подсказка
@@ -2993,6 +3041,14 @@ def _ocr_id_card(image_bytes: bytes) -> dict:
     except Exception:
         pass
     res["iin"] = iin
+    # Вид документа по формату MRZ: TD1 (3 строки ~30) — ID-карта; TD3 (2 строки ~44) — паспорт.
+    # Плюс тип из первой буквы MRZ: "P" = паспорт, "I"/"A"/"C" = ID/удостоверение.
+    _lines = [ln.replace(" ", "") for ln in (d.get("raw_text", "") or "").splitlines() if ln.strip()]
+    _doc_letter = (d.get("type") or "").upper()[:1]
+    if _doc_letter == "P" or (len(_lines) == 2 and len(_lines[0]) >= 40):
+        res["doc_type"] = "passport"
+    else:
+        res["doc_type"] = "id"
     nat = (d.get("nationality") or "").strip()
     res["citizenship"] = "Казахстан" if nat[:2] == "KA" else nat
     return res
