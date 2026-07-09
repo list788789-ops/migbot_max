@@ -3082,17 +3082,21 @@ async def employee_scan_upload(
     employee_id: str,
     request: Request,
     scan_type: str = Form(...),
-    files: list[UploadFile] = File(...),
+    files: list[UploadFile] = File(default=[]),
     db: Session = Depends(get_db),
 ):
     """Загрузка скана в хранилище. Доступ — кадровик/админ. Можно выбрать НЕСКОЛЬКО файлов
     (напр. паспорт на 2 страницах — два PDF): они склеиваются в один PDF под одним ключом,
-    чтобы вторая загрузка не затирала первую. Один файл — сохраняется как есть."""
+    чтобы вторая загрузка не затирала первую. Один файл — сохраняется как есть.
+    files необязателен на уровне FastAPI (default=[]), пустоту проверяем ниже — иначе строгий
+    File(...) даёт 422 на некоторых браузерах (десктоп по-разному шлёт multiple file input)."""
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
     _require_role(request, db, UserRole.KADROVIK)
     if scan_type not in SCAN_TYPES:
         raise HTTPException(400, "Неизвестный тип скана.")
+    if not files:
+        raise HTTPException(400, "Файл не выбран. Выберите PDF или фото и нажмите «Загрузить».")
     emp = db.get(Employee, employee_id)
     if emp is None:
         raise HTTPException(404, "Сотрудник не найден")
