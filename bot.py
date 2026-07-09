@@ -152,6 +152,29 @@ class _Responder:
             return user_id
         return self._event.message.sender.user_id
 
+    def current_message_id(self):
+        """ID сообщения, из которого пришёл callback (для редактирования на месте). None, если
+        событие не callback или структура иная."""
+        try:
+            if isinstance(self._event, MessageCallback):
+                return self._event.message.body.mid
+        except Exception:
+            pass
+        return None
+
+    async def show_menu(self, text: str, attachments):
+        """Показать меню: если это callback (нажали кнопку) — РЕДАКТИРУЕМ текущее сообщение,
+        чтобы не плодить копии меню в чате. Если редактирование недоступно/упало — отправляем
+        новое (fallback, поведение как раньше)."""
+        mid = self.current_message_id()
+        if mid is not None:
+            try:
+                await bot.edit_message(message_id=mid, text=text, attachments=attachments)
+                return
+            except Exception:
+                log.info("show_menu: edit_message не удался, шлём новое сообщение")
+        await self.send(text=text, attachments=attachments)
+
 
 def _build_main_menu() -> InlineKeyboardBuilder:
     """Главное меню — разделы. Пункты внутри разделов: _build_section_menu().
@@ -468,28 +491,6 @@ async def _deliver_document_list(responder: "_Responder", employee_id: str) -> N
             return
         full_name = employee.full_name
 
-    # ВРЕМЕННАЯ ДИАГНОСТИКА S3 (убрать после отладки): почему бот не видит документы, которые
-    # веб видит. Логируем настройки и прямой ответ хранилища, минуя тихий except в _s3_list.
-    try:
-        import s3_storage as _s3d
-        log.info("S3-DIAG: endpoint=%r bucket=%r region=%r access_len=%d secret_set=%s",
-                 _s3d.S3_ENDPOINT, _s3d.S3_BUCKET, _s3d.S3_REGION,
-                 len(_s3d.S3_ACCESS_KEY or ""), bool(_s3d.S3_SECRET_KEY))
-        try:
-            _client = _s3d._s3_client()
-            log.info("S3-DIAG: клиент создан OK")
-            _key = _s3d._scan_key("passport", employee_id)
-            log.info("S3-DIAG: проверяю ключ %r", _key)
-            try:
-                _client.head_object(Bucket=_s3d.S3_BUCKET, Key=_key)
-                log.info("S3-DIAG: head_object УСПЕХ — объект есть")
-            except Exception as _he:
-                log.info("S3-DIAG: head_object ОШИБКА: %r", _he)
-        except Exception as _ce:
-            log.info("S3-DIAG: клиент НЕ создан: %r", _ce)
-    except Exception as _de:
-        log.info("S3-DIAG: не удалось выполнить диагностику: %r", _de)
-
     present = _s3_list_for_employee(employee_id)
     available = [(st, SCAN_TYPES[st]) for st in SCAN_TYPES if (present.get(st) or {}).get("present")]
     if not available:
@@ -561,12 +562,12 @@ async def on_callback(event: MessageCallback):
 
     # Навигация по разделам меню.
     if payload == "menu:main":
-        await responder.send(text="Главное меню:", attachments=[_build_main_menu().as_markup()])
+        await responder.show_menu("Главное меню:", [_build_main_menu().as_markup()])
         return
     if payload.startswith("menu:section:"):
         section = payload.split(":", 2)[2]
         title = _SECTION_TITLES.get(section, "Раздел")
-        await responder.send(text=title, attachments=[_build_section_menu(section).as_markup()])
+        await responder.show_menu(title, [_build_section_menu(section).as_markup()])
         return
 
     if payload == "menu:add_employee":
