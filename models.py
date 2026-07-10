@@ -184,6 +184,17 @@ class Employee(Base):
     # Чекбокс: все страницы паспорта загружены (система не считает страницы, подтверждает кадровик).
     #   ALTER TABLE employees ADD COLUMN passport_all_pages BOOLEAN DEFAULT FALSE;
     passport_all_pages: Mapped[bool] = mapped_column(Boolean, default=False)
+    # СНИЛС. Нужен для корректного ЕФС-1 (реквизит). ЕФС-1 подаётся в срок независимо от СНИЛС
+    #   (срок ЕФС-1 жёсткий — 1 раб. день от договора; СНИЛС долгий), при появлении -> корректировка.
+    #   ALTER TABLE employees ADD COLUMN snils VARCHAR;
+    snils: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Вид процедуры получения СНИЛС: "new" — первичное, "merge" — объединение дублей (было
+    #   несколько СНИЛС от прошлых въездов, СФР сливает в один).
+    #   ALTER TABLE employees ADD COLUMN snils_procedure VARCHAR;
+    snils_procedure: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Дата записи в СФР на получение/объединение СНИЛС (если СНИЛС ещё нет).
+    #   ALTER TABLE employees ADD COLUMN snils_appointment_date DATE;
+    snils_appointment_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     address: Mapped[str | None] = mapped_column(Text, nullable=True)
     entry_country: Mapped[str | None] = mapped_column(String, nullable=True)  # "откуда въехал"
     # Свободный текст, не дата: в таблице это либо дата+заметка ("25.07.2026 Хостел"), либо пусто.
