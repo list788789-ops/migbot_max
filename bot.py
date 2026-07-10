@@ -71,6 +71,7 @@ from models import (
     Obligation,
     ObligationStatus,
     ObligationType,
+    SystemFlag,
 )
 from obligations import create_obligations_for_employee
 import tabel
@@ -946,6 +947,22 @@ async def on_callback(event: MessageCallback):
         await responder.send(f"{full_name}: причина проставлена.")
         return
 
+    if payload == "ack_never_marked":
+        today_s = date.today().isoformat()
+        with Session(engine) as session:
+            flag = session.get(SystemFlag, _NEVER_MARKED_ACK_KEY)
+            now = datetime.utcnow()
+            if flag is None:
+                flag = SystemFlag(key=_NEVER_MARKED_ACK_KEY, value=today_s, updated_at=now)
+                session.add(flag)
+            else:
+                flag.value = today_s
+                flag.updated_at = now
+            session.commit()
+        await responder.send("✔ Принято, сегодня повторно не пришлю. Если проблема не решена — "
+                              "напомню завтра утром.")
+        return
+
     if payload.startswith("rotconfirm:"):
         employee_id = payload.split(":", 1)[1]
         with Session(engine) as session:
@@ -1693,29 +1710,83 @@ async def on_attachment(event: MessageCreated):
     )
 
 
-async def rotation_reminders_job():
-    """Ежедневное напоминание за 3 дня до ожидаемого возврата с межвахты — с кнопками
-    подтвердить/продлить. Шлётся во все чаты из NotificationSubscriber (та же таблица,
-    что уже заведена под проактивные напоминания о дедлайнах).
+_NEVER_MARKED_ACK_KEY = "never_marked_ack_date"
 
-    2026-07: срочная проверка "явка без действующего договора" (get_marks_without_
-    valid_contract) НЕ шлётся сюда проактивно — NotificationSubscriber.chat_id не
-    связан с ролью пользователя (нет моста chat_id -> User), значит рассылка ушла бы
-    ВСЕМ подписавшимся, включая прораба, которому детали видеть не должны (см.
-    договорённость). Пока только пассивный пункт меню "🚨 ЕСТЬ ЯВКА БЕЗ ДОГОВОРА"
-    (menu:invalid_contract_marks) с проверкой роли — кадровик заходит сам."""
+
+async def morning_job():
+    """
+    Единый утренний джоб в 9:00 МСК (2026-07, слияние двух прежних джобов —
+    rotation_reminders_job и never_marked_job — плюс новая месячная проверка).
+    Три части, каждая своим сообщением(-ями), но один запуск планировщика:
+
+    1. Проблемные за месяц (неявки >= ABSENT_THRESHOLD ИЛИ выходные >=
+       WEEKEND_THRESHOLD, см. tabel.get_monthly_problems) — просто текстом.
+    2. Никогда не отмеченные (см. tabel.get_never_marked_employees) — с кнопкой
+       "✅ Ознакомлен", через SystemFlag не шлётся повторно в тот же день.
+    3. Возврат с межвахты в течение 3 дней (см. tabel.get_rotation_reminders) —
+       С КНОПКАМИ подтвердить/продлить, ТОЛЬКО если человек не встретился в
+       пункте 2 (никогда не отмеченные и "возвращается с межвахты" — взаимно
+       исключающие случаи на практике, но проверка на дубль сделана явно,
+       как просили — "если про неё ещё не упомянуто").
+
+    Рассылка во ВСЕ чаты NotificationSubscriber безопасна для всех трёх пунктов —
+    это работа прораба (вести отметки), не чувствительные детали обязательств
+    кадровика (та утечка обсуждалась и НЕ применяется здесь, см. старый
+    docstring rotation_reminders_job)."""
+    today = date.today()
+    today_s = today.isoformat()
     try:
         with Session(engine) as session:
+            monthly_problems = tabel.get_monthly_problems(session)
+            flag = session.get(SystemFlag, _NEVER_MARKED_ACK_KEY)
+            already_acked_today = flag is not None and flag.value == today_s
+            never_marked = [] if already_acked_today else tabel.get_never_marked_employees(session)
             reminders = tabel.get_rotation_reminders(session, days_before=3)
             chat_ids = [row.chat_id for row in session.query(NotificationSubscriber).all()]
     except Exception:
-        log.exception("rotation_reminders_job: не удалось прочитать напоминания")
+        log.exception("morning_job: не удалось прочитать данные")
         return
 
-    if not reminders or not chat_ids:
+    if not chat_ids:
         return
 
+    # 1. Месячные проблемные.
+    if monthly_problems:
+        lines = ["📊 За текущий месяц накопились неявки/выходные, требующие внимания:"]
+        for p in monthly_problems:
+            details = []
+            if p["absent_count"] >= tabel.ABSENT_THRESHOLD:
+                details.append(f"неявок: {p['absent_count']}")
+            if p["weekend_count"] >= tabel.WEEKEND_THRESHOLD:
+                details.append(f"выходных: {p['weekend_count']}")
+            lines.append(f"  • {p['name']} — {', '.join(details)}")
+        text = "\n".join(lines)
+        for chat_id in chat_ids:
+            try:
+                await bot.send_message(chat_id=chat_id, text=text)
+            except Exception:
+                log.exception("morning_job: не удалось отправить проблемных в chat_id=%s", chat_id)
+
+    # 2. Никогда не отмеченные.
+    never_marked_ids = set()
+    if never_marked:
+        never_marked_ids = {e.id for e in never_marked}
+        names = "\n".join(f"  • {e.full_name} (договор с {e.contract_date:%d.%m.%Y})"
+                           for e in never_marked)
+        text = (f"⚠️ Оформлены, но по ним ещё НИ РАЗУ не было отметки явки:\n{names}\n\n"
+                f"Возможно, забыли внести в утренний обход — проверьте и отметьте.")
+        kb = InlineKeyboardBuilder()
+        kb.row(CallbackButton(text="✅ Ознакомлен", payload="ack_never_marked"))
+        for chat_id in chat_ids:
+            try:
+                await bot.send_message(chat_id=chat_id, text=text, attachments=[kb.as_markup()])
+            except Exception:
+                log.exception("morning_job: не удалось отправить never_marked в chat_id=%s", chat_id)
+
+    # 3. Возврат с межвахты — пропускаем тех, кто уже упомянут в пункте 2.
     for r in reminders:
+        if r["employee_id"] in never_marked_ids:
+            continue
         kb = InlineKeyboardBuilder()
         kb.row(CallbackButton(text="✅ Подтверждаю возврат", payload=f"rotconfirm:{r['employee_id']}"))
         kb.row(CallbackButton(text="📅 Продлить межвахту", payload=f"rotextend:{r['employee_id']}"))
@@ -1725,12 +1796,12 @@ async def rotation_reminders_job():
             try:
                 await bot.send_message(chat_id=chat_id, text=text, attachments=[kb.as_markup()])
             except Exception:
-                log.exception("rotation_reminders_job: не удалось отправить в chat_id=%s", chat_id)
+                log.exception("morning_job: не удалось отправить напоминание в chat_id=%s", chat_id)
 
 
 async def main():
     scheduler = AsyncIOScheduler(timezone=MSK)
-    scheduler.add_job(rotation_reminders_job, CronTrigger(hour=9, minute=0))
+    scheduler.add_job(morning_job, CronTrigger(hour=9, minute=0))
     scheduler.start()
     await dp.start_polling(bot)
 
