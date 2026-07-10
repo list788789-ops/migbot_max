@@ -44,10 +44,30 @@ MIGR_DAILY_THRESHOLD = 5  # порог одновременных МУ за де
 # ================= АКТИВНЫЕ СОТРУДНИКИ =================
 
 def get_active_employees(session: Session) -> list[Employee]:
-    """Активные — без даты увольнения (contract_end_date IS NULL), см. договорённость."""
+    """Активные — без даты увольнения (contract_end_date IS NULL), И договор уже
+    начался (contract_date заполнен и <= сегодня). Кто заведён в базу, но договор
+    ещё не наступил или не проставлен — считается "на оформлении", в табель не
+    попадает (см. договорённость 2026-07). Такие видны кадровику отдельно —
+    см. get_onboarding_employees ниже."""
+    today = date.today()
     return (
         session.query(Employee)
         .filter(Employee.contract_end_date.is_(None))
+        .filter(Employee.contract_date.isnot(None))
+        .filter(Employee.contract_date <= today)
+        .order_by(Employee.full_name)
+        .all()
+    )
+
+
+def get_onboarding_employees(session: Session) -> list[Employee]:
+    """Кто заведён в базу, но договор ещё не начался (нет даты, или дата в будущем) —
+    "на оформлении". Не показывается в табеле, отдельная задача кадровику."""
+    today = date.today()
+    return (
+        session.query(Employee)
+        .filter(Employee.contract_end_date.is_(None))
+        .filter((Employee.contract_date.is_(None)) | (Employee.contract_date > today))
         .order_by(Employee.full_name)
         .all()
     )
