@@ -294,7 +294,10 @@ class RotationReturn(Base):
     __tablename__ = "rotation_returns"
 
     employee_id: Mapped[str] = mapped_column(ForeignKey("employees.id"), primary_key=True)
-    expected_return_date: Mapped[date] = mapped_column(Date, nullable=False)
+    # NULL = дата возврата ещё не известна ("заглушка нужно уточнить у прораба",
+    # см. tabel.get_pending_clarification_rotations). До 2026-07 поле было NOT NULL —
+    # ALTER TABLE rotation_returns ALTER COLUMN expected_return_date DROP NOT NULL;
+    expected_return_date: Mapped[date | None] = mapped_column(Date, nullable=True)
 
     # 2026-07: тип отбытия на межвахту — от него зависит, какое юридическое
     # событие срабатывает при ФАКТИЧЕСКОМ возврате (см. tabel.apply_rotation_return):
