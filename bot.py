@@ -71,6 +71,7 @@ from models import (
     Obligation,
     ObligationStatus,
     ObligationType,
+    RotationReturn,
     SystemFlag,
 )
 from obligations import create_obligations_for_employee
@@ -223,6 +224,8 @@ def _build_section_menu(section: str, role: str | None = None) -> InlineKeyboard
                                         payload="menu:rotation_flags"))
             builder.row(CallbackButton(text="🧾 На оформлении (не в табеле)",
                                         payload="menu:onboarding"))
+            builder.row(CallbackButton(text="❓ Уточнить дату возврата (МЖ)",
+                                        payload="menu:pending_rotation"))
     elif section == "reports":
         builder.row(CallbackButton(text="📅 Табель за сегодня", payload="menu:tabel_today"))
         builder.row(CallbackButton(text="◀ Прочее в разработке", payload="menu:main"))
@@ -732,17 +735,36 @@ async def on_callback(event: MessageCallback):
             full_name = employee.full_name
             day_code = tabel.get_day_slot(session, employee_id) or "—"
             night_code = tabel.get_night_slot(session, employee_id) or "—"
+            rr = session.get(RotationReturn, employee_id)
+            needs_clarification = rr is not None and rr.expected_return_date is None
         kb = InlineKeyboardBuilder()
         kb.row(CallbackButton(text="✅ Поставить явку (Д)", payload=f"empact_day:{employee_id}"))
         kb.row(CallbackButton(text="🧹 Очистить день", payload=f"empact_clrday:{employee_id}"))
         kb.row(CallbackButton(text="🧹 Очистить ночь", payload=f"empact_clrnight:{employee_id}"))
         if day_code == tabel.ROTATION:
             kb.row(CallbackButton(text="✈️ Отменить межвахту", payload=f"empact_clrrot:{employee_id}"))
+        if needs_clarification:
+            kb.row(CallbackButton(text="✈️ Уточнить дату возврата",
+                                    payload=f"empact_clarify_rot:{employee_id}"))
         kb.row(CallbackButton(text="◀ Назад к списку", payload="menu:empaction"))
+        extra_note = "\n⚠️ Дата возврата с межвахты не уточнена!" if needs_clarification else ""
         await responder.send(
-            f"{full_name}\nСегодня: день={day_code}, ночь={night_code}\nЧто сделать?",
+            f"{full_name}\nСегодня: день={day_code}, ночь={night_code}{extra_note}\nЧто сделать?",
             attachments=[kb.as_markup()],
         )
+        return
+
+    if payload.startswith("empact_clarify_rot:"):
+        employee_id = payload.split(":", 1)[1]
+        with Session(engine) as session:
+            employee = session.get(Employee, employee_id)
+            full_name = employee.full_name if employee else "—"
+        _pending_forms[responder.user_id()] = {
+            "state": "awaiting_rotation_return_date",
+            "employee_id": employee_id,
+        }
+        await responder.send(f"{full_name}: укажите дату ВОЗВРАТА на объект "
+                              f"(формат ГГГГ-ММ-ДД):")
         return
 
     if payload.startswith("empact_day:"):
@@ -1081,6 +1103,24 @@ async def on_callback(event: MessageCallback):
                 marks_str = ", ".join(f"{d:%d.%m}/{slot}={code}" for d, slot, code in item["marks"])
                 lines.append(f"\n{item['name']} ({reason})\nОтметки: {marks_str}")
         await responder.send("\n".join(lines))
+        return
+
+    if payload == "menu:pending_rotation":
+        with Session(engine) as session:
+            role = _role_for_max_id(session, responder.user_id())
+            if role not in ("kadrovik", "admin"):
+                await responder.send("Доступно только кадровику/админу.")
+                return
+            pending = tabel.get_pending_clarification_rotations(session)
+            if not pending:
+                await responder.send("Нет межвахт без уточнённой даты возврата.")
+                return
+            names = "\n".join(f"  • {p['name']}" for p in pending)
+        await responder.send(
+            f"❓ Стоят на МЖ, но дата возврата НЕ уточнена ({len(pending)}):\n{names}\n\n"
+            f"Попросите прораба уточнить через «☀️ Утро» → выбрать человека → "
+            f"«✈️ Уточнить межвахту»."
+        )
         return
 
     if payload.startswith("rotflag:"):
