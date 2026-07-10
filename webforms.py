@@ -1779,13 +1779,6 @@ value="{emp.entry_date.isoformat() if emp.entry_date else ''}">
 {help_entry}
 </fieldset>
 <fieldset>
-<legend>Дактилоскопия («грин карта»)</legend>
-<input type="date" name="dactyloscopy_date" max="{today_s}"
-data-orig="{emp.dactyloscopy_date.isoformat() if emp.dactyloscopy_date else ''}"
-value="{emp.dactyloscopy_date.isoformat() if emp.dactyloscopy_date else ''}">
-{help_dact}
-</fieldset>
-<fieldset>
 <legend>Место пребывания</legend>
 <p class="muted">Текущий адрес: {emp.address or "не указан"}</p>
 <label>Адрес</label>
@@ -1894,11 +1887,33 @@ value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
 <input type="hidden" name="scan_type" value="medical_certificate">
 <input type="file" name="files" accept="application/pdf,image/*" multiple required style="display:block;width:100%;margin:6px 0;padding:8px;border:1px solid #d9dde3;border-radius:8px;background:#fff;font-size:15px">
 <button type="submit" class="btn-full">Загрузить справку (закроет медкомиссию)</button></form>'''
+    _today_s_dact = date.today().isoformat()
+    _dact_action = f'/employees/{emp.id}/dactyloscopy_date'
     if emp.dactyloscopy_date:
-        _dact_html = f'<b style="color:#1a7f37">Дактилоскопия сделана</b> <span class="muted">({emp.dactyloscopy_date.isoformat()})</span>'
+        _dv = emp.dactyloscopy_date.isoformat()
+        _dact_form = (
+            '<form method="post" action="' + _dact_action + '" style="margin-top:8px">'
+            '<label style="font-size:13px" class="muted">Изменить дату:</label>'
+            '<input type="date" name="dactyloscopy_date" max="' + _today_s_dact + '" value="' + _dv + '" '
+            'style="display:block;margin:4px 0;padding:8px;border:1px solid #d9dde3;border-radius:8px">'
+            '<button type="submit" class="secondary">Сохранить дату</button></form>'
+        )
+        _dact_html = (
+            '<b style="color:#1a7f37">Дактилоскопия сделана</b> '
+            '<span class="muted">(' + _dv + ')</span>' + _dact_form
+        )
     else:
         _dact_seq = "" if _med_done else ' <span class="muted">(обычно после медкомиссии)</span>'
-        _dact_html = f'<b style="color:#c47f00">Дактилоскопия не сделана</b>{_dact_seq}<br><span class="muted" style="font-size:13px">Дата ставится в блоке «Дактилоскопия» формы выше.</span>'
+        _dact_form = (
+            '<form method="post" action="' + _dact_action + '" style="margin-top:8px">'
+            '<label style="font-size:13px" class="muted">Дата прохождения (заполнение закроет обязательство):</label>'
+            '<input type="date" name="dactyloscopy_date" max="' + _today_s_dact + '" '
+            'style="display:block;margin:4px 0;padding:8px;border:1px solid #d9dde3;border-radius:8px">'
+            '<button type="submit" class="btn-full">Сохранить дату дактилоскопии</button></form>'
+        )
+        _dact_html = (
+            '<b style="color:#c47f00">Дактилоскопия не сделана</b>' + _dact_seq + '<br>' + _dact_form
+        )
     _medzone_section = f'''
 <fieldset>
 <legend>Медкомиссия и дактилоскопия</legend>
