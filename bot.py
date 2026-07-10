@@ -844,6 +844,25 @@ async def on_callback(event: MessageCallback):
         await responder.send(f"{full_name}: причина проставлена.")
         return
 
+    if payload.startswith("depart:"):
+        _, employee_id, date_iso, departure_type = payload.split(":", 3)
+        return_date = datetime.strptime(date_iso, "%Y-%m-%d").date()
+        with Session(engine) as session:
+            employee = session.get(Employee, employee_id)
+            if employee is None:
+                await event.answer(notification="Сотрудник не найден.")
+                return
+            full_name = employee.full_name
+            flagged = tabel.set_rotation(session, employee, return_date, responder.user_id(),
+                                          departure_type=departure_type)
+        if flagged:
+            await responder.send(f"✔ {full_name}: межвахта до {return_date:%d.%m.%Y}. "
+                                  f"Данные направлены в отдел кадров.")
+        else:
+            await responder.send(f"✔ {full_name}: межвахта до {return_date:%d.%m.%Y}. "
+                                  f"Напомню за 3 дня до возврата.")
+        return
+
     if payload == "reason_finish":
         with Session(engine) as session:
             n = tabel.fill_unmarked_absent(session, responder.user_id())
@@ -1248,9 +1267,15 @@ async def on_text(event: MessageCreated):
             else:
                 tabel.mark_day(session, employee, user_id)
                 slot_label = "День"
+            departure_type = tabel.apply_rotation_return(session, employee, actual_date)
+        extra = ""
+        if departure_type == tabel.DEPARTURE_ABROAD:
+            extra = "\nПостановка на учёт по возврату из-за границы создана (кадровику)."
+        elif departure_type == tabel.DEPARTURE_DOMESTIC:
+            extra = "\nАдрес пребывания обновлён, обязательства пересчитаны (кадровику)."
         await event.message.answer(
             f"✔ {full_name}: фактический возврат с межвахты {date_s} "
-            f"зафиксирован. {slot_label} проставлен(а)."
+            f"зафиксирован. {slot_label} проставлен(а).{extra}"
         )
         return
 
@@ -1270,22 +1295,19 @@ async def on_text(event: MessageCreated):
             return
         employee_id = form["employee_id"]
         _pending_forms.pop(user_id, None)
-        with Session(engine) as session:
-            employee = session.get(Employee, employee_id)
-            if employee is None:
-                await event.message.answer("Сотрудник не найден.")
-                return
-            full_name = employee.full_name
-            flagged = tabel.set_rotation(session, employee, return_date, user_id)
-        if flagged:
-            await event.message.answer(
-                f"✔ {full_name}: межвахта до {date_s}. "
-                f"Данные направлены в отдел кадров."
-            )
-        else:
-            await event.message.answer(
-                f"✔ {full_name}: межвахта до {date_s}. Напомню за 3 дня до возврата."
-            )
+        # Тип отбытия определяет, какое юридическое событие сработает при
+        # фактическом возврате (см. tabel.apply_rotation_return) — не пишем в БД,
+        # пока не выберут.
+        payload_base = f"{employee_id}:{return_date.isoformat()}"
+        kb = InlineKeyboardBuilder()
+        kb.row(CallbackButton(text="🌍 За границу", payload=f"depart:{payload_base}:{tabel.DEPARTURE_ABROAD}"))
+        kb.row(CallbackButton(text="🇷🇺 В РФ, но с площадки", payload=f"depart:{payload_base}:{tabel.DEPARTURE_DOMESTIC}"))
+        kb.row(CallbackButton(text="🏠 Не выезжал", payload=f"depart:{payload_base}:{tabel.DEPARTURE_NONE}"))
+        await event.message.answer(
+            "Куда убыл на межвахту? (от этого зависит, что сработает при возврате — "
+            "новая постановка на учёт, обновление адреса или ничего)",
+            attachments=[kb.as_markup()],
+        )
         return
 
     if form and form.get("state") == "awaiting_entry_date_button":
