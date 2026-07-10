@@ -931,6 +931,25 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
             f'<a class="btn" href="/employees/{e.id}">Открыть карточку</a></div>'
         )
 
+    # СРОЧНАЯ проверка (2026-07): явка есть, а договор не действует. См. подробный
+    # docstring tabel.get_marks_without_valid_contract. Веб безопасен для проактивного
+    # показа (вход персональный, не рассылка) — в отличие от бота, где это оставлено
+    # только пассивным пунктом меню (см. решение про NotificationSubscriber).
+    invalid_contract_marks = []
+    if role in ("kadrovik", "admin"):
+        invalid_contract_marks = tabel.get_marks_without_valid_contract(db)
+
+    def invalid_contract_row(item: dict) -> str:
+        cd = item["contract_date"].strftime("%d.%m.%Y") if item["contract_date"] else "не указана"
+        ced = item["contract_end_date"]
+        reason = f"уволен {ced:%d.%m.%Y}" if ced else f"дата договора: {cd}"
+        marks_str = ", ".join(f"{d:%d.%m}" for d, _slot, _code in item["marks"])
+        return (
+            f'<div class="card">{item["name"]} ({reason})<br>'
+            f'<span class="badge red">Явка: {marks_str}</span><br>'
+            f'<a class="btn" href="/employees/{item["employee_id"]}">Открыть карточку</a></div>'
+        )
+
     test_banner = (
         '<div class="warning-banner">⚠ Тестовый режим включён (TEST_ALLOW_MISSING_FIELDS): '
         'документы для медкомиссии генерируются с прочерками вместо незаполненных полей. '
@@ -956,8 +975,16 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
 
     body = f"""
 {test_banner}
+{f'''<div class="warning-banner" style="background:#fdecec;border-left-color:#c0392b;color:#7a1f1f">
+🚨 СРОЧНО: явка без действующего договора у {len(invalid_contract_marks)} чел. — проверьте ниже.
+</div>''' if invalid_contract_marks else ""}
 <h1>Задачи</h1>
 <p><a class="btn" href="/employees/new">+ Добавить сотрудника</a></p>
+
+{f'''<section class="grid">
+<h2>🚨 Явка без действующего договора ({len(invalid_contract_marks)})</h2>
+{"".join(invalid_contract_row(item) for item in invalid_contract_marks)}
+</section>''' if invalid_contract_marks else ""}
 
 <section class="grid">
 <h2>Просрочено ({len(overdue)})</h2>
