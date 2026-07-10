@@ -1893,8 +1893,19 @@ value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
         else:
             _med_html = f'<span>Направлен {_ref.referral_date.isoformat()}, прошло {_md} дн. из 14</span>'
         _med_done = False
+    # Форму загрузки справки показываем, пока СКАНА СПРАВКИ НЕТ — независимо от статуса медкомиссии
+    # (иначе тупик: медкомиссия «пройдена», а скана нет и загрузить негде; пакет требует справку).
+    _cert_uploaded = False
+    try:
+        _cert_uploaded = bool((_s3_list_for_employee(emp.id).get("medical_certificate") or {}).get("present"))
+    except Exception:
+        _cert_uploaded = False
+    # Подсказка: медкомиссия пройдена, но скана справки нет — он нужен для пакета Госуслуг.
+    _cert_hint = ""
+    if _med_done and not _cert_uploaded:
+        _cert_hint = '<br><span style="color:#c47f00;font-size:13px">⚠ Медкомиссия пройдена, но скан справки не загружен — он нужен для пакета Госуслуг. Загрузите ниже.</span>'
     _med_upload = ""
-    if _ref is not None and not _med_done:
+    if not _cert_uploaded:
         _med_upload = f'''<form method="post" action="/employees/{emp.id}/scan/upload" enctype="multipart/form-data" style="margin-top:8px">
 <input type="hidden" name="scan_type" value="medical_certificate">
 <input type="file" name="files" accept="application/pdf,image/*" multiple required style="display:block;width:100%;margin:6px 0;padding:8px;border:1px solid #d9dde3;border-radius:8px;background:#fff;font-size:15px">
@@ -1931,7 +1942,7 @@ value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
 <legend>Медкомиссия и дактилоскопия</legend>
 <div style="padding:10px 0;border-bottom:1px solid #eee">
 <div style="font-size:13px;color:#889;text-transform:uppercase;letter-spacing:.5px">Медкомиссия{_med_legal}</div>
-{_med_html}
+{_med_html}{_cert_hint}
 {_med_upload}
 </div>
 <div style="padding:10px 0">
