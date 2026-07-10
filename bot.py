@@ -41,7 +41,7 @@ import asyncio
 import logging
 import os
 import tempfile
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 
 MSK = timezone(timedelta(hours=3))  # Мурманская обл. — московское время, без перехода на летнее с 2014
 
@@ -70,6 +70,7 @@ from models import (
     ObligationType,
 )
 from obligations import create_obligations_for_employee
+import tabel
 from auth_binding import bind_max_account, find_user_by_max_id, get_role_label
 from common_utils import category_for_citizenship
 from consent_texts import get_consent_text  # см. consent_texts.py
@@ -178,17 +179,28 @@ class _Responder:
         await self.send(text=text, attachments=attachments)
 
 
-def _build_main_menu() -> InlineKeyboardBuilder:
+def _build_main_menu(role: str | None = None) -> InlineKeyboardBuilder:
     """Главное меню — разделы. Пункты внутри разделов: _build_section_menu().
-    Структура расширяемая: чтобы добавить пункт — допиши в нужный раздел ниже."""
+    Структура расширяемая: чтобы добавить пункт — допиши в нужный раздел ниже.
+
+    2026-07: слияние с ботом ТабельБелокаменка. "☀️ Утро"/"🌙 Вечер" — разметка
+    явки, доступна PRORAB/KADROVIK/ADMIN (см. UserRole в models.py, узкое
+    исключение из "PRORAB не пишет в БД"). "⚠️ Требует внимания" скрыт от
+    PRORAB совсем — там теперь в том числе флаги межвахты с обязательствами,
+    это забота кадровика, не прораба (см. договорённость про "данные
+    направлены в отдел кадров")."""
     builder = InlineKeyboardBuilder()
+    if role in ("prorab", "kadrovik", "admin"):
+        builder.row(CallbackButton(text="☀️ Утро (явка)", payload="menu:morning"))
+        builder.row(CallbackButton(text="🌙 Вечер (ночная смена)", payload="menu:evening"))
     builder.row(CallbackButton(text="👥 Сотрудники", payload="menu:section:employees"))
-    builder.row(CallbackButton(text="⚠️ Требует внимания", payload="menu:section:attention"))
+    if role in ("kadrovik", "admin"):
+        builder.row(CallbackButton(text="⚠️ Требует внимания", payload="menu:section:attention"))
     builder.row(CallbackButton(text="📊 Отчёты", payload="menu:section:reports"))
     return builder
 
 
-def _build_section_menu(section: str) -> InlineKeyboardBuilder:
+def _build_section_menu(section: str, role: str | None = None) -> InlineKeyboardBuilder:
     """Подменю раздела. Внизу каждого — кнопка «Назад» в главное меню (menu:main)."""
     builder = InlineKeyboardBuilder()
     if section == "employees":
@@ -199,10 +211,22 @@ def _build_section_menu(section: str) -> InlineKeyboardBuilder:
         builder.row(CallbackButton(text="⏳ Без даты въезда", payload="menu:incomplete"))
         builder.row(CallbackButton(text="🗓 Без даты договора", payload="menu:contractdate"))
         builder.row(CallbackButton(text="🖊 Ожидают согласия", payload="menu:pending_consent"))
+        if role in ("kadrovik", "admin"):
+            builder.row(CallbackButton(text="🔄 Межвахта — открытые обязательства",
+                                        payload="menu:rotation_flags"))
     elif section == "reports":
-        builder.row(CallbackButton(text="🚧 Раздел в разработке", payload="menu:main"))
+        builder.row(CallbackButton(text="📅 Табель за сегодня", payload="menu:tabel_today"))
+        builder.row(CallbackButton(text="◀ Прочее в разработке", payload="menu:main"))
     builder.row(CallbackButton(text="⬅️ Назад", payload="menu:main"))
     return builder
+
+
+def _role_for_max_id(session: Session, max_user_id: str) -> str | None:
+    """Роль пользователя по MAX user_id, или None, если не привязан ('/login' не выполнен)."""
+    user = find_user_by_max_id(session, max_user_id)
+    if user is None or user.role is None:
+        return None
+    return user.role.value
 
 
 _SECTION_TITLES = {
@@ -221,6 +245,14 @@ async def _start_add_employee_flow(responder: "_Responder") -> None:
         "Категория по умолчанию — eaeu. Для Белоруссии напишите 'belarus' вместо гражданства-триггера "
         "(это временный формат для MVP)."
     )
+
+
+def _tabel_extra_button(prefix: str) -> CallbackButton | None:
+    if prefix == "utroday":
+        return CallbackButton(text="✅ Отметил всех присутствующих", payload="utro_done")
+    if prefix == "eveningnight":
+        return CallbackButton(text="✅ Готово", payload="evening_done")
+    return None
 
 
 async def _deliver_employees_list(responder: "_Responder") -> None:
@@ -250,7 +282,11 @@ PICKER_TITLES = {
     "delpick": "Выберите сотрудника для удаления (тест, необратимо)",
     "consentpick": "Ожидают согласия",
     "contractdate": "Без даты договора",
+    "utroday": "☀️ Утро — отметьте, кто на месте",
+    "eveningnight": "🌙 Вечер — кто заступает в ночь",
 }
+# Префиксы табеля — там незачем показывать паспорт в подписи кнопки (не тот контекст).
+_TABEL_PREFIXES = {"utroday", "eveningnight"}
 
 
 def _picker_employees(session: Session, prefix: str) -> list[Employee]:
@@ -279,20 +315,29 @@ def _picker_employees(session: Session, prefix: str) -> list[Employee]:
             .order_by(Employee.full_name)
             .all()
         )
+    if prefix == "utroday":
+        return tabel.get_unmarked_day(session)
+    if prefix == "eveningnight":
+        return tabel.get_not_worked_day(session)
     return []
 
 
 async def _deliver_picker(
-    responder: "_Responder", prefix: str, page: int = 0, edit: bool = False, only_if_open: bool = False
+    responder: "_Responder", prefix: str, page: int = 0, edit: bool = False,
+    only_if_open: bool = False, extra_button: CallbackButton | None = None,
 ) -> None:
-    """Общий постраничный список сотрудников-кнопок для empdate/delpick/consentpick/contractdate.
+    """Общий постраничный список сотрудников-кнопок для empdate/delpick/consentpick/
+    contractdate/utroday/eveningnight.
     Если edit=True и для (user_id, prefix) уже есть открытый список — редактируем его на месте
     (bot.edit_message), а не отправляем новое сообщение. Так после подтверждения действия
     список остаётся на экране, просто без обработанного сотрудника, вместо полного удаления
     и замены единственной строкой результата.
 
     only_if_open=True: если список не был открыт (например, дата введена через /set_entry_date,
-    а не через кнопку) — ничего не отправляем, не заводим список, который никто не открывал."""
+    а не через кнопку) — ничего не отправляем, не заводим список, который никто не открывал.
+
+    extra_button: дополнительная кнопка отдельной строкой над «Выход» (например,
+    «✅ Отметил всех присутствующих» для utroday)."""
     key = (responder.user_id(), prefix)
     if only_if_open and key not in _open_pickers:
         return
@@ -318,8 +363,11 @@ async def _deliver_picker(
 
         builder = InlineKeyboardBuilder()
         for emp in chunk:
-            passport = f"{emp.passport_series or ''} {emp.passport_number or ''}".strip()
-            label = f"{emp.full_name} ({passport})" if passport else emp.full_name
+            if prefix in _TABEL_PREFIXES:
+                label = emp.full_name
+            else:
+                passport = f"{emp.passport_series or ''} {emp.passport_number or ''}".strip()
+                label = f"{emp.full_name} ({passport})" if passport else emp.full_name
             builder.row(CallbackButton(text=label[:60], payload=f"{prefix}:{emp.id}"))
 
         total_pages = (total + PICKER_PAGE_SIZE - 1) // PICKER_PAGE_SIZE
@@ -332,6 +380,8 @@ async def _deliver_picker(
             if nav:
                 builder.row(*nav)
 
+        if extra_button is not None:
+            builder.row(extra_button)
         builder.row(CallbackButton(text="🚪 Выход", payload=f"exitpicker:{prefix}"))
 
     header = f"{PICKER_TITLES.get(prefix, prefix)}: {total}"
@@ -463,9 +513,11 @@ async def on_bot_started(event):
 
 @dp.message_created(CommandStart())
 async def on_start(event: MessageCreated):
+    with Session(engine) as session:
+        role = _role_for_max_id(session, event.message.sender.user_id)
     await event.message.answer(
         text="Бот миграционного учёта запущен. Выберите действие:",
-        attachments=[_build_main_menu().as_markup()],
+        attachments=[_build_main_menu(role).as_markup()],
     )
 
 
@@ -590,17 +642,278 @@ async def on_callback(event: MessageCallback):
 
     # Навигация по разделам меню.
     if payload == "menu:main":
-        await responder.show_menu("Главное меню:", [_build_main_menu().as_markup()])
+        with Session(engine) as session:
+            role = _role_for_max_id(session, responder.user_id())
+        await responder.show_menu("Главное меню:", [_build_main_menu(role).as_markup()])
         return
     if payload.startswith("menu:section:"):
         section = payload.split(":", 2)[2]
         title = _SECTION_TITLES.get(section, "Раздел")
-        await responder.show_menu(title, [_build_section_menu(section).as_markup()])
+        with Session(engine) as session:
+            role = _role_for_max_id(session, responder.user_id())
+        if section == "attention" and role not in ("kadrovik", "admin"):
+            await responder.send("Этот раздел доступен только кадровику/админу.")
+            return
+        await responder.show_menu(title, [_build_section_menu(section, role).as_markup()])
         return
 
     if payload == "menu:add_employee":
         await _start_add_employee_flow(responder)
         return
+
+    # ================= ТАБЕЛЬ: Утро/Вечер/Межвахта/Отчёты (2026-07, слияние ботов) =================
+
+    if payload == "menu:morning":
+        with Session(engine) as session:
+            role = _role_for_max_id(session, responder.user_id())
+        if role not in ("prorab", "kadrovik", "admin"):
+            await responder.send("Разметка явки доступна только зарегистрированным пользователям. "
+                                  "Выполните /login.")
+            return
+        await _deliver_picker(responder, "utroday", extra_button=_tabel_extra_button("utroday"))
+        return
+
+    if payload == "menu:evening":
+        with Session(engine) as session:
+            role = _role_for_max_id(session, responder.user_id())
+        if role not in ("prorab", "kadrovik", "admin"):
+            await responder.send("Разметка явки доступна только зарегистрированным пользователям. "
+                                  "Выполните /login.")
+            return
+        await _deliver_picker(responder, "eveningnight", extra_button=_tabel_extra_button("eveningnight"))
+        return
+
+    if payload.startswith("utroday:"):
+        employee_id = payload.split(":", 1)[1]
+        with Session(engine) as session:
+            employee = session.get(Employee, employee_id)
+            if employee is None:
+                await event.answer(notification="Сотрудник не найден.")
+                return
+            conflict = tabel.check_day_conflict(session, employee)
+            if conflict:
+                kb = InlineKeyboardBuilder()
+                kb.row(CallbackButton(text="✅ Всё равно день", payload=f"utroforce:{employee_id}"))
+                kb.row(CallbackButton(text="✖ Отмена", payload="menu:morning"))
+                await responder.send(f"⚠️ {conflict}\nВсё равно поставить день?",
+                                      attachments=[kb.as_markup()])
+                return
+            rot_conflict = tabel.check_rotation_return_conflict(session, employee)
+            if rot_conflict:
+                _pending_forms[responder.user_id()] = {
+                    "state": "awaiting_actual_return_date",
+                    "employee_id": employee_id, "action": "day",
+                }
+                await responder.send(f"⚠️ {rot_conflict}\nУкажите дату фактического возврата "
+                                      f"(обычно — сегодняшнее число, ГГГГ-ММ-ДД):")
+                return
+            tabel.mark_day(session, employee, responder.user_id())
+        await _deliver_picker(responder, "utroday", edit=True,
+                               extra_button=_tabel_extra_button("utroday"))
+        return
+
+    if payload.startswith("utroforce:"):
+        employee_id = payload.split(":", 1)[1]
+        with Session(engine) as session:
+            employee = session.get(Employee, employee_id)
+            if employee is not None:
+                tabel.mark_day(session, employee, responder.user_id())
+        await _deliver_picker(responder, "utroday",
+                               extra_button=_tabel_extra_button("utroday"))
+        return
+
+    if payload.startswith("eveningnight:"):
+        employee_id = payload.split(":", 1)[1]
+        with Session(engine) as session:
+            employee = session.get(Employee, employee_id)
+            if employee is None:
+                await event.answer(notification="Сотрудник не найден.")
+                return
+            conflict = tabel.check_night_conflict(session, employee)
+            if conflict:
+                kb = InlineKeyboardBuilder()
+                kb.row(CallbackButton(text="✅ Всё равно ночь", payload=f"eveningforce:{employee_id}"))
+                kb.row(CallbackButton(text="✖ Отмена", payload="menu:evening"))
+                await responder.send(f"⚠️ {conflict}\nВсё равно поставить ночь?",
+                                      attachments=[kb.as_markup()])
+                return
+            rot_conflict = tabel.check_rotation_return_conflict(session, employee)
+            if rot_conflict:
+                _pending_forms[responder.user_id()] = {
+                    "state": "awaiting_actual_return_date",
+                    "employee_id": employee_id, "action": "night",
+                }
+                await responder.send(f"⚠️ {rot_conflict}\nУкажите дату фактического возврата "
+                                      f"(обычно — сегодняшнее число, ГГГГ-ММ-ДД):")
+                return
+            tabel.mark_night(session, employee, responder.user_id())
+        await _deliver_picker(responder, "eveningnight", edit=True,
+                               extra_button=_tabel_extra_button("eveningnight"))
+        return
+
+    if payload.startswith("eveningforce:"):
+        employee_id = payload.split(":", 1)[1]
+        with Session(engine) as session:
+            employee = session.get(Employee, employee_id)
+            if employee is not None:
+                tabel.mark_night(session, employee, responder.user_id())
+        await _deliver_picker(responder, "eveningnight",
+                               extra_button=_tabel_extra_button("eveningnight"))
+        return
+
+    if payload == "utro_done":
+        with Session(engine) as session:
+            remaining = tabel.get_unmarked_day(session)
+            if not remaining:
+                await responder.send("Все отмечены. Утро завершено.")
+                return
+            builder = InlineKeyboardBuilder()
+            for e in remaining[:PICKER_PAGE_SIZE]:
+                builder.row(CallbackButton(text=e.full_name[:60], payload=f"reasonpick:{e.id}"))
+            builder.row(CallbackButton(text="✅ Завершить (остальным неявка)", payload="reason_finish"))
+        await responder.send(f"Укажите причину отсутствия (осталось {len(remaining)}):",
+                              attachments=[builder.as_markup()])
+        return
+
+    if payload.startswith("reasonpick:"):
+        employee_id = payload.split(":", 1)[1]
+        kb = InlineKeyboardBuilder()
+        kb.row(
+            CallbackButton(text="❌ Неявка", payload=f"reasoncode:{employee_id}:{tabel.ABSENT}"),
+            CallbackButton(text="🤒 Больничный", payload=f"reasoncode:{employee_id}:{tabel.SICK}"),
+        )
+        kb.row(
+            CallbackButton(text="✈️ Межвахта", payload=f"reasoncode:{employee_id}:{tabel.ROTATION}"),
+            CallbackButton(text="📋 Мигр.учёт", payload=f"reasoncode:{employee_id}:{tabel.MIGR}"),
+        )
+        kb.row(CallbackButton(text="🏖 Выходной", payload=f"reasoncode:{employee_id}:{tabel.WEEKEND}"))
+        await responder.send("Причина?", attachments=[kb.as_markup()])
+        return
+
+    if payload.startswith("reasoncode:") and payload.endswith(":force"):
+        _, employee_id, code, _force = payload.split(":", 3)
+        with Session(engine) as session:
+            employee = session.get(Employee, employee_id)
+            full_name = employee.full_name if employee is not None else "—"
+            if employee is not None:
+                tabel.set_reason(session, employee, code, responder.user_id())
+                today_count = tabel.count_migr_today(session)
+                if today_count > tabel.MIGR_DAILY_THRESHOLD:
+                    await responder.send(f"⚠️ Сегодня на мигр.учёте уже {today_count} человек "
+                                          f"(порог {tabel.MIGR_DAILY_THRESHOLD}). Риск вопросов "
+                                          f"от заказчика — проверьте обоснованность.")
+        await responder.send(f"{full_name}: причина проставлена.")
+        return
+
+    if payload.startswith("reasoncode:"):
+        _, employee_id, code = payload.split(":", 2)
+        with Session(engine) as session:
+            employee = session.get(Employee, employee_id)
+            if employee is None:
+                await event.answer(notification="Сотрудник не найден.")
+                return
+            full_name = employee.full_name
+
+            if code == tabel.ROTATION:
+                _pending_forms[responder.user_id()] = {
+                    "state": "awaiting_rotation_return_date",
+                    "employee_id": employee_id,
+                }
+                await responder.send(f"{full_name}: межвахта.\n"
+                                      f"⚠️ Укажите дату ВОЗВРАТА на объект (когда он вернётся "
+                                      f"к работе), а не дату отъезда.\nФормат: ГГГГ-ММ-ДД")
+                return
+
+            if code == tabel.MIGR:
+                migr_warn = tabel.check_migr_after_rotation(session, employee)
+                if migr_warn:
+                    kb = InlineKeyboardBuilder()
+                    kb.row(CallbackButton(text="✅ Всё равно МУ", payload=f"reasoncode:{employee_id}:{tabel.MIGR}:force"))
+                    kb.row(CallbackButton(text="✖ Отмена", payload=f"reasonpick:{employee_id}"))
+                    await responder.send(f"⚠️ {migr_warn}\nВсё равно поставить МУ?",
+                                          attachments=[kb.as_markup()])
+                    return
+                tabel.set_reason(session, employee, code, responder.user_id())
+                today_count = tabel.count_migr_today(session)
+                if today_count > tabel.MIGR_DAILY_THRESHOLD:
+                    await responder.send(f"⚠️ Сегодня на мигр.учёте уже {today_count} человек "
+                                          f"(порог {tabel.MIGR_DAILY_THRESHOLD}). Риск вопросов "
+                                          f"от заказчика — проверьте обоснованность.")
+            else:
+                tabel.set_reason(session, employee, code, responder.user_id())
+        await responder.send(f"{full_name}: причина проставлена.")
+        return
+
+    if payload == "reason_finish":
+        with Session(engine) as session:
+            n = tabel.fill_unmarked_absent(session, responder.user_id())
+        await responder.send(f"Утро завершено. Неявка проставлена: {n} чел.")
+        return
+
+    if payload == "evening_done":
+        await responder.send("🌙 Вечерняя отметка завершена.")
+        return
+
+    if payload == "menu:tabel_today":
+        with Session(engine) as session:
+            s = tabel.day_summary(session)
+        lines = [
+            "Табель за сегодня:",
+            f"☀️ День: {s['day']}   🌙 Ночь: {s['night']}   😴 Отдых: {s['rest']}",
+            f"🤒 Больн.: {s['sick']}   ✈️ Межвахта: {s['rotation']}   ❌ Неявка: {s['absent']}",
+            f"📋 Мигр.учёт: {s['migr']}",
+        ]
+        if s["absent_list"]:
+            lines.append("\nОтсутствуют/особое:")
+            for name, code in s["absent_list"]:
+                lines.append(f"  • {name} — {code}")
+        await responder.send("\n".join(lines))
+        return
+
+    if payload == "menu:rotation_flags":
+        with Session(engine) as session:
+            role = _role_for_max_id(session, responder.user_id())
+            if role not in ("kadrovik", "admin"):
+                await responder.send("Доступно только кадровику/админу.")
+                return
+            flags = tabel.list_flagged_rotations(session)
+            if not flags:
+                await responder.send("Нет открытых флагов межвахты.")
+                return
+            builder = InlineKeyboardBuilder()
+            for rr in flags:
+                builder.row(CallbackButton(text=rr.employee.full_name[:60],
+                                            payload=f"rotflag:{rr.employee_id}"))
+        await responder.send(f"Межвахта с открытыми обязательствами ({len(flags)}):",
+                              attachments=[builder.as_markup()])
+        return
+
+    if payload.startswith("rotflag:"):
+        employee_id = payload.split(":", 1)[1]
+        with Session(engine) as session:
+            employee = session.get(Employee, employee_id)
+            if employee is None:
+                await event.answer(notification="Сотрудник не найден.")
+                return
+            obligations = tabel.get_open_obligations(session, employee_id)
+        lines = [f"{employee.full_name} — открытые обязательства при уходе на межвахту:"]
+        for o in obligations:
+            lines.append(f"  • {o.type.value} — {o.status.value}, дедлайн {o.deadline_date:%d.%m.%Y}")
+        kb = InlineKeyboardBuilder()
+        kb.row(CallbackButton(text="✅ Разобрано", payload=f"rotflag_resolve:{employee_id}"))
+        await responder.send("\n".join(lines), attachments=[kb.as_markup()])
+        return
+
+    if payload.startswith("rotflag_resolve:"):
+        employee_id = payload.split(":", 1)[1]
+        with Session(engine) as session:
+            user = find_user_by_max_id(session, responder.user_id())
+            reviewer_id = user.id if user else "unknown"
+            ok = tabel.resolve_rotation_flag(session, employee_id, reviewer_id)
+        await responder.send("Отмечено как разобранное." if ok else "Не удалось (флаг уже снят?).")
+        return
+
+    # ================= /конец табеля =================
 
     if payload == "menu:employees":
         await _deliver_employees_list(responder)
@@ -612,7 +925,9 @@ async def on_callback(event: MessageCallback):
 
     if payload.startswith("page:"):
         _, prefix, page_s = payload.split(":", 2)
-        await _deliver_picker(responder, prefix, page=int(page_s), edit=True, only_if_open=True)
+        extra = _tabel_extra_button(prefix)
+        await _deliver_picker(responder, prefix, page=int(page_s), edit=True,
+                               only_if_open=True, extra_button=extra)
         return
 
     if payload.startswith("empdate:"):
@@ -903,6 +1218,74 @@ async def on_text(event: MessageCreated):
         with Session(engine) as session:
             ok, text = bind_max_account(session, phone, user_id)
         await event.message.answer(text)
+        return
+
+    if form and form.get("state") == "awaiting_actual_return_date":
+        date_s = event.message.body.text.strip()
+        try:
+            actual_date = datetime.strptime(date_s, "%Y-%m-%d").date()
+        except ValueError:
+            await event.message.answer("Не распознал дату. Формат: ГГГГ-ММ-ДД, например 2026-07-10.")
+            return
+        if actual_date > date.today():
+            await event.message.answer(
+                "⚠️ Дата в будущем — нужна дата ФАКТИЧЕСКОГО возврата (обычно сегодняшнее "
+                "число). Введите ещё раз (ГГГГ-ММ-ДД):"
+            )
+            return
+        employee_id = form["employee_id"]
+        action = form["action"]
+        _pending_forms.pop(user_id, None)
+        with Session(engine) as session:
+            employee = session.get(Employee, employee_id)
+            if employee is None:
+                await event.message.answer("Сотрудник не найден.")
+                return
+            full_name = employee.full_name
+            if action == "night":
+                tabel.mark_night(session, employee, user_id)
+                slot_label = "Ночь"
+            else:
+                tabel.mark_day(session, employee, user_id)
+                slot_label = "День"
+        await event.message.answer(
+            f"✔ {full_name}: фактический возврат с межвахты {date_s} "
+            f"зафиксирован. {slot_label} проставлен(а)."
+        )
+        return
+
+    if form and form.get("state") == "awaiting_rotation_return_date":
+        date_s = event.message.body.text.strip()
+        try:
+            return_date = datetime.strptime(date_s, "%Y-%m-%d").date()
+        except ValueError:
+            await event.message.answer("Не распознал дату. Формат: ГГГГ-ММ-ДД, например 2026-07-20.")
+            return
+        if return_date <= date.today():
+            await event.message.answer(
+                "⚠️ Дата — сегодня или в прошлом.\nНужна дата ВОЗВРАТА на объект (когда "
+                "сотрудник вернётся к работе), а не дата отъезда и не сегодняшнее число.\n"
+                "Введите дату возврата ещё раз (ГГГГ-ММ-ДД):"
+            )
+            return
+        employee_id = form["employee_id"]
+        _pending_forms.pop(user_id, None)
+        with Session(engine) as session:
+            employee = session.get(Employee, employee_id)
+            if employee is None:
+                await event.message.answer("Сотрудник не найден.")
+                return
+            full_name = employee.full_name
+            flagged = tabel.set_rotation(session, employee, return_date, user_id)
+        if flagged:
+            await event.message.answer(
+                f"✔ {full_name}: межвахта до {date_s}. "
+                f"Данные направлены в отдел кадров."
+            )
+        else:
+            await event.message.answer(
+                f"✔ {full_name}: межвахта до {date_s}. Напомню за 3 дня до возврата."
+            )
         return
 
     if form and form.get("state") == "awaiting_entry_date_button":
