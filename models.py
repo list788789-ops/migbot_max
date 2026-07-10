@@ -284,14 +284,30 @@ class RotationReturn(Base):
     явно закрыта им самим (reviewed_at/reviewed_by), а не молча исчезнуть,
     когда кто-то другой закрыл дедлайн.
 
-    На боевой БД: create_all создаёт новые таблицы автоматически, ALTER TABLE
-    не нужен (это новая таблица целиком, не колонка в существующей).
+    На боевой БД: если таблица уже была создана ДО добавления departure_type
+    (create_all создаёт только отсутствующие таблицы, не добавляет колонки в
+    существующие) — нужен ручной ALTER TABLE:
+        ALTER TABLE rotation_returns ADD COLUMN departure_type VARCHAR;
+    Если разворачиваешь БД с нуля — create_all создаст колонку сама.
     """
 
     __tablename__ = "rotation_returns"
 
     employee_id: Mapped[str] = mapped_column(ForeignKey("employees.id"), primary_key=True)
     expected_return_date: Mapped[date] = mapped_column(Date, nullable=False)
+
+    # 2026-07: тип отбытия на межвахту — от него зависит, какое юридическое
+    # событие срабатывает при ФАКТИЧЕСКОМ возврате (см. tabel.apply_rotation_return):
+    #   'abroad'   — пересёк границу РФ (едет домой) -> новая постановка на учёт
+    #                (REGISTRATION), но БЕЗ повторной дактилоскопии/медосмотра
+    #                (это разовые обязанности, не привязаны к повторному въезду).
+    #   'domestic' — остался в РФ, но покидал место пребывания -> address_since
+    #                обновляется датой возврата, дальше работает уже существующее
+    #                правило REGISTRATION/address_since в deadlines.py.
+    #   'none'     — физически не выезжал с площадки -> ничего не создаётся,
+    #                регистрация не прерывалась.
+    # NULL = не указано (старые записи до этого поля, или упрощённый флоу).
+    departure_type: Mapped[str | None] = mapped_column(String, nullable=True)
 
     flagged: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     flagged_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
