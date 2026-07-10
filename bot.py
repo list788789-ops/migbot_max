@@ -920,7 +920,7 @@ async def on_callback(event: MessageCallback):
         return
 
     if payload == "menu:incomplete":
-        await _deliver_picker(responder, "empdate")
+        await _deliver_picker(responder, "empdate", edit=True)
         return
 
     if payload.startswith("page:"):
@@ -949,7 +949,7 @@ async def on_callback(event: MessageCallback):
         return
 
     if payload == "menu:contractdate":
-        await _deliver_picker(responder, "contractdate")
+        await _deliver_picker(responder, "contractdate", edit=True)
         return
 
     if payload.startswith("contractdate:"):
@@ -969,11 +969,11 @@ async def on_callback(event: MessageCallback):
         return
 
     if payload == "menu:delete_employee":
-        await _deliver_picker(responder, "delpick")
+        await _deliver_picker(responder, "delpick", edit=True)
         return
 
     if payload == "menu:docpick":
-        await _deliver_picker(responder, "docpick")
+        await _deliver_picker(responder, "docpick", edit=True)
         return
 
     if payload.startswith("docpick:"):
@@ -1013,7 +1013,7 @@ async def on_callback(event: MessageCallback):
         return
 
     if payload == "menu:pending_consent":
-        await _deliver_picker(responder, "consentpick")
+        await _deliver_picker(responder, "consentpick", edit=True)
         return
 
     if payload.startswith("consentpick:"):
