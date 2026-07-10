@@ -1040,13 +1040,20 @@ def generate_medical_referral_docx(employee: Employee, output_dir: str = "/tmp")
 def generate_employees_xlsx(employees: list[Employee], output_dir: str = "/tmp") -> str:
     """Полный список сотрудников таблицей — замена постраничному тексту в /employees.
     Отдельный файл от Google Sheets: тот обновляется по крону раз в сутки командой
-    export_to_sheets_api.py, этот — генерируется по запросу с текущим состоянием БД."""
+    export_to_sheets_api.py, этот — генерируется по запросу с текущим состоянием БД.
+
+    2026-07: имя файла раньше было жёстко "employees.xlsx" (одно и то же при каждом
+    вызове) — при повторных запросах MAX мог показать закешированное вложение по
+    имени файла вместо свежего, хотя данные внутри честно генерировались заново из БД
+    при каждом вызове. Плюс жёсткое имя означало гонку при одновременном запросе
+    отчёта двумя людьми (второй мог перезаписать файл первого мидвей записи). Теперь
+    имя включает метку времени — гарантированно новый файл на каждый вызов."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Сотрудники"
 
     headers = [
-        "ФИО", "Гражданство", "Категория", "Дата въезда", "Дата договора",
+        "№", "ФИО", "Гражданство", "Категория", "Дата въезда", "Дата договора",
         "Статус занятости", "Согласие", "Телефон", "Язык",
         "Дата рождения", "Серия паспорта", "Номер паспорта", "Адрес", "Откуда въехал",
     ]
@@ -1054,8 +1061,9 @@ def generate_employees_xlsx(employees: list[Employee], output_dir: str = "/tmp")
     for cell in ws[1]:
         cell.font = Font(bold=True)
 
-    for emp in employees:
+    for i, emp in enumerate(employees, start=1):
         ws.append([
+            i,
             emp.full_name,
             emp.citizenship or "",
             emp.category.value if emp.category else "",
@@ -1076,6 +1084,7 @@ def generate_employees_xlsx(employees: list[Employee], output_dir: str = "/tmp")
         max_len = max((len(str(c.value)) for c in col if c.value), default=10)
         ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 40)
 
-    path = os.path.join(output_dir, "employees.xlsx")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(output_dir, f"employees_{timestamp}.xlsx")
     wb.save(path)
     return path
