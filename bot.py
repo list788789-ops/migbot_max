@@ -218,6 +218,8 @@ def _build_section_menu(section: str, role: str | None = None) -> InlineKeyboard
         if role in ("kadrovik", "admin"):
             builder.row(CallbackButton(text="🔄 Межвахта — открытые обязательства",
                                         payload="menu:rotation_flags"))
+            builder.row(CallbackButton(text="🧾 На оформлении (не в табеле)",
+                                        payload="menu:onboarding"))
     elif section == "reports":
         builder.row(CallbackButton(text="📅 Табель за сегодня", payload="menu:tabel_today"))
         builder.row(CallbackButton(text="◀ Прочее в разработке", payload="menu:main"))
@@ -1014,6 +1016,23 @@ async def on_callback(event: MessageCallback):
                                             payload=f"rotflag:{rr.employee_id}"))
         await responder.send(f"Межвахта с открытыми обязательствами ({len(flags)}):",
                               attachments=[builder.as_markup()])
+        return
+
+    if payload == "menu:onboarding":
+        with Session(engine) as session:
+            role = _role_for_max_id(session, responder.user_id())
+            if role not in ("kadrovik", "admin"):
+                await responder.send("Доступно только кадровику/админу.")
+                return
+            onboarding = tabel.get_onboarding_employees(session)
+            if not onboarding:
+                await responder.send("Нет сотрудников на оформлении.")
+                return
+            lines = ["На оформлении (не попадают в табель, пока не начнётся договор):"]
+            for e in onboarding:
+                cd = e.contract_date.strftime("%d.%m.%Y") if e.contract_date else "не указана"
+                lines.append(f"  • {e.full_name} — дата договора: {cd}")
+        await responder.send("\n".join(lines))
         return
 
     if payload.startswith("rotflag:"):
