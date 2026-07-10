@@ -262,11 +262,20 @@ def _tabel_extra_button(prefix: str) -> CallbackButton | None:
 async def _deliver_employees_list(responder: "_Responder") -> None:
     """Список сотрудников — теперь файлом xlsx, не постраничным текстом. Генерируется
     по текущему состоянию БД на момент запроса, независимо от Google Sheets (тот
-    обновляется по крону через export_to_sheets_api.py и может отставать)."""
+    обновляется по крону через export_to_sheets_api.py и может отставать).
+
+    2026-07: исключены уволенные (contract_end_date заполнен) — раньше список
+    показывал вообще всех, включая давно уволенных, что не соответствовало
+    ожиданию "список действующих сотрудников"."""
     with Session(engine) as session:
-        employees = session.query(Employee).order_by(Employee.full_name).all()
+        employees = (
+            session.query(Employee)
+            .filter(Employee.contract_end_date.is_(None))
+            .order_by(Employee.full_name)
+            .all()
+        )
         if not employees:
-            await responder.send("Сотрудников в базе нет.")
+            await responder.send("Действующих сотрудников в базе нет.")
             return
         path = generate_employees_xlsx(employees)
 
