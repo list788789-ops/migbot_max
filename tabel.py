@@ -73,6 +73,53 @@ def get_onboarding_employees(session: Session) -> list[Employee]:
     )
 
 
+def get_marks_without_valid_contract(session: Session) -> list[dict]:
+    """
+    СРОЧНАЯ проверка (2026-07): у кого есть отметки РЕАЛЬНОЙ явки (Д/НЧ — то есть
+    человек физически выходил на работу), при этом по текущим данным сотрудника
+    договор не действует (нет даты/дата в будущем, ИЛИ contract_end_date уже
+    заполнен — уволен). Отличается от get_onboarding_employees: там просто "не в
+    табеле по фильтру", здесь — уже случившийся факт выхода на работу без
+    действующего договора, кадровику нужно вмешаться немедленно, а не просто
+    дозаполнить карточку.
+
+    Возможные причины: (а) договор оформлен, но дата ещё не внесена в систему —
+    техническая недоработка данных; (б) человек реально работал без оформления —
+    юридический риск. Разбираться должен кадровик, бот только сигнализирует.
+
+    Возвращает [{"employee_id", "name", "contract_date", "contract_end_date",
+    "marks": [(date, slot, code), ...]}].
+    """
+    today = date.today()
+    invalid_employees = (
+        session.query(Employee)
+        .filter(
+            (Employee.contract_date.is_(None))
+            | (Employee.contract_date > today)
+            | (Employee.contract_end_date.isnot(None))
+        )
+        .all()
+    )
+    result = []
+    for e in invalid_employees:
+        work_marks = (
+            session.query(AttendanceMark)
+            .filter_by(employee_id=e.id)
+            .filter(AttendanceMark.code.in_([DAY, NIGHT]))
+            .order_by(AttendanceMark.mark_date)
+            .all()
+        )
+        if work_marks:
+            result.append({
+                "employee_id": e.id,
+                "name": e.full_name,
+                "contract_date": e.contract_date,
+                "contract_end_date": e.contract_end_date,
+                "marks": [(m.mark_date, m.slot, m.code) for m in work_marks],
+            })
+    return result
+
+
 # ================= ЧТЕНИЕ ОТМЕТОК =================
 
 def _get_mark(session: Session, employee_id: str, mark_date: date, slot: str) -> str | None:
