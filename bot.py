@@ -1729,6 +1729,10 @@ async def morning_job():
        исключающие случаи на практике, но проверка на дубль сделана явно,
        как просили — "если про неё ещё не упомянуто").
 
+    0. Плюс (2026-07) первая строка отчёта — общее количество активных по
+       списку (tabel.get_active_employees), для контекста ко всем остальным
+       цифрам ниже.
+
     Рассылка во ВСЕ чаты NotificationSubscriber безопасна для всех трёх пунктов —
     это работа прораба (вести отметки), не чувствительные детали обязательств
     кадровика (та утечка обсуждалась и НЕ применяется здесь, см. старый
@@ -1737,6 +1741,7 @@ async def morning_job():
     today_s = today.isoformat()
     try:
         with Session(engine) as session:
+            active_count = len(tabel.get_active_employees(session))
             monthly_problems = tabel.get_monthly_problems(session)
             flag = session.get(SystemFlag, _NEVER_MARKED_ACK_KEY)
             already_acked_today = flag is not None and flag.value == today_s
@@ -1749,6 +1754,16 @@ async def morning_job():
 
     if not chat_ids:
         return
+
+    # 0. Общее количество активных по списку.
+    for chat_id in chat_ids:
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"📋 Табель на {today:%d.%m.%Y}: активных по списку — {active_count}."
+            )
+        except Exception:
+            log.exception("morning_job: не удалось отправить количество активных в chat_id=%s", chat_id)
 
     # 1. Месячные проблемные.
     if monthly_problems:
