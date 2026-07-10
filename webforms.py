@@ -910,7 +910,7 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
         ) or "—"
         return (
             f'<div class="card">{emp.full_name if emp else "?"} — межвахта до '
-            f'{rr.expected_return_date.strftime("%d.%m.%Y")}<br>'
+            f'{rr.expected_return_date.strftime("%d.%m.%Y") if rr.expected_return_date else "не уточнена"}<br>'
             f'<span class="badge red">Открытые обязательства: {obl_labels}</span><br>'
             f'<form method="post" action="/attention/rotation/{rr.employee_id}/resolve" style="display:inline">'
             f'<button type="submit" class="btn">✅ Разобрано</button></form> '
@@ -1122,8 +1122,12 @@ def tabel_page(request: Request, year: int | None = None, month: int | None = No
             f'align-items:center;gap:8px;font-weight:400">'
             f'<span>{html.escape(rr.employee.full_name if rr.employee else "?")}'
             f'<br><span class="muted">{_dep_label.get(rr.departure_type, "не указано")}</span></span>'
-            f'<span class="badge neutral" style="margin:0">до {rr.expected_return_date:%d.%m.%Y}</span>'
-            f'</div>'
+            + (
+                f'<span class="badge neutral" style="margin:0">до {rr.expected_return_date:%d.%m.%Y}</span>'
+                if rr.expected_return_date
+                else '<span class="badge red" style="margin:0">дата не уточнена</span>'
+            )
+            + '</div>'
             for rr in rotation_rows
         )
         summary_html += f'<section><h2>✈️ На межвахте ({len(rotation_rows)})</h2>{rotation_cards}</section>'
