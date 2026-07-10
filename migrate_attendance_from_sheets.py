@@ -157,7 +157,8 @@ def migrate() -> dict:
     conn = psycopg2.connect(DATABASE_URL)
     conn.autocommit = False
 
-    report = {"migrated": [], "unmatched": [], "fuzzy_matched": [], "rows_written": 0}
+    report = {"migrated": [], "unmatched": [], "fuzzy_matched": [], "patronymic_filled": [],
+              "rows_written": 0}
     try:
         id_map = _fetch_employee_ids(conn, list(marks_by_name.keys()))
         all_employees = None  # подтягиваем лениво, только если реально понадобится fuzzy
@@ -170,6 +171,21 @@ def migrate() -> dict:
                 match = _fuzzy_match(name, all_employees)
                 if match is not None:
                     report["fuzzy_matched"].append((name, match[1]))
+                    employee_id, migbot_name = match
+                    # Дополняем отчество, ТОЛЬКО если в migbot его нет вообще
+                    # (короче на одно слово, чем в Sheets) — не трогаем случаи,
+                    # где отчество ЕСТЬ, но написано иначе (это конфликт
+                    # написания, а не пропуск, решать его молча нельзя).
+                    sheets_parts = name.split()
+                    migbot_parts = migbot_name.split()
+                    if len(sheets_parts) > len(migbot_parts):
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "UPDATE employees SET full_name = %s WHERE id = %s",
+                                (name, employee_id),
+                            )
+                        report["patronymic_filled"].append((migbot_name, name))
+                        match = (employee_id, name)  # дальше используем уже полное имя
             if match is None:
                 report["unmatched"].append(name)
                 continue
@@ -188,7 +204,9 @@ def migrate() -> dict:
                          created_by, created_at, updated_at)
                     VALUES %s
                     ON CONFLICT (employee_id, mark_date, slot)
-                    DO UPDATE SET code = EXCLUDED.code, updated_at = now()
+                    DO UPDATE SET code = EXCLUDED.code,
+                                   employee_name_snap = EXCLUDED.employee_name_snap,
+                                   updated_at = now()
                     """,
                     values,
                     template="(%s, %s, %s, %s, %s, %s, %s, now(), now())",
@@ -210,6 +228,10 @@ if __name__ == "__main__":
     result = migrate()
     print(f"Перенесено сотрудников: {len(result['migrated'])}")
     print(f"Записей отметок: {result['rows_written']}")
+    if result["patronymic_filled"]:
+        print(f"\nДополнено отчество в migbot (было короче, чем в Sheets) ({len(result['patronymic_filled'])}):")
+        for old_name, new_name in result["patronymic_filled"]:
+            print(f"  • {old_name}  →  {new_name}")
     if result["fuzzy_matched"]:
         print(f"\nНечёткое совпадение по Фамилия+Имя (проверь сам, что это те же люди) ({len(result['fuzzy_matched'])}):")
         for sheets_name, migbot_name in result["fuzzy_matched"]:
