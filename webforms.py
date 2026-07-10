@@ -1068,6 +1068,7 @@ def tabel_page(request: Request, year: int | None = None, month: int | None = No
     days_in_month = calendar.monthrange(year, month)[1]
 
     s = tabel.day_summary(db)
+    active_count = len(tabel.get_active_employees(db))
     grid = tabel.get_month_codes(db, year, month)
 
     # Навигация месяц назад/вперёд.
@@ -1084,7 +1085,7 @@ def tabel_page(request: Request, year: int | None = None, month: int | None = No
     )
     summary_html = f"""
 <div class="card" style="font-weight:400">
-<div style="font-size:13px;color:var(--sub);margin-bottom:6px">Табель за {today.strftime("%d.%m.%Y")}</div>
+<div style="font-size:13px;color:var(--sub);margin-bottom:6px">Табель за {today.strftime("%d.%m.%Y")} — активных по списку: {active_count}</div>
 <div style="display:flex;flex-wrap:wrap;gap:2px">
 {_stat("☀️", "День", s['day'])}{_stat("🌙", "Ночь", s['night'])}{_stat("😴", "Отдых", s['rest'])}
 {_stat("🤒", "Больн.", s['sick'])}{_stat("✈️", "Межвахта", s['rotation'])}{_stat("❌", "Неявка", s['absent'])}
