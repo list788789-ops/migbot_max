@@ -690,6 +690,15 @@ async def on_callback(event: MessageCallback):
             await responder.send("Разметка явки доступна только зарегистрированным пользователям. "
                                   "Выполните /login.")
             return
+        with Session(engine) as session:
+            never_marked = tabel.get_never_marked_employees(session)
+        if never_marked:
+            names = "\n".join(f"  • {e.full_name} (договор с {e.contract_date:%d.%m.%Y})"
+                               for e in never_marked)
+            await responder.send(
+                f"⚠️ Оформлены, но по ним ещё НИ РАЗУ не было отметки явки:\n{names}\n\n"
+                f"Возможно, забыли внести в утренний обход — проверьте."
+            )
         await _deliver_picker(responder, "utroday", extra_button=_tabel_extra_button("utroday"))
         return
 
