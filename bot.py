@@ -1815,6 +1815,8 @@ async def morning_job():
             if p["weekend_count"] >= tabel.WEEKEND_THRESHOLD:
                 details.append(f"выходных: {p['weekend_count']}")
             lines.append(f"  • {p['name']} — {', '.join(details)}")
+        lines.append("\nℹ️ Это сообщение будет приходить каждое утро, пока показатели "
+                      "не опустятся ниже порога — само не исчезнет.")
         text = "\n".join(lines)
         for chat_id in chat_ids:
             try:
@@ -1829,7 +1831,9 @@ async def morning_job():
         names = "\n".join(f"  • {e.full_name} (договор с {e.contract_date:%d.%m.%Y})"
                            for e in never_marked)
         text = (f"⚠️ Оформлены, но по ним ещё НИ РАЗУ не было отметки явки:\n{names}\n\n"
-                f"Возможно, забыли внести в утренний обход — проверьте и отметьте.")
+                f"Возможно, забыли внести в утренний обход — проверьте и отметьте.\n\n"
+                f"ℹ️ Если нажмёте «Ознакомлен» — сегодня повторно не пришлю, но если "
+                f"проблема не решена, напомню снова завтра утром.")
         kb = InlineKeyboardBuilder()
         kb.row(CallbackButton(text="✅ Ознакомлен", payload="ack_never_marked"))
         for chat_id in chat_ids:
@@ -1846,7 +1850,10 @@ async def morning_job():
         kb.row(CallbackButton(text="✅ Подтверждаю возврат", payload=f"rotconfirm:{r['employee_id']}"))
         kb.row(CallbackButton(text="📅 Продлить межвахту", payload=f"rotextend:{r['employee_id']}"))
         text = (f"⏰ {r['name']}: ожидаемый возврат с межвахты — "
-                f"{r['return_date']:%d.%m.%Y}.\nПодтвердите или продлите:")
+                f"{r['return_date']:%d.%m.%Y}.\nПодтвердите или продлите:\n\n"
+                f"ℹ️ Будет приходить ежедневно, пока дата не пройдёт — "
+                f"«Подтверждаю» не останавливает напоминание, только «Продлить» "
+                f"сдвигает дату дальше.")
         for chat_id in chat_ids:
             try:
                 await bot.send_message(chat_id=chat_id, text=text, attachments=[kb.as_markup()])
@@ -1870,7 +1877,9 @@ async def morning_job():
         kb.row(CallbackButton(text="✈️ Уточнить дату возврата",
                                 payload=f"empact_clarify_rot:{item['employee_id']}"))
         text = (f"❓ {item['name']}: стоит на МЖ, но дата возврата не уточнена.\n"
-                f"Укажите, когда он вернётся к работе:")
+                f"Укажите, когда он вернётся к работе:\n\n"
+                f"ℹ️ Это напоминание будет приходить каждое утро, пока не укажете дату — "
+                f"после этого исчезнет само.")
         for chat_id in chat_ids:
             try:
                 await bot.send_message(chat_id=chat_id, text=text, attachments=[kb.as_markup()])
