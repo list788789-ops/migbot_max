@@ -48,6 +48,7 @@ from __future__ import annotations
 import html
 import logging
 import os
+import calendar
 from datetime import date, datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -79,6 +80,7 @@ from models import (
     SystemFlag,
 )
 from obligations import create_obligations_for_employee
+import tabel
 from deadlines import lead_days_for
 from document_templates import (
     CLINIC_CHIEF_DOCTOR_NAME,
@@ -466,6 +468,7 @@ def _nav(active: str = "", role: str = "") -> str:
     role: роль пользователя — 'admin' добавляет пункт «Пользователи» (управление доступом)."""
     items = [
         ("home", "/", "Рабочий стол"),
+        ("tabel", "/tabel", "Табель"),
         ("employees", "/employees", "Сотрудники"),
         ("medical", "/medical", "Медкомиссия"),
     ]
@@ -986,6 +989,151 @@ def attention_rotation_resolve(employee_id: str, request: Request, db: Session =
         db.add(rr)
         db.commit()
     return RedirectResponse("/", status_code=303)
+
+
+# --- Табель (2026-07, слияние с ботом ТабельБелокаменка) --------------------
+# Видят все три роли (PRORAB тоже — узкое исключение из "не пишет в БД", см.
+# UserRole.PRORAB в models.py). Разметка через веб — та же tabel.py, что и бот,
+# один источник правды (attendance_marks), просто два интерфейса ввода.
+
+_TABEL_CODE_OPTIONS = [
+    ("", "—"),
+    (tabel.DAY, "Д — день"),
+    ("С", "С — сутки"),
+    (tabel.NIGHT, "НЧ — ночь"),
+    (tabel.REST, "О — отдых"),
+    (tabel.SICK, "Б — больничный"),
+    (tabel.ROTATION, "МЖ — межвахта"),
+    (tabel.ABSENT, "Н — неявка"),
+    (tabel.MIGR, "МУ — мигр.учёт"),
+    (tabel.WEEKEND, "В — выходной"),
+]
+
+
+@app.get("/tabel", response_class=HTMLResponse)
+def tabel_page(request: Request, year: int | None = None, month: int | None = None,
+                db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    today = datetime.now(MSK).date()
+    year = year or today.year
+    month = month or today.month
+    days_in_month = calendar.monthrange(year, month)[1]
+
+    s = tabel.day_summary(db)
+    grid = tabel.get_month_codes(db, year, month)
+
+    # Навигация месяц назад/вперёд.
+    prev_month, prev_year = (12, year - 1) if month == 1 else (month - 1, year)
+    next_month, next_year = (1, year + 1) if month == 12 else (month + 1, year)
+    month_names = ["", "январь", "февраль", "март", "апрель", "май", "июнь",
+                    "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
+
+    summary_html = f"""
+<div class="card">
+☀️ День: {s['day']}&nbsp;&nbsp;🌙 Ночь: {s['night']}&nbsp;&nbsp;😴 Отдых: {s['rest']}<br>
+🤒 Больн.: {s['sick']}&nbsp;&nbsp;✈️ Межвахта: {s['rotation']}&nbsp;&nbsp;❌ Неявка: {s['absent']}<br>
+📋 Мигр.учёт: {s['migr']}
+</div>
+"""
+    if s["absent_list"]:
+        summary_html += '<div class="card">Отсутствуют/особое:<br>' + "".join(
+            f"{html.escape(name)} — {code}<br>" for name, code in s["absent_list"]
+        ) + "</div>"
+
+    # Заголовок с числами месяца.
+    header_cells = "".join(f'<th style="min-width:30px">{d}</th>' for d in range(1, days_in_month + 1))
+    is_current_month = (year == today.year and month == today.month)
+
+    rows_html = ""
+    for emp_id, data in sorted(grid.items(), key=lambda kv: kv[1]["name"]):
+        cells = ""
+        for i, code in enumerate(data["codes"]):
+            day_num = i + 1
+            day_date = date(year, month, day_num)
+            is_today_col = is_current_month and day_num == today.day
+            bg = " background:#eaf0fb;" if is_today_col else ""
+            options_html = "".join(
+                f'<option value="{val}"{" selected" if val == code else ""}>{val or "—"}</option>'
+                for val, _label in _TABEL_CODE_OPTIONS
+            )
+            cells += (
+                f'<td style="padding:2px;{bg}">'
+                f'<form method="post" action="/tabel/mark" class="inline">'
+                f'<input type="hidden" name="employee_id" value="{emp_id}">'
+                f'<input type="hidden" name="mark_date" value="{day_date.isoformat()}">'
+                f'<input type="hidden" name="year" value="{year}">'
+                f'<input type="hidden" name="month" value="{month}">'
+                f'<select name="code" onchange="this.form.submit()" '
+                f'style="min-height:32px;padding:2px;margin:0;font-size:12px;width:56px">'
+                f'{options_html}</select></form></td>'
+            )
+        rows_html += (
+            f'<tr><td style="white-space:nowrap;font-weight:600;padding:4px 8px 4px 0">'
+            f'{html.escape(data["name"])}</td>{cells}</tr>'
+        )
+
+    body = f"""
+<h1>Табель</h1>
+{summary_html}
+<section style="overflow-x:auto">
+<h2>{month_names[month]} {year}
+&nbsp;
+<a class="btn secondary" href="/tabel?year={prev_year}&month={prev_month}">← </a>
+<a class="btn secondary" href="/tabel?year={next_year}&month={next_month}"> →</a>
+</h2>
+<table style="border-collapse:collapse;font-size:13px">
+<thead><tr><th></th>{header_cells}</tr></thead>
+<tbody>{rows_html}</tbody>
+</table>
+<p class="muted">Изменение ячейки применяется сразу при выборе. "С" (сутки) и полноценная
+постановка "МЖ" с указанием даты возврата и типа отбытия — доступны с полными проверками
+через MAX-бота; здесь — быстрая правка кода без пошагового флоу.</p>
+</section>
+"""
+    return _render("Табель", body, active="tabel", role=request.session.get("role", ""))
+
+
+@app.post("/tabel/mark")
+def tabel_mark(
+    request: Request,
+    employee_id: str = Form(...),
+    mark_date: str = Form(...),
+    code: str = Form(""),
+    year: int = Form(...),
+    month: int = Form(...),
+    db: Session = Depends(get_db),
+):
+    """Запись одной ячейки табеля из веба. Роль не ограничивается (см. договорённость —
+    все три роли могут ставить/менять отметки), но вход обязателен."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    actor = _actor_name(request, db)
+    employee = db.get(Employee, employee_id)
+    if employee is None:
+        return RedirectResponse(f"/tabel?year={year}&month={month}", status_code=303)
+
+    d = datetime.strptime(mark_date, "%Y-%m-%d").date()
+
+    if code == "":
+        tabel.clear_day_slot(db, employee, d)
+        tabel.clear_night_slot(db, employee, d)
+    elif code == tabel.DAY:
+        tabel.mark_day(db, employee, actor, d)
+    elif code == "С":
+        tabel.mark_sutki(db, employee, actor, d)
+    elif code == tabel.NIGHT:
+        tabel.mark_night(db, employee, actor, d)
+    elif code == tabel.REST:
+        tabel.set_rest(db, employee, actor, d)
+    elif code in (tabel.SICK, tabel.ROTATION, tabel.ABSENT, tabel.MIGR, tabel.WEEKEND):
+        # МЖ через веб — без даты возврата/типа отбытия (упрощённая правка кода,
+        # см. предупреждение на странице). Полноценная постановка — через бота.
+        tabel.set_reason(db, employee, code, actor, d)
+
+    return RedirectResponse(f"/tabel?year={year}&month={month}", status_code=303)
 
 
 # --- Сотрудники: список + единая карточка ------------------------------------
