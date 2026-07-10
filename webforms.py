@@ -75,6 +75,7 @@ from models import (
     ObligationType,
     Referral,
     RegistrationStatus,
+    RotationReturn,
     SystemFlag,
 )
 from obligations import create_obligations_for_employee
@@ -883,6 +884,36 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
             f'<a class="btn" href="/employees/{e.id}">Открыть карточку</a></div>'
         )
 
+    # Межвахта с открытыми обязательствами (2026-07, слияние с ботом ТабельБелокаменка).
+    # Видит только кадровик/админ — прораб ставит межвахту не глядя на это (см.
+    # UserRole.PRORAB в models.py и договорённость "данные направлены в отдел кадров").
+    role = request.session.get("role", "")
+    rotation_flags = []
+    if role in ("kadrovik", "admin"):
+        rotation_flags = db.scalars(
+            select(RotationReturn)
+            .where(RotationReturn.flagged == True)  # noqa: E712
+            .where(RotationReturn.reviewed_at.is_(None))
+        ).all()
+
+    def rotation_row(rr: RotationReturn) -> str:
+        emp = rr.employee
+        open_obl = [
+            o for o in (emp.obligations if emp else [])
+            if o.is_current and o.status in (ObligationStatus.PENDING, ObligationStatus.OVERDUE)
+        ]
+        obl_labels = ", ".join(
+            f"{OBLIGATION_LABELS.get(o.type, o.type.value)} ({o.status.value})" for o in open_obl
+        ) or "—"
+        return (
+            f'<div class="card">{emp.full_name if emp else "?"} — межвахта до '
+            f'{rr.expected_return_date.strftime("%d.%m.%Y")}<br>'
+            f'<span class="badge red">Открытые обязательства: {obl_labels}</span><br>'
+            f'<form method="post" action="/attention/rotation/{rr.employee_id}/resolve" style="display:inline">'
+            f'<button type="submit" class="btn">✅ Разобрано</button></form> '
+            f'<a class="btn" href="/employees/{rr.employee_id}">Открыть карточку</a></div>'
+        )
+
     test_banner = (
         '<div class="warning-banner">⚠ Тестовый режим включён (TEST_ALLOW_MISSING_FIELDS): '
         'документы для медкомиссии генерируются с прочерками вместо незаполненных полей. '
@@ -926,6 +957,11 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
 {''.join(attention_row(e, b) for e, b in needs_attention) or '<p class="muted">У всех сотрудников заполнены ключевые поля.</p>'}
 </section>
 
+{f'''<section class="grid">
+<h2>🔄 Межвахта с открытыми обязательствами ({len(rotation_flags)})</h2>
+{"".join(rotation_row(rr) for rr in rotation_flags) or '<p class="muted">Нет.</p>'}
+</section>''' if role in ("kadrovik", "admin") else ""}
+
 <section>
 <h2>Медкомиссия</h2>
 <div class="card">Нужно направление: {len(need_referral)}<br>
@@ -938,6 +974,20 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
     return _render("Рабочий стол", body, active="home", role=request.session.get("role",""))
 
 
+@app.post("/attention/rotation/{employee_id}/resolve")
+def attention_rotation_resolve(employee_id: str, request: Request, db: Session = Depends(get_db)):
+    """Кадровик отмечает флаг межвахты как разобранный — вручную, не снимается
+    автоматически при закрытии обязательств (см. docstring RotationReturn в models.py)."""
+    user = _require_role(request, db, UserRole.KADROVIK)
+    rr = db.get(RotationReturn, employee_id)
+    if rr is not None and rr.flagged:
+        rr.reviewed_at = datetime.now(MSK)
+        rr.reviewed_by = user.id
+        db.add(rr)
+        db.commit()
+    return RedirectResponse("/", status_code=303)
+
+
 # --- Сотрудники: список + единая карточка ------------------------------------
 
 @app.get("/employees", response_class=HTMLResponse)
@@ -946,7 +996,12 @@ def employees_list(request: Request, db: Session = Depends(get_db)):
         return RedirectResponse("/login", status_code=303)
 
     today = datetime.now(MSK).date()
-    employees = db.scalars(select(Employee).order_by(Employee.full_name)).all()
+    # 2026-07: исключены уволенные (contract_end_date заполнен) — для них уже есть
+    # отдельный /archive; раньше показывались в обоих местах одновременно.
+    employees = db.scalars(
+        select(Employee).where(Employee.contract_end_date.is_(None))
+        .order_by(Employee.full_name)
+    ).all()
 
     def nearest_pending(e: Employee):
         obs = [o for o in e.obligations if o.is_current and o.status == ObligationStatus.PENDING]
