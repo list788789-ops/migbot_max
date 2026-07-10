@@ -377,6 +377,18 @@ class User(Base):
     failed_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     locked_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
+    # Привязка MAX-аккаунта (2026-07, слияние с ботом ТабельБелокаменка).
+    # user_id из события maxapi (event.message.sender.user_id) — числовой ID,
+    # никак не связанный с телефоном сам по себе. Привязывается один раз через
+    # команду /login <телефон> в самом боте: бот ищет User по телефону,
+    # проверяет status=APPROVED, и если max_user_id ещё пуст — записывает сюда.
+    # Дальше бот узнаёт роль/права человека по этому полю, не спрашивая телефон
+    # заново при каждом обращении. NULL = ещё не привязан к MAX вообще.
+    # На боевой БД добавить колонку вручную (create_all не меняет существующие
+    # таблицы):
+    #   ALTER TABLE users ADD COLUMN max_user_id VARCHAR UNIQUE;
+    max_user_id: Mapped[str | None] = mapped_column(String, nullable=True, unique=True)
+
 
 class Consent(Base):
     __tablename__ = "consents"
