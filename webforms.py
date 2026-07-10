@@ -1076,11 +1076,20 @@ def tabel_page(request: Request, year: int | None = None, month: int | None = No
     month_names = ["", "январь", "февраль", "март", "апрель", "май", "июнь",
                     "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
 
+    _stat = lambda emoji, label, value: (
+        f'<div style="flex:1 1 auto;min-width:70px;text-align:center;padding:8px 4px">'
+        f'<div style="font-size:20px">{emoji}</div>'
+        f'<div style="font-size:20px;font-weight:700">{value}</div>'
+        f'<div style="font-size:11px;color:var(--sub)">{label}</div></div>'
+    )
     summary_html = f"""
-<div class="card">
-☀️ День: {s['day']}&nbsp;&nbsp;🌙 Ночь: {s['night']}&nbsp;&nbsp;😴 Отдых: {s['rest']}<br>
-🤒 Больн.: {s['sick']}&nbsp;&nbsp;✈️ Межвахта: {s['rotation']}&nbsp;&nbsp;❌ Неявка: {s['absent']}<br>
-📋 Мигр.учёт: {s['migr']}
+<div class="card" style="font-weight:400">
+<div style="font-size:13px;color:var(--sub);margin-bottom:6px">Табель за {today.strftime("%d.%m.%Y")}</div>
+<div style="display:flex;flex-wrap:wrap;gap:2px">
+{_stat("☀️", "День", s['day'])}{_stat("🌙", "Ночь", s['night'])}{_stat("😴", "Отдых", s['rest'])}
+{_stat("🤒", "Больн.", s['sick'])}{_stat("✈️", "Межвахта", s['rotation'])}{_stat("❌", "Неявка", s['absent'])}
+{_stat("📋", "Мигр.учёт", s['migr'])}
+</div>
 </div>
 """
     if s["absent_list"]:
@@ -1089,11 +1098,15 @@ def tabel_page(request: Request, year: int | None = None, month: int | None = No
             tabel.MIGR: "neutral", tabel.WEEKEND: "green",
         }
         absent_cards = "".join(
-            f'<div class="card">{html.escape(name)}<br>'
-            f'<span class="badge {_absent_badge.get(code, "neutral")}">{code}</span></div>'
+            f'<div class="card" style="display:flex;justify-content:space-between;'
+            f'align-items:center;gap:8px;font-weight:400">'
+            f'<span>{html.escape(name)}</span>'
+            f'<span class="badge {_absent_badge.get(code, "neutral")}" style="margin:0">{code}</span></div>'
             for name, code in s["absent_list"]
         )
-        summary_html += f'<section class="grid"><h2>Отсутствуют/особое ({len(s["absent_list"])})</h2>{absent_cards}</section>'
+        summary_html += f'<section><h2>Отсутствуют/особое ({len(s["absent_list"])})</h2>{absent_cards}</section>'
+
+    # Закреплённый (sticky) стиль для колонки номера — при горизонтальной прокрутке
 
     # Закреплённый (sticky) стиль для колонки номера — при горизонтальной прокрутке
     # ФИО и дни уходят влево вместе с остальной таблицей, а № остаётся на месте.
