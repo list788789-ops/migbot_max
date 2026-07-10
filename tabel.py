@@ -544,17 +544,45 @@ def extend_rotation(session: Session, employee: Employee, new_return_date: date)
 
 
 def get_rotation_reminders(session: Session, days_before: int = 3) -> list[dict]:
-    """Кто возвращается с межвахты в пределах days_before дней — для cron-напоминания."""
+    """Кто возвращается с межвахты в пределах days_before дней — для cron-напоминания.
+    Пропускает записи с expected_return_date=NULL (заглушки "нужно уточнить") —
+    те не про приближающийся срок, а про полное отсутствие даты, см.
+    get_pending_clarification_rotations."""
     today = date.today()
     rows = session.query(RotationReturn).all()
     result = []
     for rr in rows:
+        if rr.expected_return_date is None:
+            continue
         delta = (rr.expected_return_date - today).days
         if 0 <= delta <= days_before:
             employee = session.get(Employee, rr.employee_id)
             if employee is not None:
                 result.append({"employee_id": employee.id, "name": employee.full_name,
                                 "return_date": rr.expected_return_date})
+    return result
+
+
+def get_pending_clarification_rotations(session: Session) -> list[dict]:
+    """
+    Кто стоит на МЖ (заглушка создана разовым скриптом при переносе истории —
+    2026-07), но дата возврата НЕИЗВЕСТНА (expected_return_date=NULL). Нужна
+    ДЛЯ ДВУХ адресатов:
+      - прораб уточняет дату (флоу тот же, что при обычной постановке МЖ);
+      - кадровик видит список, чтобы дёргать прораба, если тот не уточняет.
+
+    Возвращает [{"employee_id", "name"}].
+    """
+    rows = (
+        session.query(RotationReturn)
+        .filter(RotationReturn.expected_return_date.is_(None))
+        .all()
+    )
+    result = []
+    for rr in rows:
+        employee = session.get(Employee, rr.employee_id)
+        if employee is not None:
+            result.append({"employee_id": employee.id, "name": employee.full_name})
     return result
 
 
