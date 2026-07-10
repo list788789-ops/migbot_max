@@ -640,3 +640,60 @@ def get_month_codes(session: Session, year: int | None = None, month: int | None
                 codes.append("")
         result[e.id] = {"name": e.full_name, "codes": codes}
     return result
+
+
+# Пороги месячной проверки "проблемных" (см. get_monthly_problems). WEEKEND_THRESHOLD
+# явно назван в задаче ("с тремя выходными"). ABSENT_THRESHOLD не был назван явно —
+# [Предполагаю] беру >=1 (любая неявка в текущем месяце достойна внимания прораба),
+# это легко поменять одной константой, если нужен другой порог.
+ABSENT_THRESHOLD = 1
+WEEKEND_THRESHOLD = 3
+
+
+def get_monthly_problems(session: Session, year: int | None = None,
+                          month: int | None = None) -> list[dict]:
+    """
+    Кто за текущий месяц накопил >= ABSENT_THRESHOLD неявок (Н) ИЛИ
+    >= WEEKEND_THRESHOLD выходных (В). Возвращает
+    [{"name", "absent_count", "weekend_count"}] только для тех, кто превысил
+    хотя бы один порог.
+    """
+    today = date.today()
+    year = year or today.year
+    month = month or today.month
+
+    active = get_active_employees(session)
+    active_ids = [e.id for e in active]
+    names_by_id = {e.id: e.full_name for e in active}
+
+    import calendar as _calendar
+    days_in_month = _calendar.monthrange(year, month)[1]
+
+    rows = (
+        session.query(AttendanceMark.employee_id, AttendanceMark.code)
+        .filter(AttendanceMark.employee_id.in_(active_ids))
+        .filter(AttendanceMark.slot == "day")
+        .filter(AttendanceMark.mark_date >= date(year, month, 1))
+        .filter(AttendanceMark.mark_date <= date(year, month, days_in_month))
+        .filter(AttendanceMark.code.in_([ABSENT, WEEKEND]))
+        .all()
+    )
+
+    counts = {}  # employee_id -> {"absent": n, "weekend": n}
+    for employee_id, code in rows:
+        c = counts.setdefault(employee_id, {"absent": 0, "weekend": 0})
+        if code == ABSENT:
+            c["absent"] += 1
+        elif code == WEEKEND:
+            c["weekend"] += 1
+
+    result = []
+    for employee_id, c in counts.items():
+        if c["absent"] >= ABSENT_THRESHOLD or c["weekend"] >= WEEKEND_THRESHOLD:
+            result.append({
+                "name": names_by_id.get(employee_id, "?"),
+                "absent_count": c["absent"],
+                "weekend_count": c["weekend"],
+            })
+    result.sort(key=lambda r: r["name"])
+    return result
