@@ -1042,12 +1042,18 @@ def tabel_page(request: Request, year: int | None = None, month: int | None = No
             f"{html.escape(name)} — {code}<br>" for name, code in s["absent_list"]
         ) + "</div>"
 
+    # Закреплённый (sticky) стиль для колонки номера — при горизонтальной прокрутке
+    # ФИО и дни уходят влево вместе с остальной таблицей, а № остаётся на месте.
+    _num_sticky = "position:sticky;left:0;background:#fff;z-index:2;"
+
     # Заголовок с числами месяца.
     header_cells = "".join(f'<th style="min-width:30px">{d}</th>' for d in range(1, days_in_month + 1))
     is_current_month = (year == today.year and month == today.month)
 
     rows_html = ""
-    for emp_id, data in sorted(grid.items(), key=lambda kv: kv[1]["name"]):
+    for row_num, (emp_id, data) in enumerate(
+        sorted(grid.items(), key=lambda kv: kv[1]["name"]), start=1
+    ):
         cells = ""
         for i, code in enumerate(data["codes"]):
             day_num = i + 1
@@ -1070,7 +1076,9 @@ def tabel_page(request: Request, year: int | None = None, month: int | None = No
                 f'{options_html}</select></form></td>'
             )
         rows_html += (
-            f'<tr><td style="white-space:nowrap;font-weight:600;padding:4px 8px 4px 0">'
+            f'<tr>'
+            f'<td style="{_num_sticky}padding:4px 8px;text-align:right;color:var(--sub)">{row_num}</td>'
+            f'<td style="white-space:nowrap;font-weight:600;padding:4px 8px 4px 0">'
             f'{html.escape(data["name"])}</td>{cells}</tr>'
         )
 
@@ -1084,7 +1092,7 @@ def tabel_page(request: Request, year: int | None = None, month: int | None = No
 <a class="btn secondary" href="/tabel?year={next_year}&month={next_month}"> →</a>
 </h2>
 <table style="border-collapse:collapse;font-size:13px">
-<thead><tr><th></th>{header_cells}</tr></thead>
+<thead><tr><th style="position:sticky;left:0;background:#fff;z-index:2">№</th><th></th>{header_cells}</tr></thead>
 <tbody>{rows_html}</tbody>
 </table>
 <p class="muted">Изменение ячейки применяется сразу при выборе. "С" (сутки) и полноценная
