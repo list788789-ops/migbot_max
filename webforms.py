@@ -266,13 +266,9 @@ def _password_problems(pw: str) -> list[str]:
     return problems
 
 
-def _normalize_phone(phone: str) -> str:
-    """Телефон-логин к единому виду: только цифры, ведущая 8 -> 7. Чтобы +7/8/пробелы
-    не создавали разных логинов одному человеку."""
-    digits = "".join(ch for ch in (phone or "") if ch.isdigit())
-    if digits.startswith("8") and len(digits) == 11:
-        digits = "7" + digits[1:]
-    return digits
+from common_utils import normalize_phone as _normalize_phone
+# _normalize_phone вынесена в common_utils.py — используется и здесь, и в bot.py.
+# Оставлена под старым именем (алиас), чтобы не трогать все места вызова в этом файле.
 
 
 def _current_user(request: Request, db: Session):
@@ -1108,11 +1104,13 @@ def employees_archive(request: Request, db: Session = Depends(get_db)):
 # Гражданство выбирается из стран ЕАЭС; категория ВЫВОДИТСЯ из него (не отдельное поле),
 # чтобы исключить рассинхрон "Казахстан + BELARUS". Беларусь -> BELARUS, остальные -> EAEU.
 CITIZENSHIP_OPTIONS = ["Казахстан", "Киргизия", "Армения", "Беларусь"]
-CITIZENSHIP_TO_CATEGORY = {"Беларусь": Category.BELARUS}  # default -> EAEU
-
-
-def _category_for_citizenship(citizenship: str) -> Category:
-    return CITIZENSHIP_TO_CATEGORY.get((citizenship or "").strip(), Category.EAEU)
+from common_utils import (
+    CITIZENSHIP_TO_CATEGORY,
+    category_for_citizenship as _category_for_citizenship,
+)
+# Вынесено в common_utils.py — используется и здесь, и в bot.py (там раньше была
+# другая, неверная проверка на английское "belarus" вместо русского "Беларусь" —
+# несовпадение обнаружилось только при выносе в общий модуль).
 
 
 def _new_employee_form_html(values: dict, error: str = "") -> str:
