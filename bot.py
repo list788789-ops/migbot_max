@@ -1853,6 +1853,30 @@ async def morning_job():
             except Exception:
                 log.exception("morning_job: не удалось отправить напоминание в chat_id=%s", chat_id)
 
+    # 4. Уточнить дату возврата с межвахты (2026-07) — заглушки без даты
+    # (см. tabel.get_pending_clarification_rotations). Это адресовано ПРОРАБУ
+    # (он вводит дату), не кадровику — тот минимально работает в MAX, его
+    # версия этой же задачи теперь в веб-дашборде (см. webforms.py). Кнопка
+    # ведёт прямо в тот же флоу ввода даты, что и "🧹 Действия с сотрудником".
+    try:
+        with Session(engine) as session:
+            pending_rotation = tabel.get_pending_clarification_rotations(session)
+    except Exception:
+        log.exception("morning_job: не удалось прочитать pending_rotation")
+        pending_rotation = []
+
+    for item in pending_rotation:
+        kb = InlineKeyboardBuilder()
+        kb.row(CallbackButton(text="✈️ Уточнить дату возврата",
+                                payload=f"empact_clarify_rot:{item['employee_id']}"))
+        text = (f"❓ {item['name']}: стоит на МЖ, но дата возврата не уточнена.\n"
+                f"Укажите, когда он вернётся к работе:")
+        for chat_id in chat_ids:
+            try:
+                await bot.send_message(chat_id=chat_id, text=text, attachments=[kb.as_markup()])
+            except Exception:
+                log.exception("morning_job: не удалось отправить pending_rotation в chat_id=%s", chat_id)
+
 
 async def main():
     scheduler = AsyncIOScheduler(timezone=MSK)
