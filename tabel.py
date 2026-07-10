@@ -296,6 +296,11 @@ def count_migr_today(session: Session, mark_date: date | None = None) -> int:
 
 # ================= МЕЖВАХТА: ФЛАГ ДЛЯ КАДРОВИКА =================
 
+DEPARTURE_ABROAD = "abroad"      # пересёк границу РФ — новая постановка на учёт
+DEPARTURE_DOMESTIC = "domestic"  # остался в РФ, но покидал место пребывания
+DEPARTURE_NONE = "none"          # физически не выезжал с площадки
+
+
 def get_open_obligations(session: Session, employee_id: str) -> list[Obligation]:
     return (
         session.query(Obligation)
@@ -307,12 +312,17 @@ def get_open_obligations(session: Session, employee_id: str) -> list[Obligation]
 
 
 def set_rotation(session: Session, employee: Employee, expected_return_date: date,
-                  created_by: str, mark_date: date | None = None) -> bool:
+                  created_by: str, departure_type: str | None = None,
+                  mark_date: date | None = None) -> bool:
     """
     Ставит МЖ прорабу без задержек. Если есть открытые обязательства — не
     блокирует, но создаёт/обновляет флаг для кадровика (rotation_returns.flagged).
     Возвращает True, если флаг был поднят (для сообщения прорабу "данные
     направлены в отдел кадров" — без деталей обязательств, см. договорённость).
+
+    departure_type (DEPARTURE_ABROAD/DOMESTIC/NONE) — определяет, какое
+    юридическое событие сработает при ФАКТИЧЕСКОМ возврате, см.
+    apply_rotation_return().
     """
     mark_date = mark_date or date.today()
     set_reason(session, employee, ROTATION, created_by, mark_date)
@@ -331,10 +341,47 @@ def set_rotation(session: Session, employee: Employee, expected_return_date: dat
         rr.reviewed_at = None
         rr.reviewed_by = None
 
+    rr.departure_type = departure_type
     rr.flagged = flagged
     rr.flagged_at = now if flagged else None
     session.commit()
     return flagged
+
+
+def apply_rotation_return(session: Session, employee: Employee, actual_return_date: date) -> str:
+    """
+    Вызывается при ФАКТИЧЕСКОМ возврате с межвахты (см. договорённость про три
+    типа отбытия). Смотрит departure_type, сохранённый при постановке МЖ:
+
+      DEPARTURE_ABROAD   -> create_registration_obligation_for_return (новая
+                            постановка на учёт, БЕЗ дактилоскопии/медосмотра).
+      DEPARTURE_DOMESTIC -> employee.address_since = дата возврата, дальше
+                            отрабатывает уже существующее правило
+                            REGISTRATION/address_since в deadlines.py — но
+                            нужен полный create_obligations_for_employee,
+                            чтобы это правило реально сработало (он же и
+                            версионирует старую REGISTRATION).
+      DEPARTURE_NONE / не указано -> ничего не создаём, регистрация не
+                            прерывалась.
+
+    Возвращает departure_type (или "none", если не был указан) — для текста
+    сообщения человеку.
+    """
+    from obligations import create_obligations_for_employee, create_registration_obligation_for_return
+
+    rr = session.get(RotationReturn, employee.id)
+    departure_type = rr.departure_type if rr else None
+
+    if departure_type == DEPARTURE_ABROAD:
+        create_registration_obligation_for_return(session, employee, actual_return_date)
+    elif departure_type == DEPARTURE_DOMESTIC:
+        employee.address_since = actual_return_date
+        session.add(employee)
+        session.commit()
+        create_obligations_for_employee(session, employee)
+    # DEPARTURE_NONE или None — ничего не делаем.
+
+    return departure_type or DEPARTURE_NONE
 
 
 def list_flagged_rotations(session: Session) -> list[RotationReturn]:
