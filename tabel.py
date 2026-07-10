@@ -194,6 +194,16 @@ def mark_night(session: Session, employee: Employee, created_by: str,
     _set_mark(session, employee, mark_date, "night", NIGHT, created_by)
 
 
+def mark_sutki(session: Session, employee: Employee, created_by: str,
+               mark_date: date | None = None) -> None:
+    """Сутки — отработал и день, и ночь в одну дату (двойная смена). Через обычные
+    Утро/Вечер в боте так не поставить (Вечер намеренно исключает уже отработавших
+    день, см. get_not_worked_day) — это ручная правка, доступная только из веба."""
+    mark_date = mark_date or date.today()
+    _set_mark(session, employee, mark_date, "day", DAY, created_by)
+    _set_mark(session, employee, mark_date, "night", NIGHT, created_by)
+
+
 def set_reason(session: Session, employee: Employee, code: str, created_by: str,
                mark_date: date | None = None) -> None:
     """Причина отсутствия в дневной слот: Н/Б/МЖ/МУ/В."""
@@ -489,3 +499,52 @@ def day_summary(session: Session, mark_date: date | None = None) -> dict:
         "sick": counts[SICK], "rotation": counts[ROTATION], "absent": counts[ABSENT],
         "migr": counts[MIGR], "absent_list": absent_list, "total": len(active),
     }
+
+
+def get_month_codes(session: Session, year: int | None = None, month: int | None = None) -> dict:
+    """
+    Помесячная сетка для веба (аналог старой сетки Google Sheets табеля):
+    {employee_id: {"name": ФИО, "codes": [код_день1, код_день2, ...]}}
+
+    День+ночь объединяются в один код на дату — 'С' (сутки), если стоит и
+    Д, и НЧ в один день; иначе код дня, если он есть; иначе НЧ, если стоит
+    только ночь (день пуст/не Д); иначе пусто ("").
+    """
+    import calendar as _calendar
+
+    today = date.today()
+    year = year or today.year
+    month = month or today.month
+    days_in_month = _calendar.monthrange(year, month)[1]
+
+    active = get_active_employees(session)
+    active_ids = [e.id for e in active]
+
+    marks = (
+        session.query(AttendanceMark)
+        .filter(AttendanceMark.employee_id.in_(active_ids))
+        .filter(AttendanceMark.mark_date >= date(year, month, 1))
+        .filter(AttendanceMark.mark_date <= date(year, month, days_in_month))
+        .all()
+    )
+    # (employee_id, day_number, slot) -> code
+    lookup = {}
+    for m in marks:
+        lookup[(m.employee_id, m.mark_date.day, m.slot)] = m.code
+
+    result = {}
+    for e in active:
+        codes = []
+        for d in range(1, days_in_month + 1):
+            day_code = lookup.get((e.id, d, "day"))
+            night_code = lookup.get((e.id, d, "night"))
+            if day_code == DAY and night_code == NIGHT:
+                codes.append("С")
+            elif day_code:
+                codes.append(day_code)
+            elif night_code == NIGHT:
+                codes.append(NIGHT)
+            else:
+                codes.append("")
+        result[e.id] = {"name": e.full_name, "codes": codes}
+    return result
