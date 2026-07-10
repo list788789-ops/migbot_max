@@ -73,10 +73,16 @@ class RegistrationStatus(str, enum.Enum):
 
 
 class UserRole(str, enum.Enum):
-    """Роли пользователей системы. PRORAB — только чтение и скачивание документов (договор,
-    квитанции, отчёты), без записи в БД. KADROVIK — всё по работникам (заключение, статусы,
-    правки), но НЕ управление пользователями. ADMIN — всё + одобрение заявок и управление
-    пользователями. Роль назначает админ при одобрении заявки (заявитель её не выбирает)."""
+    """Роли пользователей системы. PRORAB — чтение и скачивание документов (договор,
+    квитанции, отчёты) БЕЗ записи в основные таблицы (employees/obligations/consents и
+    т.д.), НО с узким исключением: разметка явки в attendance_marks (Утро/Вечер/Причины/
+    Межвахта, см. tabel.py) — это единственное, что PRORAB может писать. Решение
+    зафиксировано в 2026-07 при слиянии с ботом ТабельБелокаменка: разметка явки
+    исторически была основной функцией прораба, вынести её в отдельную роль сочли
+    избыточным (это тот же самый человек и та же обязанность, а не новая). KADROVIK —
+    всё по работникам (заключение, статусы, правки), но НЕ управление пользователями.
+    ADMIN — всё + одобрение заявок и управление пользователями. Роль назначает админ
+    при одобрении (заявитель её не выбирает)."""
     PRORAB = "prorab"
     KADROVIK = "kadrovik"
     ADMIN = "admin"
@@ -259,6 +265,40 @@ class Employee(Base):
     attendance_marks: Mapped[list["AttendanceMark"]] = relationship(
         back_populates="employee", cascade="all, delete-orphan"
     )
+
+
+class RotationReturn(Base):
+    """
+    Ожидаемая дата возврата с межвахты + флаг "требует внимания кадровика".
+
+    2026-07: слияние с ботом ТабельБелокаменка. Прораб ставит МЖ без задержек —
+    его работа не блокируется чужими просрочками. Но если на момент постановки
+    у сотрудника были незакрытые обязательства (Obligation, is_current=True,
+    status IN PENDING/OVERDUE) — flagged=True, и это попадает кадровику в раздел
+    "⚠️ Требует внимания" (видит только KADROVIK/ADMIN, не PRORAB — см. UserRole).
+
+    Одна строка на сотрудника (перезаписывается при новой межвахте) — история
+    предыдущих межвахт не нужна, только "когда ждать в этот раз" и "решено ли".
+    flagged НЕ снимается автоматически при закрытии обязательств — это
+    сознательная задача кадровику ("уточнить причину межвахты"), должна быть
+    явно закрыта им самим (reviewed_at/reviewed_by), а не молча исчезнуть,
+    когда кто-то другой закрыл дедлайн.
+
+    На боевой БД: create_all создаёт новые таблицы автоматически, ALTER TABLE
+    не нужен (это новая таблица целиком, не колонка в существующей).
+    """
+
+    __tablename__ = "rotation_returns"
+
+    employee_id: Mapped[str] = mapped_column(ForeignKey("employees.id"), primary_key=True)
+    expected_return_date: Mapped[date] = mapped_column(Date, nullable=False)
+
+    flagged: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    flagged_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    reviewed_by: Mapped[str | None] = mapped_column(String, nullable=True)  # User.id кадровика
+
+    employee: Mapped["Employee"] = relationship()
 
 
 class RegistrationPeriod(Base):
