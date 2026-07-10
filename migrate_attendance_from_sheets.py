@@ -123,6 +123,33 @@ def _fetch_employee_ids(conn, names: list) -> dict:
     return {full_name.strip().lower(): (emp_id, full_name) for emp_id, full_name in rows}
 
 
+def _name_key(name: str) -> str:
+    """Фамилия+Имя (первые 2 токена) в нижнем регистре — для fuzzy-сопоставления,
+    когда отчество записано по-разному в двух системах (см. find_fuzzy_matches
+    в sheets.py табеля — та же самая проблема, тот же приём)."""
+    parts = name.split()
+    return " ".join(parts[:2]).strip().lower() if len(parts) >= 2 else name.strip().lower()
+
+
+def _fetch_all_employees(conn) -> list:
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, full_name FROM employees")
+        return cur.fetchall()
+
+
+def _fuzzy_match(name: str, all_employees: list) -> tuple | None:
+    """Ищет среди ВСЕХ сотрудников migbot совпадение по Фамилия+Имя.
+    Возвращает (employee_id, migbot_full_name) или None. Если совпадений
+    больше одного — не угадываем, возвращаем None (пусть остаётся
+    в несопоставленных, разберётся человек)."""
+    key = _name_key(name)
+    matches = [(emp_id, full_name) for emp_id, full_name in all_employees
+               if _name_key(full_name) == key]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
 def migrate() -> dict:
     active_names, grid = _read_active_employee_grid()
     marks_by_name = _extract_marks(active_names, grid)
@@ -130,12 +157,19 @@ def migrate() -> dict:
     conn = psycopg2.connect(DATABASE_URL)
     conn.autocommit = False
 
-    report = {"migrated": [], "unmatched": [], "rows_written": 0}
+    report = {"migrated": [], "unmatched": [], "fuzzy_matched": [], "rows_written": 0}
     try:
         id_map = _fetch_employee_ids(conn, list(marks_by_name.keys()))
+        all_employees = None  # подтягиваем лениво, только если реально понадобится fuzzy
 
         for name, marks in marks_by_name.items():
             match = id_map.get(name.strip().lower())
+            if match is None:
+                if all_employees is None:
+                    all_employees = _fetch_all_employees(conn)
+                match = _fuzzy_match(name, all_employees)
+                if match is not None:
+                    report["fuzzy_matched"].append((name, match[1]))
             if match is None:
                 report["unmatched"].append(name)
                 continue
@@ -176,6 +210,10 @@ if __name__ == "__main__":
     result = migrate()
     print(f"Перенесено сотрудников: {len(result['migrated'])}")
     print(f"Записей отметок: {result['rows_written']}")
+    if result["fuzzy_matched"]:
+        print(f"\nНечёткое совпадение по Фамилия+Имя (проверь сам, что это те же люди) ({len(result['fuzzy_matched'])}):")
+        for sheets_name, migbot_name in result["fuzzy_matched"]:
+            print(f"  • Sheets: {sheets_name}  →  migbot: {migbot_name}")
     if result["unmatched"]:
         print(f"\nНе сопоставлено ({len(result['unmatched'])}):")
         for n in result["unmatched"]:
