@@ -76,22 +76,26 @@ def get_onboarding_employees(session: Session) -> list[Employee]:
 def get_marks_without_valid_contract(session: Session) -> list[dict]:
     """
     СРОЧНАЯ проверка (2026-07): у кого есть отметки РЕАЛЬНОЙ явки (Д/НЧ — то есть
-    человек физически выходил на работу), при этом по текущим данным сотрудника
-    договор не действует (нет даты/дата в будущем, ИЛИ contract_end_date уже
-    заполнен — уволен). Отличается от get_onboarding_employees: там просто "не в
-    табеле по фильтру", здесь — уже случившийся факт выхода на работу без
-    действующего договора, кадровику нужно вмешаться немедленно, а не просто
-    дозаполнить карточку.
+    человек физически выходил на работу) ВНЕ периода действия договора. Отличается
+    от get_onboarding_employees: там просто "не в табеле по фильтру", здесь —
+    уже случившийся факт выхода на работу без действующего договора.
+
+    ВАЖНО: считается нарушением только явка ВНЕ границ договора, а не любая явка
+    у уволенного/оформляемого сотрудника. Если уволен 03.07 — явка 02.07 (до
+    увольнения) это НОРМА, а не нарушение; нарушение — явка ПОСЛЕ 03.07. Если
+    contract_date в будущем — нарушение это явка ДО этой даты; если contract_date
+    вообще не указана — любая явка нарушение (нет ни одной подтверждённой даты
+    начала работы).
 
     Возможные причины: (а) договор оформлен, но дата ещё не внесена в систему —
     техническая недоработка данных; (б) человек реально работал без оформления —
     юридический риск. Разбираться должен кадровик, бот только сигнализирует.
 
     Возвращает [{"employee_id", "name", "contract_date", "contract_end_date",
-    "marks": [(date, slot, code), ...]}].
+    "marks": [(date, slot, code), ...]}] — только с реально нарушающими отметками.
     """
     today = date.today()
-    invalid_employees = (
+    candidates = (
         session.query(Employee)
         .filter(
             (Employee.contract_date.is_(None))
@@ -101,21 +105,30 @@ def get_marks_without_valid_contract(session: Session) -> list[dict]:
         .all()
     )
     result = []
-    for e in invalid_employees:
-        work_marks = (
+    for e in candidates:
+        all_marks = (
             session.query(AttendanceMark)
             .filter_by(employee_id=e.id)
             .filter(AttendanceMark.code.in_([DAY, NIGHT]))
             .order_by(AttendanceMark.mark_date)
             .all()
         )
-        if work_marks:
+        bad_marks = []
+        for m in all_marks:
+            if e.contract_end_date is not None and m.mark_date > e.contract_end_date:
+                bad_marks.append(m)  # работал ПОСЛЕ увольнения
+            elif e.contract_date is None:
+                bad_marks.append(m)  # ни одной подтверждённой даты начала вообще
+            elif e.contract_date is not None and m.mark_date < e.contract_date:
+                bad_marks.append(m)  # работал ДО официальной даты начала
+
+        if bad_marks:
             result.append({
                 "employee_id": e.id,
                 "name": e.full_name,
                 "contract_date": e.contract_date,
                 "contract_end_date": e.contract_end_date,
-                "marks": [(m.mark_date, m.slot, m.code) for m in work_marks],
+                "marks": [(m.mark_date, m.slot, m.code) for m in bad_marks],
             })
     return result
 
