@@ -1084,9 +1084,16 @@ def tabel_page(request: Request, year: int | None = None, month: int | None = No
 </div>
 """
     if s["absent_list"]:
-        summary_html += '<div class="card">Отсутствуют/особое:<br>' + "".join(
-            f"{html.escape(name)} — {code}<br>" for name, code in s["absent_list"]
-        ) + "</div>"
+        _absent_badge = {
+            tabel.ABSENT: "red", tabel.SICK: "orange", tabel.ROTATION: "neutral",
+            tabel.MIGR: "neutral", tabel.WEEKEND: "green",
+        }
+        absent_cards = "".join(
+            f'<div class="card">{html.escape(name)}<br>'
+            f'<span class="badge {_absent_badge.get(code, "neutral")}">{code}</span></div>'
+            for name, code in s["absent_list"]
+        )
+        summary_html += f'<section class="grid"><h2>Отсутствуют/особое ({len(s["absent_list"])})</h2>{absent_cards}</section>'
 
     # Закреплённый (sticky) стиль для колонки номера — при горизонтальной прокрутке
     # ФИО и дни уходят влево вместе с остальной таблицей, а № остаётся на месте.
@@ -1106,6 +1113,11 @@ def tabel_page(request: Request, year: int | None = None, month: int | None = No
             day_date = date(year, month, day_num)
             is_today_col = is_current_month and day_num == today.day
             bg = " background:#eaf0fb;" if is_today_col else ""
+            code_bg = {
+                tabel.DAY: "#eaf6f0", tabel.NIGHT: "#eef1f4", tabel.REST: "#eef1f4",
+                tabel.SICK: "#fdf3e2", tabel.ROTATION: "#eef1f4", tabel.ABSENT: "#fdecec",
+                tabel.MIGR: "#eef1f4", tabel.WEEKEND: "#eaf6f0", "С": "#eaf6f0",
+            }.get(code, "#fff")
             options_html = "".join(
                 f'<option value="{val}"{" selected" if val == code else ""}>{val or "—"}</option>'
                 for val, _label in _TABEL_CODE_OPTIONS
@@ -1118,7 +1130,8 @@ def tabel_page(request: Request, year: int | None = None, month: int | None = No
                 f'<input type="hidden" name="year" value="{year}">'
                 f'<input type="hidden" name="month" value="{month}">'
                 f'<select name="code" onchange="this.form.submit()" '
-                f'style="min-height:32px;padding:2px;margin:0;font-size:12px;width:56px">'
+                f'style="min-height:32px;padding:2px;margin:0;font-size:12px;width:56px;'
+                f'background-color:{code_bg}">'
                 f'{options_html}</select></form></td>'
             )
         rows_html += (
