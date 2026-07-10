@@ -917,6 +917,20 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
             f'<a class="btn" href="/employees/{rr.employee_id}">Открыть карточку</a></div>'
         )
 
+    # На оформлении (2026-07): договор ещё не начался (нет даты или дата в будущем) —
+    # такие сотрудники исключены из табеля (см. tabel.get_active_employees). Видит
+    # только кадровик/админ, как и флаги межвахты.
+    onboarding_employees = []
+    if role in ("kadrovik", "admin"):
+        onboarding_employees = tabel.get_onboarding_employees(db)
+
+    def onboarding_row(e: Employee) -> str:
+        cd = e.contract_date.strftime("%d.%m.%Y") if e.contract_date else "не указана"
+        return (
+            f'<div class="card">{e.full_name} — дата договора: {cd}<br>'
+            f'<a class="btn" href="/employees/{e.id}">Открыть карточку</a></div>'
+        )
+
     test_banner = (
         '<div class="warning-banner">⚠ Тестовый режим включён (TEST_ALLOW_MISSING_FIELDS): '
         'документы для медкомиссии генерируются с прочерками вместо незаполненных полей. '
@@ -963,6 +977,11 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
 {f'''<section class="grid">
 <h2>🔄 Межвахта с открытыми обязательствами ({len(rotation_flags)})</h2>
 {"".join(rotation_row(rr) for rr in rotation_flags) or '<p class="muted">Нет.</p>'}
+</section>''' if role in ("kadrovik", "admin") else ""}
+
+{f'''<section class="grid">
+<h2>🧾 На оформлении, не в табеле ({len(onboarding_employees)})</h2>
+{"".join(onboarding_row(e) for e in onboarding_employees) or '<p class="muted">Нет.</p>'}
 </section>''' if role in ("kadrovik", "admin") else ""}
 
 <section>
