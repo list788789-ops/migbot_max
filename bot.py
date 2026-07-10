@@ -70,6 +70,7 @@ from models import (
     ObligationType,
 )
 from obligations import create_obligations_for_employee
+from auth_binding import bind_max_account, find_user_by_max_id, get_role_label
 from consent_texts import get_consent_text  # см. consent_texts.py
 from s3_storage import (
     SCAN_TYPES, _s3_list_for_employee, _s3_download, _ext_for,
@@ -482,6 +483,25 @@ async def on_incomplete(event: MessageCreated):
     await _deliver_picker(_Responder(event), "empdate")
 
 
+@dp.message_created(F.message.body.text == "/login")
+async def on_login_start(event: MessageCreated):
+    """Привязка MAX-аккаунта к пользователю системы — см. auth_binding.py."""
+    user_id = event.message.sender.user_id
+    with Session(engine) as session:
+        existing = find_user_by_max_id(session, user_id)
+        if existing is not None:
+            await event.message.answer(
+                f"Вы уже вошли как {existing.full_name} ({get_role_label(existing)}). "
+                f"Если это не вы — обратитесь к админу."
+            )
+            return
+    _pending_forms[user_id] = {"state": "awaiting_login_phone"}
+    await event.message.answer(
+        "Введите номер телефона, под которым вас зарегистрировал кадровик "
+        "(тот же, что при подаче заявки на веб-форме)."
+    )
+
+
 async def _deliver_document_list(responder: "_Responder", employee_id: str) -> None:
     """Показывает загруженные документы работника кнопками. Скачивание — по нажатию (docget)."""
     with Session(engine) as session:
@@ -875,6 +895,14 @@ async def _handle_send_document(
 async def on_text(event: MessageCreated):
     user_id = event.message.sender.user_id
     form = _pending_forms.get(user_id)
+
+    if form and form.get("state") == "awaiting_login_phone":
+        phone = event.message.body.text.strip()
+        _pending_forms.pop(user_id, None)
+        with Session(engine) as session:
+            ok, text = bind_max_account(session, phone, user_id)
+        await event.message.answer(text)
+        return
 
     if form and form.get("state") == "awaiting_entry_date_button":
         date_s = event.message.body.text.strip()
