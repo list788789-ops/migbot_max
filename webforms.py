@@ -951,6 +951,29 @@ def employees_list(request: Request, db: Session = Depends(get_db)):
         obs = [o for o in e.obligations if o.is_current and o.status == ObligationStatus.PENDING]
         return min(obs, key=lambda o: o.deadline_date) if obs else None
 
+    # Медстатусы для чипа в списке: одним запросом все Referral (последний на работника).
+    from models import Referral as _Ref, ExamStatus as _ES
+    _all_refs = db.scalars(select(_Ref).order_by(_Ref.referral_date.desc())).all()
+    _ref_by_emp = {}
+    for _r in _all_refs:
+        _ref_by_emp.setdefault(_r.employee_id, _r)  # первый = самый свежий (order desc)
+
+    def _med_chip(e: Employee) -> str:
+        """Краткий чип статуса медкомиссии для списка. Пусто, если работник ещё не прибыл."""
+        r = _ref_by_emp.get(e.id)
+        if r is None:
+            if e.entry_date and (today - e.entry_date).days >= 5:
+                return '<span class="badge amber">мед: пора направление</span>'
+            return ''
+        if r.exam_status == _ES.COMPLETED:
+            return '<span class="badge green">мед: пройдена</span>'
+        _md = (today - r.referral_date).days
+        if _md > 14:
+            return '<span class="badge red">мед: справка просрочена</span>'
+        if _md >= 10:
+            return '<span class="badge amber">мед: ждём справку</span>'
+        return '<span class="badge neutral">мед: направлен</span>'
+
     def row(e: Employee) -> str:
         cit = e.citizenship or "—"
         # Ожидающие прибытия (без даты въезда): обязательства по въезду не создаются,
@@ -978,7 +1001,7 @@ def employees_list(request: Request, db: Session = Depends(get_db)):
         # data-search: ФИО + табельный в нижнем регистре — по нему фильтрует JS-поиск.
         _search_key = f"{e.full_name or ''} {e.tab_number or ''}".lower()
         return (
-            f'<div class="card emp-row" data-search="{html.escape(_search_key, quote=True)}">{e.full_name} {chip}<br>'
+            f'<div class="card emp-row" data-search="{html.escape(_search_key, quote=True)}">{e.full_name} {chip} {_med_chip(e)}<br>'
             f'<span class="muted-line">{cit}</span>{ob_line}'
             f'<a class="btn" href="/employees/{e.id}">Открыть карточку</a></div>'
         )
@@ -1819,6 +1842,62 @@ value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
         else:
             contract_block = '<p class="muted">Договор недоступен: не задан статус учёта или табельный номер.</p>'
 
+    # === Объединённая зона: Медкомиссия и дактилоскопия ===
+    from models import Referral, ExamStatus
+    _ref = db.scalars(
+        select(Referral).where(Referral.employee_id == emp.id)
+        .order_by(Referral.referral_date.desc())
+    ).first()
+    if _ref is None:
+        if emp.entry_date:
+            _since = (date.today() - emp.entry_date).days
+            if _since >= 5:
+                _med_html = f'<b style="color:#c47f00">Пора выдать направление</b> (прошло {_since} дн. от въезда)'
+            else:
+                _med_html = f'<span class="muted">Направление ещё не требуется (прошло {_since} дн. из 5)</span>'
+        else:
+            _med_html = '<span class="muted">Ожидает прибытия — сроки не идут</span>'
+        _med_html += ' · <a href="/medical">выписать направление</a>'
+        _med_done = False
+    elif _ref.exam_status == ExamStatus.COMPLETED:
+        _med_html = '<b style="color:#1a7f37">Медкомиссия пройдена</b>'
+        if _ref.result_date:
+            _med_html += f' <span class="muted">({_ref.result_date.isoformat()})</span>'
+        _med_done = True
+    else:
+        _md = (date.today() - _ref.referral_date).days
+        if _md > 14:
+            _med_html = f'<b style="color:#b00">Справка просрочена</b> (прошло {_md} дн., внутр. срок 14)'
+        elif _md >= 10:
+            _med_html = f'<b style="color:#c47f00">Ждём справку</b> (прошло {_md} дн. из 14)'
+        else:
+            _med_html = f'<span>Направлен {_ref.referral_date.isoformat()}, прошло {_md} дн. из 14</span>'
+        _med_done = False
+    _med_upload = ""
+    if _ref is not None and not _med_done:
+        _med_upload = f'''<form method="post" action="/employees/{emp.id}/scan/upload" enctype="multipart/form-data" style="margin-top:8px">
+<input type="hidden" name="scan_type" value="medical_certificate">
+<input type="file" name="files" accept="application/pdf,image/*" multiple required style="display:block;width:100%;margin:6px 0;padding:8px;border:1px solid #d9dde3;border-radius:8px;background:#fff;font-size:15px">
+<button type="submit" class="btn-full">Загрузить справку (закроет медкомиссию)</button></form>'''
+    if emp.dactyloscopy_date:
+        _dact_html = f'<b style="color:#1a7f37">Дактилоскопия сделана</b> <span class="muted">({emp.dactyloscopy_date.isoformat()})</span>'
+    else:
+        _dact_seq = "" if _med_done else ' <span class="muted">(обычно после медкомиссии)</span>'
+        _dact_html = f'<b style="color:#c47f00">Дактилоскопия не сделана</b>{_dact_seq}<br><span class="muted" style="font-size:13px">Дата ставится в блоке «Дактилоскопия» формы выше.</span>'
+    _medzone_section = f'''
+<fieldset>
+<legend>Медкомиссия и дактилоскопия</legend>
+<div style="padding:10px 0;border-bottom:1px solid #eee">
+<div style="font-size:13px;color:#889;text-transform:uppercase;letter-spacing:.5px">Медкомиссия</div>
+{_med_html}
+{_med_upload}
+</div>
+<div style="padding:10px 0">
+<div style="font-size:13px;color:#889;text-transform:uppercase;letter-spacing:.5px">Дактилоскопия</div>
+{_dact_html}
+</div>
+</fieldset>'''
+
     body = f"""
 {_warn_banner}
 <h1>{emp.full_name}</h1>
@@ -1856,6 +1935,7 @@ value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
 </fieldset>
 </div>
 </div>
+{_medzone_section}
 {_obligations_section}
 {_scans_section}
 <a class="btn secondary" href="/employees">← Ко всем сотрудникам</a>
@@ -2303,13 +2383,12 @@ def medical_list(request: Request, db: Session = Depends(get_db)):
             f'<div class="card">{name}<br>'
             f'<span class="muted">направлен {r.referral_date.isoformat()}</span><br>'
             f'{_status}<br>'
-            f'<span class="muted" style="font-size:13px">Завершение — загрузка скана справки в карточке работника.</span><br>'
-            f'<form class="inline" method="post" action="/medical/{r.employee_id}/result">'
-            f'<input type="hidden" name="result" value="done">'
-            f'<button type="submit">✅ Пройдено</button></form>'
+            f'<span class="muted" style="font-size:13px">Завершение — загрузка скана справки '
+            f'(кнопка в карточке работника). Отметка «пройдено» без скана убрана.</span><br>'
+            f'<a class="btn secondary" href="/employees/{r.employee_id}">Открыть карточку → загрузить справку</a><br>'
             f'<form class="inline" method="post" action="/medical/{r.employee_id}/result" onsubmit="return confirm(&#39;Удалить направление и вернуть сотрудника в очередь на выписку? Действие необратимо.&#39;)">'
             f'<input type="hidden" name="result" value="failed">'
-            f'<button type="submit" class="secondary">❌ Не пройдено</button></form>'
+            f'<button type="submit" class="secondary">❌ Не пройдено (отменить направление)</button></form>'
             f'</div>'
         )
 
