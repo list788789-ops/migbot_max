@@ -71,6 +71,7 @@ from models import (
 )
 from obligations import create_obligations_for_employee
 from auth_binding import bind_max_account, find_user_by_max_id, get_role_label
+from common_utils import category_for_citizenship
 from consent_texts import get_consent_text  # см. consent_texts.py
 from s3_storage import (
     SCAN_TYPES, _s3_list_for_employee, _s3_download, _ext_for,
@@ -938,7 +939,7 @@ async def on_text(event: MessageCreated):
             return
 
         full_name, citizenship, entry_date_s, contract_date_s, language, phone = parts
-        category = Category.BELARUS if citizenship.lower() == "belarus" else Category.EAEU
+        category = category_for_citizenship(citizenship)
 
         with Session(engine) as session:
             employee = Employee(
