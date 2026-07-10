@@ -216,6 +216,8 @@ def _build_section_menu(section: str, role: str | None = None) -> InlineKeyboard
         builder.row(CallbackButton(text="🗓 Без даты договора", payload="menu:contractdate"))
         builder.row(CallbackButton(text="🖊 Ожидают согласия", payload="menu:pending_consent"))
         if role in ("kadrovik", "admin"):
+            builder.row(CallbackButton(text="🚨 ЕСТЬ ЯВКА БЕЗ ДОГОВОРА",
+                                        payload="menu:invalid_contract_marks"))
             builder.row(CallbackButton(text="🔄 Межвахта — открытые обязательства",
                                         payload="menu:rotation_flags"))
             builder.row(CallbackButton(text="🧾 На оформлении (не в табеле)",
@@ -1035,6 +1037,26 @@ async def on_callback(event: MessageCallback):
         await responder.send("\n".join(lines))
         return
 
+    if payload == "menu:invalid_contract_marks":
+        with Session(engine) as session:
+            role = _role_for_max_id(session, responder.user_id())
+            if role not in ("kadrovik", "admin"):
+                await responder.send("Доступно только кадровику/админу.")
+                return
+            invalid_marks = tabel.get_marks_without_valid_contract(session)
+            if not invalid_marks:
+                await responder.send("Нет случаев явки без действующего договора.")
+                return
+            lines = ["🚨 Явка без действующего договора:"]
+            for item in invalid_marks:
+                cd = item["contract_date"].strftime("%d.%m.%Y") if item["contract_date"] else "не указана"
+                ced = item["contract_end_date"]
+                reason = f"уволен {ced:%d.%m.%Y}" if ced else f"дата договора: {cd}"
+                marks_str = ", ".join(f"{d:%d.%m}/{slot}={code}" for d, slot, code in item["marks"])
+                lines.append(f"\n{item['name']} ({reason})\nОтметки: {marks_str}")
+        await responder.send("\n".join(lines))
+        return
+
     if payload.startswith("rotflag:"):
         employee_id = payload.split(":", 1)[1]
         with Session(engine) as session:
@@ -1665,7 +1687,14 @@ async def on_attachment(event: MessageCreated):
 async def rotation_reminders_job():
     """Ежедневное напоминание за 3 дня до ожидаемого возврата с межвахты — с кнопками
     подтвердить/продлить. Шлётся во все чаты из NotificationSubscriber (та же таблица,
-    что уже заведена под проактивные напоминания о дедлайнах)."""
+    что уже заведена под проактивные напоминания о дедлайнах).
+
+    2026-07: срочная проверка "явка без действующего договора" (get_marks_without_
+    valid_contract) НЕ шлётся сюда проактивно — NotificationSubscriber.chat_id не
+    связан с ролью пользователя (нет моста chat_id -> User), значит рассылка ушла бы
+    ВСЕМ подписавшимся, включая прораба, которому детали видеть не должны (см.
+    договорённость). Пока только пассивный пункт меню "🚨 ЕСТЬ ЯВКА БЕЗ ДОГОВОРА"
+    (menu:invalid_contract_marks) с проверкой роли — кадровик заходит сам."""
     try:
         with Session(engine) as session:
             reminders = tabel.get_rotation_reminders(session, days_before=3)
