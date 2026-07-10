@@ -931,6 +931,21 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
             f'<a class="btn" href="/employees/{e.id}">Открыть карточку</a></div>'
         )
 
+    # Уточнить дату возврата с межвахты (2026-07): заглушки RotationReturn с
+    # expected_return_date=NULL, см. tabel.get_pending_clarification_rotations.
+    # Кадровик минимально работает в MAX — эта задача теперь в первую очередь
+    # здесь, в веб-дашборде (прорабу отдельно шлётся напоминание в боте, см.
+    # bot.py morning_job).
+    pending_rotation = []
+    if role in ("kadrovik", "admin"):
+        pending_rotation = tabel.get_pending_clarification_rotations(db)
+
+    def pending_rotation_row(item: dict) -> str:
+        return (
+            f'<div class="card">{item["name"]} — дата возврата с межвахты не уточнена<br>'
+            f'<a class="btn" href="/employees/{item["employee_id"]}">Открыть карточку</a></div>'
+        )
+
     # СРОЧНАЯ проверка (2026-07): явка есть, а договор не действует. См. подробный
     # docstring tabel.get_marks_without_valid_contract. Веб безопасен для проактивного
     # показа (вход персональный, не рассылка) — в отличие от бота, где это оставлено
@@ -1009,6 +1024,11 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
 {f'''<section class="grid">
 <h2>🧾 На оформлении, не в табеле ({len(onboarding_employees)})</h2>
 {"".join(onboarding_row(e) for e in onboarding_employees) or '<p class="muted">Нет.</p>'}
+</section>''' if role in ("kadrovik", "admin") else ""}
+
+{f'''<section class="grid">
+<h2>❓ Уточнить дату возврата с межвахты ({len(pending_rotation)})</h2>
+{"".join(pending_rotation_row(item) for item in pending_rotation) or '<p class="muted">Нет.</p>'}
 </section>''' if role in ("kadrovik", "admin") else ""}
 
 <section>
