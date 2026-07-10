@@ -60,6 +60,18 @@ def get_active_employees(session: Session) -> list[Employee]:
     )
 
 
+def get_never_marked_employees(session: Session) -> list[Employee]:
+    """
+    Активен по фильтру (договор действует), но НИ РАЗУ не было ни одной отметки
+    в attendance_marks — не просто "сегодня не отмечен" (это нормально до конца
+    утра), а вообще ни разу с начала договора. Сигнал прорабу: человек оформлен,
+    но по нему табель не ведётся вовсе — возможно, забыли внести в утренний обход.
+    """
+    active = get_active_employees(session)
+    marked_ids = {row[0] for row in session.query(AttendanceMark.employee_id).distinct().all()}
+    return [e for e in active if e.id not in marked_ids]
+
+
 def get_onboarding_employees(session: Session) -> list[Employee]:
     """Кто заведён в базу, но договор ещё не начался (нет даты, или дата в будущем) —
     "на оформлении". Не показывается в табеле, отдельная задача кадровику."""
