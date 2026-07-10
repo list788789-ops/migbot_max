@@ -224,6 +224,18 @@ def clear_night_slot(session: Session, employee: Employee, mark_date: date | Non
     session.commit()
 
 
+def clear_rotation(session: Session, employee: Employee, mark_date: date | None = None) -> None:
+    """Полная отмена межвахты: снимает код МЖ за дату (обычно сегодня — день постановки)
+    И удаляет строку RotationReturn (ожидание возврата + флаг кадровика), если была.
+    Не трогает уже созданные Obligation от apply_rotation_return — если межвахта уже
+    была закрыта фактическим возвратом, тот обязательство остаётся (это случившийся
+    факт), отменять его отдельно руками."""
+    mark_date = mark_date or date.today()
+    clear_day_slot(session, employee, mark_date)
+    session.query(RotationReturn).filter_by(employee_id=employee.id).delete()
+    session.commit()
+
+
 def fill_unmarked_absent(session: Session, created_by: str,
                           mark_date: date | None = None) -> int:
     """Всем активным с пустым дневным слотом ставит Н. Возвращает число проставленных."""
@@ -407,6 +419,28 @@ def resolve_rotation_flag(session: Session, employee_id: str, reviewed_by_user_i
     return True
 
 
+def extend_rotation(session: Session, employee: Employee, new_return_date: date) -> bool:
+    """Продление межвахты (кнопка «Продлить» в напоминании за 3 дня) — обновляет только
+    дату, сохраняет departure_type, каким он был указан при постановке. Пере-проверяет
+    открытые обязательства заново (могли появиться/закрыться за время межвахты)."""
+    rr = session.get(RotationReturn, employee.id)
+    if rr is None:
+        # Продлевать нечего — межвахта не была поставлена через обычный флоу.
+        rr = RotationReturn(employee_id=employee.id, expected_return_date=new_return_date)
+        session.add(rr)
+    else:
+        rr.expected_return_date = new_return_date
+        rr.reviewed_at = None
+        rr.reviewed_by = None
+
+    open_obligations = get_open_obligations(session, employee.id)
+    flagged = len(open_obligations) > 0
+    rr.flagged = flagged
+    rr.flagged_at = datetime.utcnow() if flagged else None
+    session.commit()
+    return flagged
+
+
 def get_rotation_reminders(session: Session, days_before: int = 3) -> list[dict]:
     """Кто возвращается с межвахты в пределах days_before дней — для cron-напоминания."""
     today = date.today()
@@ -417,7 +451,7 @@ def get_rotation_reminders(session: Session, days_before: int = 3) -> list[dict]
         if 0 <= delta <= days_before:
             employee = session.get(Employee, rr.employee_id)
             if employee is not None:
-                result.append({"name": employee.full_name,
+                result.append({"employee_id": employee.id, "name": employee.full_name,
                                 "return_date": rr.expected_return_date})
     return result
 
