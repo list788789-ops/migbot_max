@@ -1106,6 +1106,27 @@ def tabel_page(request: Request, year: int | None = None, month: int | None = No
         )
         summary_html += f'<section><h2>Отсутствуют/особое ({len(s["absent_list"])})</h2>{absent_cards}</section>'
 
+    # ✈️ На межвахте — с датой ожидаемого возврата (не просто бейдж в общем списке).
+    rotation_rows = db.scalars(
+        select(RotationReturn)
+        .join(Employee, Employee.id == RotationReturn.employee_id)
+        .where(Employee.contract_end_date.is_(None))
+    ).all()
+    if rotation_rows:
+        _dep_label = {
+            "abroad": "за границу", "domestic": "в РФ, с площадки", "none": "не выезжал",
+        }
+        rotation_cards = "".join(
+            f'<div class="card" style="display:flex;justify-content:space-between;'
+            f'align-items:center;gap:8px;font-weight:400">'
+            f'<span>{html.escape(rr.employee.full_name if rr.employee else "?")}'
+            f'<br><span class="muted">{_dep_label.get(rr.departure_type, "не указано")}</span></span>'
+            f'<span class="badge neutral" style="margin:0">до {rr.expected_return_date:%d.%m.%Y}</span>'
+            f'</div>'
+            for rr in rotation_rows
+        )
+        summary_html += f'<section><h2>✈️ На межвахте ({len(rotation_rows)})</h2>{rotation_cards}</section>'
+
     # Закреплённый (sticky) стиль для колонки номера — при горизонтальной прокрутке
 
     # Закреплённый (sticky) стиль для колонки номера — при горизонтальной прокрутке
