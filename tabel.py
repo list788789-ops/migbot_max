@@ -642,11 +642,9 @@ def get_month_codes(session: Session, year: int | None = None, month: int | None
     return result
 
 
-# Пороги месячной проверки "проблемных" (см. get_monthly_problems). WEEKEND_THRESHOLD
-# явно назван в задаче ("с тремя выходными"). ABSENT_THRESHOLD не был назван явно —
-# [Предполагаю] беру >=1 (любая неявка в текущем месяце достойна внимания прораба),
-# это легко поменять одной константой, если нужен другой порог.
-ABSENT_THRESHOLD = 1
+# Пороги месячной проверки "проблемных" (см. get_monthly_problems). Оба порога
+# названы явно в задаче: неявки от 2, выходные от 3.
+ABSENT_THRESHOLD = 2
 WEEKEND_THRESHOLD = 3
 
 
