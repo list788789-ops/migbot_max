@@ -16,12 +16,13 @@ import logging
 from sqlalchemy.orm import Session
 
 from models import User, UserStatus
+from common_utils import normalize_phone
 
 log = logging.getLogger("auth_binding")
 
 
 def find_user_by_phone(session: Session, phone: str) -> User | None:
-    phone = phone.strip()
+    phone = normalize_phone(phone)
     return session.query(User).filter_by(phone=phone).first()
 
 
