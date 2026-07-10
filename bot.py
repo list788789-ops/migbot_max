@@ -43,6 +43,9 @@ import os
 import tempfile
 from datetime import date, datetime, timezone, timedelta
 
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+
 MSK = timezone(timedelta(hours=3))  # Мурманская обл. — московское время, без перехода на летнее с 2014
 
 from dotenv import load_dotenv
@@ -193,6 +196,7 @@ def _build_main_menu(role: str | None = None) -> InlineKeyboardBuilder:
     if role in ("prorab", "kadrovik", "admin"):
         builder.row(CallbackButton(text="☀️ Утро (явка)", payload="menu:morning"))
         builder.row(CallbackButton(text="🌙 Вечер (ночная смена)", payload="menu:evening"))
+        builder.row(CallbackButton(text="🧹 Действия с сотрудником", payload="menu:empaction"))
     builder.row(CallbackButton(text="👥 Сотрудники", payload="menu:section:employees"))
     if role in ("kadrovik", "admin"):
         builder.row(CallbackButton(text="⚠️ Требует внимания", payload="menu:section:attention"))
@@ -284,9 +288,10 @@ PICKER_TITLES = {
     "contractdate": "Без даты договора",
     "utroday": "☀️ Утро — отметьте, кто на месте",
     "eveningnight": "🌙 Вечер — кто заступает в ночь",
+    "empaction": "🧹 Действия с сотрудником — выберите",
 }
 # Префиксы табеля — там незачем показывать паспорт в подписи кнопки (не тот контекст).
-_TABEL_PREFIXES = {"utroday", "eveningnight"}
+_TABEL_PREFIXES = {"utroday", "eveningnight", "empaction"}
 
 
 def _picker_employees(session: Session, prefix: str) -> list[Employee]:
@@ -319,6 +324,8 @@ def _picker_employees(session: Session, prefix: str) -> list[Employee]:
         return tabel.get_unmarked_day(session)
     if prefix == "eveningnight":
         return tabel.get_not_worked_day(session)
+    if prefix == "empaction":
+        return tabel.get_active_employees(session)
     return []
 
 
@@ -683,6 +690,79 @@ async def on_callback(event: MessageCallback):
         await _deliver_picker(responder, "eveningnight", extra_button=_tabel_extra_button("eveningnight"))
         return
 
+    if payload == "menu:empaction":
+        with Session(engine) as session:
+            role = _role_for_max_id(session, responder.user_id())
+        if role not in ("prorab", "kadrovik", "admin"):
+            await responder.send("Доступно только зарегистрированным пользователям. Выполните /login.")
+            return
+        await _deliver_picker(responder, "empaction")
+        return
+
+    if payload.startswith("empaction:"):
+        employee_id = payload.split(":", 1)[1]
+        with Session(engine) as session:
+            employee = session.get(Employee, employee_id)
+            if employee is None:
+                await event.answer(notification="Сотрудник не найден.")
+                return
+            full_name = employee.full_name
+            day_code = tabel.get_day_slot(session, employee_id) or "—"
+            night_code = tabel.get_night_slot(session, employee_id) or "—"
+        kb = InlineKeyboardBuilder()
+        kb.row(CallbackButton(text="✅ Поставить явку (Д)", payload=f"empact_day:{employee_id}"))
+        kb.row(CallbackButton(text="🧹 Очистить день", payload=f"empact_clrday:{employee_id}"))
+        kb.row(CallbackButton(text="🧹 Очистить ночь", payload=f"empact_clrnight:{employee_id}"))
+        if day_code == tabel.ROTATION:
+            kb.row(CallbackButton(text="✈️ Отменить межвахту", payload=f"empact_clrrot:{employee_id}"))
+        kb.row(CallbackButton(text="◀ Назад к списку", payload="menu:empaction"))
+        await responder.send(
+            f"{full_name}\nСегодня: день={day_code}, ночь={night_code}\nЧто сделать?",
+            attachments=[kb.as_markup()],
+        )
+        return
+
+    if payload.startswith("empact_day:"):
+        employee_id = payload.split(":", 1)[1]
+        with Session(engine) as session:
+            employee = session.get(Employee, employee_id)
+            if employee is not None:
+                full_name = employee.full_name
+                tabel.mark_day(session, employee, responder.user_id())
+        await responder.send(f"✔ {full_name if employee else '—'}: явка (Д) проставлена.")
+        return
+
+    if payload.startswith("empact_clrday:"):
+        employee_id = payload.split(":", 1)[1]
+        with Session(engine) as session:
+            employee = session.get(Employee, employee_id)
+            if employee is not None:
+                full_name = employee.full_name
+                tabel.clear_day_slot(session, employee)
+        await responder.send(f"✔ {full_name if employee else '—'}: дневной слот очищен.")
+        return
+
+    if payload.startswith("empact_clrnight:"):
+        employee_id = payload.split(":", 1)[1]
+        with Session(engine) as session:
+            employee = session.get(Employee, employee_id)
+            if employee is not None:
+                full_name = employee.full_name
+                tabel.clear_night_slot(session, employee)
+        await responder.send(f"✔ {full_name if employee else '—'}: ночной слот очищен.")
+        return
+
+    if payload.startswith("empact_clrrot:"):
+        employee_id = payload.split(":", 1)[1]
+        with Session(engine) as session:
+            employee = session.get(Employee, employee_id)
+            if employee is not None:
+                full_name = employee.full_name
+                tabel.clear_rotation(session, employee)
+        await responder.send(f"✔ {full_name if employee else '—'}: межвахта отменена "
+                              f"(отметка и ожидание возврата сняты).")
+        return
+
     if payload.startswith("utroday:"):
         employee_id = payload.split(":", 1)[1]
         with Session(engine) as session:
@@ -842,6 +922,26 @@ async def on_callback(event: MessageCallback):
             else:
                 tabel.set_reason(session, employee, code, responder.user_id())
         await responder.send(f"{full_name}: причина проставлена.")
+        return
+
+    if payload.startswith("rotconfirm:"):
+        employee_id = payload.split(":", 1)[1]
+        with Session(engine) as session:
+            employee = session.get(Employee, employee_id)
+            full_name = employee.full_name if employee else "—"
+        await responder.send(f"✔ {full_name}: дата возврата подтверждена, изменений не требуется.")
+        return
+
+    if payload.startswith("rotextend:"):
+        employee_id = payload.split(":", 1)[1]
+        with Session(engine) as session:
+            employee = session.get(Employee, employee_id)
+            full_name = employee.full_name if employee else "—"
+        _pending_forms[responder.user_id()] = {
+            "state": "awaiting_rotation_extend_date",
+            "employee_id": employee_id,
+        }
+        await responder.send(f"{full_name}: введите НОВУЮ дату возврата (ГГГГ-ММ-ДД):")
         return
 
     if payload.startswith("depart:"):
@@ -1310,6 +1410,36 @@ async def on_text(event: MessageCreated):
         )
         return
 
+    if form and form.get("state") == "awaiting_rotation_extend_date":
+        date_s = event.message.body.text.strip()
+        try:
+            new_return_date = datetime.strptime(date_s, "%Y-%m-%d").date()
+        except ValueError:
+            await event.message.answer("Не распознал дату. Формат: ГГГГ-ММ-ДД, например 2026-07-25.")
+            return
+        if new_return_date <= date.today():
+            await event.message.answer(
+                "⚠️ Дата — сегодня или в прошлом. Нужна дата в будущем. "
+                "Введите ещё раз (ГГГГ-ММ-ДД):"
+            )
+            return
+        employee_id = form["employee_id"]
+        _pending_forms.pop(user_id, None)
+        with Session(engine) as session:
+            employee = session.get(Employee, employee_id)
+            if employee is None:
+                await event.message.answer("Сотрудник не найден.")
+                return
+            full_name = employee.full_name
+            flagged = tabel.extend_rotation(session, employee, new_return_date)
+        if flagged:
+            await event.message.answer(f"✔ {full_name}: межвахта продлена до {date_s}. "
+                                        f"Данные направлены в отдел кадров.")
+        else:
+            await event.message.answer(f"✔ {full_name}: межвахта продлена до {date_s}. "
+                                        f"Напомню за 3 дня до нового возврата.")
+        return
+
     if form and form.get("state") == "awaiting_entry_date_button":
         date_s = event.message.body.text.strip()
         try:
@@ -1504,7 +1634,38 @@ async def on_attachment(event: MessageCreated):
     )
 
 
+async def rotation_reminders_job():
+    """Ежедневное напоминание за 3 дня до ожидаемого возврата с межвахты — с кнопками
+    подтвердить/продлить. Шлётся во все чаты из NotificationSubscriber (та же таблица,
+    что уже заведена под проактивные напоминания о дедлайнах)."""
+    try:
+        with Session(engine) as session:
+            reminders = tabel.get_rotation_reminders(session, days_before=3)
+            chat_ids = [row.chat_id for row in session.query(NotificationSubscriber).all()]
+    except Exception:
+        log.exception("rotation_reminders_job: не удалось прочитать напоминания")
+        return
+
+    if not reminders or not chat_ids:
+        return
+
+    for r in reminders:
+        kb = InlineKeyboardBuilder()
+        kb.row(CallbackButton(text="✅ Подтверждаю возврат", payload=f"rotconfirm:{r['employee_id']}"))
+        kb.row(CallbackButton(text="📅 Продлить межвахту", payload=f"rotextend:{r['employee_id']}"))
+        text = (f"⏰ {r['name']}: ожидаемый возврат с межвахты — "
+                f"{r['return_date']:%d.%m.%Y}.\nПодтвердите или продлите:")
+        for chat_id in chat_ids:
+            try:
+                await bot.send_message(chat_id=chat_id, text=text, attachments=[kb.as_markup()])
+            except Exception:
+                log.exception("rotation_reminders_job: не удалось отправить в chat_id=%s", chat_id)
+
+
 async def main():
+    scheduler = AsyncIOScheduler(timezone=MSK)
+    scheduler.add_job(rotation_reminders_job, CronTrigger(hour=9, minute=0))
+    scheduler.start()
     await dp.start_polling(bot)
 
 
