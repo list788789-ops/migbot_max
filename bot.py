@@ -77,6 +77,7 @@ from models import (
 from obligations import create_obligations_for_employee
 import tabel
 import reports as reports_data
+import production as prod
 from auth_binding import (
     bind_max_account, find_user_by_max_id, get_role_label,
     confirm_max_code, register_via_max,
@@ -1877,6 +1878,28 @@ async def on_attachment(event: MessageCreated):
 
 _NEVER_MARKED_ACK_KEY = "never_marked_ack_date"
 
+_MAX_MESSAGE_LEN = 4000  # лимит длины сообщения MAX API
+
+
+def _split_message(text: str, limit: int = _MAX_MESSAGE_LEN) -> list[str]:
+    """Разбить длинный текст на части не длиннее limit символов, по границам
+    строк (не рвём строку посреди). Для рассылок со списком, который может
+    превысить лимит сообщения MAX (например, много непроведённых инструктажей)."""
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        # +1 на символ переноса, который вернём при склейке
+        if current and len(current) + len(line) + 1 > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        chunks.append(current)
+    return chunks
+
 
 async def morning_job():
     """
@@ -2026,6 +2049,52 @@ async def morning_job():
                 await bot.send_message(chat_id=chat_id, text=text, attachments=[kb.as_markup()])
             except Exception:
                 log.exception("morning_job: не удалось отправить pending_rotation в chat_id=%s", chat_id)
+
+    # 5. Непроведённые обязательные инструктажи (вводный / первичный на рабочем
+    # месте) — дата начала работы наступила, инструктажа нет. Рассылка "до
+    # устранения": приходит каждое утро всем подписчикам, пока инструктаж не
+    # проведён (тогда сотрудник уходит из get_instruction_compliance_gaps сам).
+    # Стадии помечены эмодзи, чтобы получатель различал давность: 🔴 критично
+    # (> порога дней), ⚠️ просрочено (в пределах порога). Отдельным сообщением
+    # от миграционных пунктов, чтобы не смешивать охрану труда и 109-ФЗ.
+    try:
+        with Session(engine) as session:
+            instruction_gaps = prod.get_instruction_compliance_gaps(session)
+    except Exception:
+        log.exception("morning_job: не удалось прочитать instruction_gaps")
+        instruction_gaps = []
+
+    if instruction_gaps:
+        critical = [g for g in instruction_gaps if g["stage"] == "critical"]
+        overdue = [g for g in instruction_gaps if g["stage"] == "overdue"]
+        lines = ["🦺 Не проведены обязательные инструктажи (дата начала работы уже прошла):"]
+        if critical:
+            lines.append("\n🔴 КРИТИЧНО (просрочка большая):")
+            for g in critical:
+                lines.append(
+                    f"  • {g['name']} — {g['type_label']} "
+                    f"(с {g['start_date']:%d.%m.%Y}, {g['days_overdue']} дн.)"
+                )
+        if overdue:
+            lines.append("\n⚠️ Просрочено:")
+            for g in overdue:
+                lines.append(
+                    f"  • {g['name']} — {g['type_label']} "
+                    f"(с {g['start_date']:%d.%m.%Y}, {g['days_overdue']} дн.)"
+                )
+        lines.append(
+            "\nℹ️ Провести инструктаж и внести в журнал — в веб-разделе «Производство → "
+            "Инструктажи». Это сообщение будет приходить каждое утро, пока инструктаж "
+            "не проведён — само не исчезнет."
+        )
+        # MAX ограничивает сообщение 4000 символов — при большом списке режем на части.
+        text = "\n".join(lines)
+        for chunk in _split_message(text):
+            for chat_id in chat_ids:
+                try:
+                    await bot.send_message(chat_id=chat_id, text=chunk)
+                except Exception:
+                    log.exception("morning_job: не удалось отправить instruction_gaps в chat_id=%s", chat_id)
 
 
 async def main():
