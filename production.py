@@ -13,7 +13,7 @@ from datetime import date, datetime, timedelta
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.shared import Pt
+from docx.shared import Mm, Pt
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -317,6 +317,20 @@ def print_new_journal_entries(session: Session, instruction_type: InstructionTyp
     return unprinted
 
 
+def get_sheet_count(session: Session, instruction_type: InstructionType) -> int:
+    """Сколько партий (= "листов") уже когда-либо напечатано для этого типа —
+    приближённо, по числу различных printed_at. [Предполагаю] это не полный
+    учёт физических листов бумаги, просто счётчик распечаток."""
+    rows = (
+        session.query(Instruction.printed_at)
+        .filter_by(type=instruction_type)
+        .filter(Instruction.printed_at.isnot(None))
+        .distinct()
+        .all()
+    )
+    return len(rows)
+
+
 def create_instruction(
     session: Session, employee_id: str, instruction_type: InstructionType,
     conducted_by: str, topic: str | None = None, next_due_date: date | None = None,
@@ -375,40 +389,44 @@ def get_journal_started_at(session: Session, instruction_type: InstructionType) 
     return first.conducted_at.date() if first else None
 
 
+def _set_a4(doc) -> None:
+    """Явный формат A4 — python-docx по умолчанию создаёт Letter (US), не A4,
+    для русских документов это неверно (см. замечание после первой распечатки)."""
+    section = doc.sections[0]
+    section.page_width = Mm(210)
+    section.page_height = Mm(297)
+
+
 def generate_instruction_journal_docx(
     instructions: list[Instruction], instruction_type: InstructionType,
     org_name: str, order_ref: str, journal_number: int = 1,
-    started_at: date | None = None, output_dir: str = "/tmp",
+    started_at: date | None = None, sheet_number: int = 1, total_sheets: int = 1,
+    output_dir: str = "/tmp",
 ) -> str:
     """
-    Печать партии журнала инструктажей — по образцу рекомендуемой формы
-    ГОСТ 12.0.004-2015 (Приложение А.4 вводный / А.5 на рабочем месте / А.6
-    целевой). Только НОВЫЕ строки (см. print_new_journal_entries — вызывается
-    ДО этой функции, здесь просто печать уже пронумерованных записей),
-    довешенные прочерками до конца страницы (JOURNAL_ROWS_PER_PAGE) — довесок
-    визуальный, не сохраняется как данные, следующая реальная запись получит
-    следующий номер как ни в чём не бывало (см. договорённость в чате).
+    Печать партии журнала инструктажей. 2026-07 (третий заход) — переписано
+    под официальный скелет таблицы, который прислал пользователь ("Журнал
+    регистрации вводного инструктажа"), а не по собственной реконструкции
+    ГОСТ 12.0.004-2015. Отличия от предыдущей версии:
+    - Обложка — не текстом, а таблицей: Начат/Окончен/Количество листов/Лист.
+    - НЕТ столбца "№" — в присланном скелете его нет вообще (номер строки
+      всё равно хранится в БД для сквозной нумерации, просто не печатается
+      отдельной графой, раз в образце так).
+    - Порядок подписей: СНАЧАЛА инструктирующего, ПОТОМ инструктируемого
+      (было наоборот).
+    - "Дата рождения" — полная дата, не только год (в Employee есть полная
+      дата, раньше зря обрезал до года).
+    - Двухуровневая шапка с объединёнными ячейками ("Сведения об
+      инструктируемом" на 3 подстолбца, "Подпись" на 2 подстолбца) — как в
+      присланном образце.
 
-    2026-07 (второй заход, по замечаниям к первой распечатке):
-    - journal_number — номер САМОЙ КНИГИ журнала (не строки внутри неё). Книга
-      заполняется, закрывается, заводится новая с №2 — это [Предполагаю] пока
-      НЕ автоматизировано (нет логики "книга заполнена, начать новую"), номер
-      передаётся параметром, по умолчанию 1. Явно отмечаю ограничение, чтобы
-      не выглядело как готовая функция ротации книг.
-    - started_at — дата "Начат" на обложке (по факту делопроизводства — дата
-      самой ранней записи в журнале ЭТОГО типа, не дата печати текущей партии).
-      "Окончен" пока всегда пусто — закрытие книги вручную не реализовано.
-    - Добавлены графы "Профессия (должность)" и "Подразделение" — были в
-      реальной рекомендуемой форме ГОСТ, у нас их не было. В Employee нет
-      полей профессии/подразделения — графы печатаются ПУСТЫМИ для заполнения
-      от руки, не выдумываю значения.
-    - Компактный шрифт (см. _set_cell) — чтобы строка помещалась в одну линию,
-      не переносилась на 2-3 (замечание после первой распечатки).
-
-    order_ref — ссылка на приказ (INTERNAL_ORDER_REF), печатается мелким
-    шрифтом внизу страницы — см. договорённость про подсказку для проверяющего.
+    sheet_number/total_sheets — для графы "Лист"/"Количество листов" на
+    обложке. [Предполагаю] total_sheets = сколько партий уже напечатано
+    включая эту — простое приближение, не полноценный учёт физических
+    листов бумаги (это была бы отдельная задача подсчёта).
     """
     doc = Document()
+    _set_a4(doc)
 
     title = doc.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -417,33 +435,75 @@ def generate_instruction_journal_docx(
     run.bold = True
     run.font.size = Pt(14)
 
-    doc.add_paragraph(f"Организация: {org_name}")
-    doc.add_paragraph(f"Журнал № {journal_number}")
-    started_str = started_at.strftime("%d.%m.%Y") if started_at else "—"
-    doc.add_paragraph(f"Начат: {started_str}          Окончен: —")
+    doc.add_paragraph(f"Организация: {org_name}          Журнал № {journal_number}")
 
-    headers = ["№", "Дата", "ФИО", "Год рожд.", "Профессия (должность)", "Подразделение",
-               "Кто провёл", "Подпись инструкт.", "Подпись инструктирующего"]
-    table = doc.add_table(rows=1, cols=len(headers))
+    # Обложка: Начат | значение | Окончен | значение | Количество листов | значение | Лист | значение
+    started_str = started_at.strftime("%d.%m.%Y") if started_at else "—"
+    cover = doc.add_table(rows=1, cols=8)
+    cover.style = "Table Grid"
+    cover_cells = cover.rows[0].cells
+    cover_values = [
+        ("Начат", started_str), ("Окончен", "—"),
+        ("Количество листов", str(total_sheets)), ("Лист", str(sheet_number)),
+    ]
+    for i, (lbl, val) in enumerate(cover_values):
+        _set_cell(cover_cells[i * 2], lbl, size=8, bold=True)
+        _set_cell(cover_cells[i * 2 + 1], val, size=8)
+
+    doc.add_paragraph()
+
+    # Основная таблица — двухуровневая шапка с объединением ячеек, 10 столбцов:
+    # 0 № сквозной | 1 № на листе | 2 Дата проведения |
+    # 3-5 Сведения об инструктируемом (ФИО/дата рожд./профессия) |
+    # 6 Подразделение | 7 ФИО+должность инструктирующего | 8-9 Подпись (инстр./инстр-емого)
+    table = doc.add_table(rows=2, cols=10)
     table.style = "Table Grid"
     table.autofit = False
-    hdr = table.rows[0].cells
-    for i, h in enumerate(headers):
-        _set_cell(hdr[i], h, size=8, bold=True)
+    r1 = table.rows[0].cells
+    r2 = table.rows[1].cells
 
-    for instr in instructions:
+    # Вертикальное объединение (2 строки шапки в одну ячейку) для столбцов без подстолбцов.
+    for col in (0, 1, 2, 6, 7):
+        r1[col].merge(r2[col])
+    _set_cell(r1[0], "№ сквозной", size=7, bold=True)
+    _set_cell(r1[1], "№ на листе", size=7, bold=True)
+    _set_cell(r1[2], "Дата проведения", size=7, bold=True)
+    _set_cell(r1[6], "Наименование структурного подразделения, в которое направлен инструктируемый",
+              size=7, bold=True)
+    _set_cell(r1[7], "Фамилия, имя, отчество, должность инструктирующего", size=7, bold=True)
+
+    # Горизонтальное объединение верхней строки для "Сведения об инструктируемом" (3-5)
+    # и "Подпись" (8-9), с подписанными подстолбцами во второй строке.
+    r1[3].merge(r1[4]).merge(r1[5])
+    _set_cell(r1[3], "Сведения об инструктируемом", size=7, bold=True)
+    _set_cell(r2[3], "Фамилия, имя, отчество", size=7, bold=True)
+    _set_cell(r2[4], "Дата рождения", size=7, bold=True)
+    _set_cell(r2[5], "Профессия, должность", size=7, bold=True)
+
+    r1[8].merge(r1[9])
+    _set_cell(r1[8], "Подпись", size=7, bold=True)
+    _set_cell(r2[8], "Инструктирующего", size=7, bold=True)
+    _set_cell(r2[9], "Инструктируемого", size=7, bold=True)
+
+    # Номер на листе — позиция внутри ТЕКУЩЕЙ партии (1..JOURNAL_ROWS_PER_PAGE),
+    # не сквозной. Корректно, только если предыдущая партия допечатана прочерками
+    # ровно до конца страницы (см. довесок ниже) — тогда каждая новая партия
+    # гарантированно начинается с начала листа, позиция внутри нее = позиция на листе.
+    for i, instr in enumerate(instructions):
         row = table.add_row().cells
         emp = instr.employee
-        birth_year = str(emp.birth_date.year) if emp and emp.birth_date else ""
+        birth_str = emp.birth_date.strftime("%d.%m.%Y") if emp and emp.birth_date else ""
+        sheet_pos = (i % JOURNAL_ROWS_PER_PAGE) + 1
         _set_cell(row[0], str(instr.journal_row_number))
-        _set_cell(row[1], instr.conducted_at.strftime("%d.%m.%Y"))
-        _set_cell(row[2], emp.full_name if emp else "?")
-        _set_cell(row[3], birth_year)
-        _set_cell(row[4], (emp.position or "") if emp else "")  # из карточки, если заполнено
-        _set_cell(row[5], (emp.subdivision or "") if emp else "")  # из карточки, если заполнено
-        _set_cell(row[6], instr.conducted_by)
-        _set_cell(row[7], "")  # подпись — от руки на распечатке
-        _set_cell(row[8], "")
+        _set_cell(row[1], str(sheet_pos))
+        _set_cell(row[2], instr.conducted_at.strftime("%d.%m.%Y"))
+        _set_cell(row[3], emp.full_name if emp else "?")
+        _set_cell(row[4], birth_str)
+        _set_cell(row[5], (emp.position or "") if emp else "")  # из карточки, если заполнено
+        _set_cell(row[6], (emp.subdivision or "") if emp else "")  # из карточки, если заполнено
+        _set_cell(row[7], instr.conducted_by)
+        _set_cell(row[8], "")  # подпись инструктирующего — от руки на распечатке
+        _set_cell(row[9], "")  # подпись инструктируемого — от руки на распечатке
 
     # Довесок прочерками до конца страницы — визуальный, не данные (не создаёт
     # записей Instruction, следующая допечатка продолжит нумерацию с реального
@@ -604,6 +664,7 @@ def generate_work_order_docx(work_order: WorkOrder, members: list[WorkOrderMembe
     том же порядке, что и в реальном бланке, для узнаваемости.
     """
     doc = Document()
+    _set_a4(doc)
 
     title = doc.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
