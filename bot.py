@@ -429,16 +429,26 @@ async def _deliver_picker(
     if total_pages > 1:
         header += f"\nСтраница {page + 1}/{total_pages}"
 
-    if edit and key in _open_pickers:
-        try:
-            await bot.edit_message(
-                message_id=_open_pickers[key], text=header, attachments=[builder.as_markup()]
-            )
-            return
-        except Exception:
-            # Сообщение могло устареть/быть удалено вручную — откатываемся на отправку нового,
-            # не проваливаем действие целиком.
-            log.exception("Не удалось отредактировать список (prefix=%s), отправляю заново", prefix)
+    # Редактируем сообщение, из которого пришёл колбэк (current_message_id) — оно
+    # всегда доступно в событии, НЕ зависит от _open_pickers в памяти. Раньше edit
+    # шёл по _open_pickers[key], который теряется при рестарте бота: после деплоя
+    # навигация (page:) с only_if_open молча выходила, «Выход» не находил список —
+    # кнопки становились мёртвыми. Теперь, как у меню (show_menu), редактируем по
+    # mid из колбэка — кнопки работают и после перезапуска.
+    if edit:
+        mid = getattr(responder, "current_message_id", lambda: None)()
+        if mid is None and key in _open_pickers:
+            mid = _open_pickers[key]  # fallback на память (напр. edit не из колбэка)
+        if mid is not None:
+            try:
+                await bot.edit_message(
+                    message_id=mid, text=header, attachments=[builder.as_markup()]
+                )
+                _open_pickers[key] = mid  # синхронизируем память с реальным сообщением
+                return
+            except Exception:
+                # Сообщение устарело/удалено — откатываемся на новое, не проваливаем действие.
+                log.exception("Не удалось отредактировать список (prefix=%s), отправляю заново", prefix)
 
     message_id = await responder.send(text=header, attachments=[builder.as_markup()])
     if message_id:
@@ -1340,8 +1350,11 @@ async def on_callback(event: MessageCallback):
     if payload.startswith("page:"):
         _, prefix, page_s = payload.split(":", 2)
         extra = _tabel_extra_button(prefix)
+        # only_if_open убран: навигация листает по сообщению из колбэка (оно живое),
+        # не сверяясь с _open_pickers. Иначе после рестарта бота (память пуста)
+        # листание молча не срабатывало — кнопки ◀️▶️ «не работали».
         await _deliver_picker(responder, prefix, page=int(page_s), edit=True,
-                               only_if_open=True, extra_button=extra)
+                               extra_button=extra)
         return
 
     if payload.startswith("empdate:"):
