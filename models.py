@@ -284,6 +284,39 @@ class InstructionType(str, enum.Enum):
     TARGETED = "targeted"                      # целевой (под конкретную задачу)
 
 
+class Brigade(Base):
+    """
+    Бригада (2026-07) — сохраняемый состав, отдельно от конкретного наряда-допуска.
+    По договорённости: раньше при каждом новом наряде состав отмечался заново
+    чекбоксами; теперь можно один раз завести бригаду и дальше выбирать её целиком.
+    Состав можно менять со временем (не история версий — просто текущий список,
+    см. BrigadeMember); у самого наряда-допуска состав фиксируется отдельно в
+    WorkOrderMember на момент создания — смена состава бригады ПОСЛЕ не меняет
+    задним числом уже выданные наряды.
+    """
+
+    __tablename__ = "brigades"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    members: Mapped[list["BrigadeMember"]] = relationship(
+        back_populates="brigade", cascade="all, delete-orphan"
+    )
+
+
+class BrigadeMember(Base):
+    __tablename__ = "brigade_members"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    brigade_id: Mapped[str] = mapped_column(ForeignKey("brigades.id"), nullable=False)
+    employee_id: Mapped[str] = mapped_column(ForeignKey("employees.id"), nullable=False)
+
+    brigade: Mapped["Brigade"] = relationship(back_populates="members")
+    employee: Mapped["Employee"] = relationship()
+
+
 class WorkOrder(Base):
     """
     Наряд-допуск (2026-07, модуль «Производство», отдельный от миграционного
@@ -398,7 +431,13 @@ class Instruction(Base):
     """Инструктаж по охране труда (2026-07, модуль «Производство»). Все виды
     учитываются — см. InstructionType. next_due_date — для повторных, когда
     ждать следующий (используется для напоминаний по аналогии с обязательствами
-    миграционного учёта, см. production.get_due_instructions)."""
+    миграционного учёта, см. production.get_due_instructions).
+
+    2026-07 (второй заход): journal_row_number/printed_at — механизм допечатки
+    журнала партиями (см. production.print_new_journal_entries). Номер строки
+    присваивается ПОСЛЕДОВАТЕЛЬНО, отдельно по каждому InstructionType (это
+    разные физические журналы — вводный, на рабочем месте, целевой — со своей
+    нумерацией). NULL = запись ещё не попала ни в одну распечатанную партию."""
 
     __tablename__ = "instructions"
 
@@ -410,6 +449,8 @@ class Instruction(Base):
     conducted_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     employee_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     next_due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    journal_row_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    printed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     employee: Mapped["Employee"] = relationship()
 
