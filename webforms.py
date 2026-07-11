@@ -1720,9 +1720,10 @@ def instruction_test_clear(request: Request, db: Session = Depends(get_db)):
 def instruction_print_journal(
     request: Request, instruction_type: str = Form(...), db: Session = Depends(get_db),
 ):
-    """Допечатать новые записи журнала — присваивает номера строк, отдаёт docx с
-    прочерками до конца страницы (см. production.print_new_journal_entries /
-    generate_instruction_journal_docx)."""
+    """Допечатать новые записи журнала — присваивает номера строк, отдаёт xlsx
+    (2026-07: переведено с docx на Excel, см. production.print_new_journal_entries /
+    generate_instruction_journal_xlsx). Довеска прочерками нет — журнал кончается
+    на последней записи, под таблицей итог "Внесено записей: N"."""
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
     t = InstructionType(instruction_type)
@@ -1731,16 +1732,16 @@ def instruction_print_journal(
         return RedirectResponse("/production/instructions", status_code=303)
     order_ref = prod.get_latest_order_ref(db)
     started_at = prod.get_journal_started_at(db, t)
-    path = prod.generate_instruction_journal_docx(
+    path = prod.generate_instruction_journal_xlsx(
         printed, t, org_name=ORG_NAME, order_ref=order_ref, started_at=started_at,
     )
     with open(path, "rb") as f:
         data = f.read()
     label = prod.INSTRUCTION_LABELS.get(t, t.value)
-    fn = f"Журнал_{label.replace(' ', '_')}_{datetime.now(MSK):%d.%m.%Y}.docx"
+    fn = f"Журнал_{label.replace(' ', '_')}_{datetime.now(MSK):%d.%m.%Y}.xlsx"
     return Response(
         content=data,
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": _content_disposition(fn)},
     )
 
