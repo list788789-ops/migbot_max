@@ -1,1121 +1,5177 @@
 """
-production.py — наряды-допуски, инструктажи, удостоверения по профессиям
-(2026-07). Отдельный модуль от миграционного учёта — своя доменная область
-(охрана труда на производстве), минимально связан с остальной системой:
-bot.py/webforms.py дают только пункты меню/ссылки на функции отсюда.
+webforms.py — веб-интерфейс для кадровика: рабочий стол, карточка сотрудника, медкомиссия.
 
-Реализовано "тестовым режимом" — в отдельном файле, чтобы можно было
-дорабатывать/переделывать, не трогая стабильный код миграционного учёта
-и табеля.
+Отдельный сервис в ТОМ ЖЕ Railway-проекте, что и bot.py: тот же репозиторий, тот же
+DATABASE_URL, те же модели из models.py. Деплой — обычный git push, Railway подхватит
+Start Command именно этого сервиса (см. инструкцию по деплою внизу файла в комментарии).
+
+Реальный гейт создания obligations — не employment_status (это поле в bot.py не проверяется
+при создании obligations), а employee.consent_status == ConsentStatus.CONFIRMED. Логика
+create_obligations_for_employee вынесена в отдельный модуль obligations.py и импортируется
+и сюда, и в bot.py — см. obligations.py, там же инструкция по правке bot.py.
+
+2026-07: консолидация. Раньше дата въезда, место въезда, дата договора, согласие и место
+пребывания были отдельными разделами верхнего уровня (каждый — свой список + своя форма).
+Теперь единственное место редактирования — карточка сотрудника (/employees/{id}), где все
+поля собраны на одной странице несколькими независимыми мини-формами (каждая шлёт только
+своё поле, чтобы случайно не затереть остальные при частичном заполнении). Раздел
+"Место въезда" (entry_country) при этом обрёл первый реально работающий обработчик —
+раньше на него ссылались навигация и дашборд, но сам POST/GET для него не был дописан.
+
+Раздел "Медкомиссия" зеркалит две команды бота, а не вводит новую логику:
+  - /send_medical_referral <id> — генерация направления (generate_medical_referral_docx)
+  - /medical_exam_result <id> <done|failed> — отметка результата на Obligation(type=MEDICAL_EXAM)
+См. _handle_medical_exam_result в bot.py — статус НЕ меняется при "failed" (в модели нет
+поля для причины отказа), это сознательное решение из bot.py, а не упрощение здесь.
+
+Место пребывания (address + address_since) — отдельное юридическое событие (см. deadlines.py,
+второе правило REGISTRATION с trigger_field="address_since"). Критично: address_since
+проставляется ТОЛЬКО когда это реальная смена уже известного адреса — если раньше адреса
+не было (первый ввод), это часть первичной регистрации по entry_date, а не новое событие,
+и address_since должен остаться NULL, иначе следующий вызов create_obligations_for_employee
+создаст лишнее обязательство по несуществующей "смене".
+
+2026-07: два изменения ради теста потока медкомиссии:
+  1. Тестовый режим TEST_ALLOW_MISSING_FIELDS (флаг живёт в document_templates.py,
+     здесь только читается) — при незаполненных полях (адрес, паспорт, дата рождения)
+     направление всё равно генерируется, с прочерками и явным баннером-предупреждением
+     в HTML-превью и в самом тексте docx (см. document_templates._add_test_warning_paragraph).
+     ВРЕМЕННО — флаг нужно выключить/удалить перед реальной работой с сотрудниками.
+  2. Обработчик HTTPException переопределён так, чтобы Content-Type ошибок явно нёс
+     charset=utf-8 — без этого мобильный браузер иногда угадывал кодировку JSON-ответа
+     неверно и кириллица в сообщении об ошибке превращалась в кракозябры (двойное
+     перекодирование на экране, не в самих данных).
 """
 
-from datetime import date, datetime, timedelta
+from __future__ import annotations
 
-from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.shared import Mm, Pt
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, Side
-from openpyxl.worksheet.pagebreak import Break
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+import html
+import logging
+import os
+import calendar
+from datetime import date, datetime, timedelta, timezone
+
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session, sessionmaker
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.sessions import SessionMiddleware
+
+log = logging.getLogger("webforms")
 
 from models import (
-    Brigade,
-    BrigadeMember,
-    Certificate,
+    User,
+    UserRole,
+    UserStatus,
+    AttendanceMark,
+    Category,
+    Consent,
+    ConsentMethod,
+    ConsentStatus,
+    DeadlineUnit,
     Employee,
-    Instruction,
+    ExamStatus,
+    Obligation,
+    ObligationStatus,
+    ObligationType,
+    Referral,
+    RegistrationStatus,
+    RotationReturn,
+    SystemFlag,
+    WorkOrderMember,
+    WorkOrder,
     InstructionType,
+    Certificate,
     InternalOrder,
     OrderCategory,
-    WorkOrder,
-    WorkOrderDailyAdmission,
-    WorkOrderMember,
-    WorkOrderStatus,
+    Brigade,
+    BrigadeMember,
+    Instruction,
+)
+from obligations import create_obligations_for_employee
+from auth_binding import get_role_label, find_user_by_max_id
+import tabel
+from deadlines import lead_days_for
+from document_templates import (
+    CLINIC_CHIEF_DOCTOR_NAME,
+    CLINIC_CONTRACT_DATE,
+    CLINIC_CONTRACT_NUMBER,
+    CLINIC_NAME as REFERRAL_CLINIC_NAME,
+    CLINIC_SHORT_NAME as REFERRAL_CLINIC_SHORT_NAME,
+    SITE_ADDRESS,
+    MEDICAL_SERVICE_TEXT,
+    PAYER_NAME as REFERRAL_PAYER_NAME,
+    PAYER_PHONE,
+    PAYER_SIGNATORY_NAME,
+    TEST_ALLOW_MISSING_FIELDS,
+    check_medical_referral_fields,
+    generate_medical_referral_docx,
+    generate_labor_contract_docx,
+    generate_duty_receipt_docx,
+    generate_termination_notice_docx,
+    generate_departure_notice_docx,
+    CONTRACT_NUMBER_PREFIX,
+    EMPLOYER_NAME_SHORT,
+    EMPLOYER_NAME_FULL,
+    EMPLOYER_DIRECTOR_FULL,
+    EMPLOYER_DIRECTOR_SHORT,
+    EMPLOYER_INN,
+    EMPLOYER_KPP,
+    EMPLOYER_LEGAL_ADDRESS,
+    EMPLOYER_ACTUAL_ADDRESS,
+    EMPLOYER_PHONE,
+    EMPLOYER_SUBDIVISION,
+    WORKPLACE_ADDRESS,
+    DISTRICT_COEFFICIENT,
+    SITE_ADDRESS as CONTRACT_SITE_ADDRESS,
 )
 
-# Порог "скоро истекает" для удостоверений — по аналогии с обязательствами
-# миграционного учёта. [Предполагаю] 30 дней — не согласовано явно, разумный
-# дефолт, легко поменять одной константой.
-CERTIFICATE_EXPIRY_WARNING_DAYS = 30
+MSK = timezone(timedelta(hours=3))  # то же смещение, что в bot.py — для единообразия timestamp'ов proof
+
+# --- База данных: та же Postgres, что у бота -------------------------------
+
+DATABASE_URL = os.environ["DATABASE_URL"]
+# Railway иногда отдаёт "postgres://", SQLAlchemy 2.x требует "postgresql://"
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine)
 
 
-# ================= Бригады =================
-
-def create_brigade(session: Session, name: str, member_employee_ids: list[str]) -> Brigade:
-    brigade = Brigade(name=name)
-    session.add(brigade)
-    session.flush()
-    for employee_id in member_employee_ids:
-        session.add(BrigadeMember(brigade_id=brigade.id, employee_id=employee_id))
-    session.commit()
-    return brigade
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
-def get_brigades(session: Session) -> list[Brigade]:
-    return session.query(Brigade).order_by(Brigade.name).all()
+# --- Авторизация: один логин/пароль на кадровика, через переменные окружения -
+
+# Старый общий вход убран (перешли на учётки). Переменные оставлены необязательными,
+# чтобы их удаление/отсутствие не роняло старт. created_by/proof теперь берут реального
+# пользователя из сессии (см. _actor_name).
+WEBFORMS_USER = os.environ.get("WEBFORMS_USER", "system")
+WEBFORMS_PASSWORD = os.environ.get("WEBFORMS_PASSWORD", "")
+SECRET_KEY = os.environ["WEBFORMS_SECRET_KEY"]
+ORG_NAME = os.environ.get("COMPANY_NAME", "ИП Буц Сергей Юрьевич")
+CLINIC_ID = os.environ.get("CLINIC_ID", "pirogova_murmansk")
+CONSENT_TEXT_VERSION = os.environ.get("CONSENT_TEXT_VERSION", "v1")
+
+app = FastAPI()
+app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, session_cookie="migbot_session")
 
 
-def get_brigade_member_ids(session: Session, brigade_id: str) -> list[str]:
-    return [
-        m.employee_id for m in
-        session.query(BrigadeMember).filter_by(brigade_id=brigade_id).all()
-    ]
+# --- Хранилище сканов (S3-совместимое, Cloud.ru Object Storage) --------------
+# Сканы для пакета Госуслуг (паспорт, миграционная карта, выписка ЕГРН на ВЖК) хранятся в
+# приватном бакете Cloud.ru. Ключи — только в переменных окружения Railway, не в коде.
+# Доступ к сканам: кадровик и админ (не прораб) — проверяется в роутах.
+# Если boto3 не установлен или ключи не заданы — функции бросают понятную ошибку, старт не
+# роняется (аналогично graceful-обработке holidays/qrcode).
+# S3-хранилище вынесено в общий модуль s3_storage.py (им пользуется и bot.py).
+from s3_storage import (
+    S3_ENDPOINT, S3_BUCKET, S3_REGION, S3_ACCESS_KEY, S3_SECRET_KEY,
+    SCAN_TYPES, PAYMENT_SCAN_TYPES, COMMON_DOC_TYPES, SCAN_COMMON_TYPES,
+    _s3_client, _scan_key, _s3_upload, _s3_list_for_employee, _s3_download,
+    _s3_delete, _common_key, _s3_upload_common, _s3_list_common,
+    _s3_download_common, _s3_delete_common, _s3_clear_check,
+)
 
 
-def update_brigade_members(session: Session, brigade_id: str, member_employee_ids: list[str]) -> bool:
-    """Заменяет состав целиком (не история — просто текущий список, см. docstring
-    Brigade в models.py)."""
-    brigade = session.get(Brigade, brigade_id)
-    if brigade is None:
-        return False
-    session.query(BrigadeMember).filter_by(brigade_id=brigade_id).delete()
-    for employee_id in member_employee_ids:
-        session.add(BrigadeMember(brigade_id=brigade_id, employee_id=employee_id))
-    session.commit()
-    return True
-
-
-def delete_brigade(session: Session, brigade_id: str) -> bool:
-    brigade = session.get(Brigade, brigade_id)
-    if brigade is None:
-        return False
-    session.delete(brigade)
-    session.commit()
-    return True
-
-
-# ================= Наряды-допуски =================
-
-def create_work_order(
-    session: Session, number: str, work_description: str, location: str,
-    responsible_supervisor_id: str, responsible_executor_id: str, issued_by: str,
-    valid_from: date, valid_to: date, member_employee_ids: list[str],
-    subdivision: str | None = None, materials: str | None = None, tools: str | None = None,
-    equipment: str | None = None, special_machinery: str | None = None,
-    technological_card_ref: str | None = None, safety_systems: str | None = None,
-    special_conditions: str | None = None,
-) -> WorkOrder:
-    order = WorkOrder(
-        number=number,
-        subdivision=subdivision,
-        work_description=work_description,
-        location=location,
-        responsible_supervisor_id=responsible_supervisor_id,
-        responsible_executor_id=responsible_executor_id,
-        issued_by=issued_by,
-        valid_from=valid_from,
-        valid_to=valid_to,
-        status=WorkOrderStatus.ACTIVE,
-        materials=materials,
-        tools=tools,
-        equipment=equipment,
-        special_machinery=special_machinery,
-        technological_card_ref=technological_card_ref,
-        safety_systems=safety_systems,
-        special_conditions=special_conditions,
+def _package_missing(emp, present: dict | None = None, common: dict | None = None) -> list:
+    """Проверяет комплектность пакета Госуслуг. Принимает уже посчитанные списки сканов present
+    (персональные) и common (общие), чтобы НЕ ходить в S3 повторно — это ускоряет карточку, где
+    списки уже посчитаны для отображения. Если не переданы — считает сам (для роутов пакета).
+    Платёжки пока не обязательны (логика двух госпошлин будет позже)."""
+    if present is None:
+        present = _s3_list_for_employee(emp.id)
+    if common is None:
+        common = _s3_list_common()
+    missing = []
+    # Не требуем для комплектности: платёжки (логика пошлин позже) и уведомление о прибытии
+    # (это подтверждение постановки на учёт, а не документ, подаваемый В пакете Госуслуг).
+    _optional = PAYMENT_SCAN_TYPES | {"arrival_notice"}
+    for st, label in SCAN_TYPES.items():
+        if st in _optional:
+            continue
+        _i = present.get(st) or {}
+        if not _i.get("present"):
+            missing.append(label)
+    for dt, label in COMMON_DOC_TYPES.items():
+        if not common.get(dt):
+            missing.append(label)
+    if emp.contract_date is None:
+        missing.append("Трудовой договор (не заключён)")
+    # Для загранпаспорта — нужны все страницы (подтверждается чекбоксом кадровика).
+    _is_passport = (emp.doc_type == "passport") or (
+        not emp.doc_type and (emp.passport_series or "").strip().upper() != "ID"
     )
-    session.add(order)
-    session.flush()  # получить order.id до commit
-
-    for employee_id in member_employee_ids:
-        session.add(WorkOrderMember(work_order_id=order.id, employee_id=employee_id))
-
-    # Заготовка строк "Ежедневный допуск к работе" на каждый день периода действия —
-    # по образцу реального бланка (там наряд на 9 дней = 9 отдельных строк допуска).
-    # Пустые (briefing_time/completion_time=NULL) — заполняются по факту каждый день,
-    # см. record_daily_admission/record_daily_completion ниже.
-    day = valid_from
-    while day <= valid_to:
-        session.add(WorkOrderDailyAdmission(work_order_id=order.id, admission_date=day))
-        day += timedelta(days=1)
-
-    session.commit()
-    return order
+    if _is_passport and not getattr(emp, "passport_all_pages", False):
+        missing.append("Паспорт: подтвердите загрузку всех страниц")
+    return missing
 
 
-def sign_work_order_member(session: Session, work_order_id: str, employee_id: str) -> bool:
-    """Подтверждение ознакомления членом бригады (подпись)."""
-    member = (
-        session.query(WorkOrderMember)
-        .filter_by(work_order_id=work_order_id, employee_id=employee_id)
-        .first()
-    )
-    if member is None:
-        return False
-    member.signed_at = datetime.utcnow()
-    session.add(member)
-    session.commit()
-    return True
+def _content_disposition(filename: str) -> str:
+    """Заголовок Content-Disposition с именем файла, безопасным для HTTP (latin-1 only).
+    Русские имена кодируем по RFC 5987 (filename*=UTF-8''...), плюс ASCII-запасной filename,
+    иначе UnicodeEncodeError: latin-1 не кодирует кириллицу в заголовке."""
+    from urllib.parse import quote
+    ascii_name = filename.encode("ascii", "ignore").decode("ascii") or "file"
+    quoted = quote(filename)
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quoted}"
 
 
-def get_daily_admissions(session: Session, work_order_id: str) -> list[WorkOrderDailyAdmission]:
-    return (
-        session.query(WorkOrderDailyAdmission)
-        .filter_by(work_order_id=work_order_id)
-        .order_by(WorkOrderDailyAdmission.admission_date)
-        .all()
+def _ext_for(ct: str) -> str:
+    if "pdf" in ct:
+        return "pdf"
+    if "jpeg" in ct or "jpg" in ct:
+        return "jpg"
+    if "png" in ct:
+        return "png"
+    return "bin"
+
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    """Переопределяет дефолтный обработчик FastAPI ТОЛЬКО ради явного charset=utf-8
+    в заголовке ответа. Starlette проставляет charset автоматически лишь для media_type,
+    начинающихся с "text/" — для "application/json" charset в Content-Type отсутствует,
+    и часть мобильных браузеров/веб-вью в таком случае угадывает кодировку неверно,
+    из-за чего кириллица в detail превращается в кракозябры на экране (сами данные
+    при этом были в порядке — ломалось только отображение)."""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        media_type="application/json; charset=utf-8",
     )
 
 
-def record_daily_briefing(session: Session, work_order_id: str, admission_date: date,
-                           confirmed_by: str) -> bool:
-    """Целевой инструктаж на конкретный день выдан — фиксирует время и кто подтвердил
-    (ответственный руководитель работ). Одна строка на день, см. WorkOrderDailyAdmission."""
-    row = (
-        session.query(WorkOrderDailyAdmission)
-        .filter_by(work_order_id=work_order_id, admission_date=admission_date)
-        .first()
-    )
-    if row is None:
+def _hash_password(pw: str) -> str:
+    """Прямой bcrypt (не passlib-обёртка): passlib 1.7.x несовместим с bcrypt 4.x
+    (лезет в bcrypt.__about__, которого больше нет), из-за чего verify падал и вход не
+    проходил при верном пароле. bcrypt.hashpw/checkpw читают и $2a$, и $2b$ без проблем."""
+    import bcrypt as _bcrypt
+    return _bcrypt.hashpw(pw.encode("utf-8"), _bcrypt.gensalt(rounds=12)).decode("utf-8")
+
+
+def _verify_password(pw: str, pw_hash: str) -> bool:
+    import bcrypt as _bcrypt
+    try:
+        return _bcrypt.checkpw(pw.encode("utf-8"), pw_hash.encode("utf-8"))
+    except Exception:
         return False
-    row.briefing_time = datetime.utcnow()
-    row.briefing_confirmed_by = confirmed_by
-    session.add(row)
-    session.commit()
-    return True
 
 
-def record_daily_completion(session: Session, work_order_id: str, admission_date: date,
-                             confirmed_by: str) -> bool:
-    """Работа за конкретный день закончена, место убрано — фиксирует время и кто
-    подтвердил (ответственный исполнитель работ)."""
-    row = (
-        session.query(WorkOrderDailyAdmission)
-        .filter_by(work_order_id=work_order_id, admission_date=admission_date)
-        .first()
-    )
-    if row is None:
-        return False
-    row.completion_time = datetime.utcnow()
-    row.completion_confirmed_by = confirmed_by
-    session.add(row)
-    session.commit()
-    return True
+def _password_problems(pw: str) -> list[str]:
+    """Требования: 8+ символов, строчная, заглавная, цифра. Возвращает список нарушений."""
+    import re as _re
+    problems = []
+    if len(pw) < 8:
+        problems.append("минимум 8 символов")
+    if not _re.search(r"[a-zа-яё]", pw):
+        problems.append("строчная буква")
+    if not _re.search(r"[A-ZА-ЯЁ]", pw):
+        problems.append("заглавная буква")
+    if not _re.search(r"\d", pw):
+        problems.append("цифра")
+    return problems
 
 
-def get_active_work_orders(session: Session) -> list[WorkOrder]:
-    today = date.today()
-    return (
-        session.query(WorkOrder)
-        .filter(WorkOrder.status == WorkOrderStatus.ACTIVE)
-        .filter(WorkOrder.valid_to >= today)
-        .order_by(WorkOrder.valid_from)
-        .all()
-    )
+from common_utils import normalize_phone as _normalize_phone
+# _normalize_phone вынесена в common_utils.py — используется и здесь, и в bot.py.
+# Оставлена под старым именем (алиас), чтобы не трогать все места вызова в этом файле.
 
 
-def close_work_order(session: Session, work_order_id: str) -> bool:
-    order = session.get(WorkOrder, work_order_id)
-    if order is None:
-        return False
-    order.status = WorkOrderStatus.CLOSED
-    session.add(order)
-    session.commit()
-    return True
+def _current_user(request: Request, db: Session):
+    """Пользователь из сессии или None. Проверяет, что запись существует и APPROVED."""
+    uid = request.session.get("user_id")
+    if not uid:
+        return None
+    user = db.get(User, uid)
+    if user is None or user.status != UserStatus.APPROVED:
+        return None
+    return user
 
 
-# ================= Инструктажи =================
+def _logged_in(request: Request) -> bool:
+    return bool(request.session.get("user_id"))
 
-INSTRUCTION_LABELS = {
-    InstructionType.INTRODUCTORY: "Вводный",
-    InstructionType.PRIMARY_WORKPLACE: "Первичный на рабочем месте",
-    InstructionType.REPEATED: "Повторный",
-    InstructionType.UNSCHEDULED: "Внеплановый",
-    InstructionType.TARGETED: "Целевой",
+
+def _require_role(request: Request, db: Session, *roles):
+    """Проверяет, что текущий пользователь имеет одну из ролей. Иначе 403.
+    ADMIN проходит везде (полный доступ). Возвращает пользователя при успехе."""
+    user = _current_user(request, db)
+    if user is None:
+        raise HTTPException(401, "Требуется вход")
+    if user.role == UserRole.ADMIN:
+        return user
+    if user.role not in roles:
+        raise HTTPException(403, "Недостаточно прав для этого действия")
+    return user
+
+
+def _actor_name(request: Request, db: Session) -> str:
+    """Имя текущего пользователя для аудита (created_by, proof). Если сессия почему-то пуста —
+    'system'. Заменяет прежний фиксированный WEBFORMS_USER, чтобы след показывал, КТО сделал."""
+    user = _current_user(request, db)
+    return user.full_name if user else "system"
+
+
+def _obligation_status(o, today):
+    """(chip_class, label, bucket). bucket: 'overdue' | 'soon' | 'ok'.
+    Порог 'скоро' берётся из deadlines.lead_days_for (один источник со сроком).
+    Короткоплечие (WORKING_DAY: переезд/уведомление/ЕФС-1) — born-amber: 'soon'
+    с момента создания, пока не сделаны. Единая точка окраски для дашборда и списка."""
+    days = (o.deadline_date - today).days
+    if days < 0:
+        return ("red", f"просрочено на {-days} дн", "overdue")
+    cat = o.employee.category if o.employee else None
+    if o.deadline_unit == DeadlineUnit.WORKING_DAY:
+        soon = True
+    else:
+        soon = days <= lead_days_for(cat, o.type, o.deadline_unit)
+    if soon:
+        label = "сегодня" if days == 0 else ("завтра" if days == 1 else f"через {days} дн")
+        return ("orange", label, "soon")
+    return ("green", "в норме", "ok")
+
+
+# Человекочитаемые названия типов обязанностей — один источник для дашборда и списка.
+SAVE_FORM_JS = """
+<script>
+(function(){
+  var f = document.getElementById('saveform');
+  if(!f) return;
+  f.addEventListener('submit', function(e){
+    var warn = [];
+    var a = f.querySelector('[name=address]');
+    if(a && a.value.trim() && (a.dataset.orig||'').trim() && a.value.trim() !== (a.dataset.orig||'').trim())
+      warn.push('адрес места пребывания — создаст обязательство регистрации');
+    var d = f.querySelector('[name=dactyloscopy_date]');
+    if(d && d.value && d.value !== (d.dataset.orig||''))
+      warn.push('дата дактилоскопии — закроет обязательство как пройденное');
+    if(warn.length){
+      if(confirm('Эти изменения затронут обязательства сотрудника:\n\n\u2022 ' + warn.join('\n\u2022 ') + '\n\nПродолжить?')){
+        f.querySelector('[name=confirmed]').value = '1';
+      } else {
+        e.preventDefault();
+      }
+    }
+  });
+})();
+</script>
+"""
+
+
+OBLIGATION_LABELS = {
+    ObligationType.REGISTRATION: "постановка на учёт",
+    ObligationType.CONTRACT_NOTICE: "уведомление о договоре",
+    ObligationType.CONTRACT_TERMINATION_NOTICE: "уведомление о расторжении",
+    ObligationType.MEDICAL_EXAM: "медосмотр",
+    ObligationType.EFS1_REPORT: "ЕФС-1",
+    ObligationType.DACTYLOSCOPY: "дактилоскопия",
+    ObligationType.REGISTRATION_RENEWAL: "продление регистрации",
+    ObligationType.DEPARTURE_NOTICE: "снятие с учёта (убытие)",
+    ObligationType.PATENT_PAYMENT: "оплата патента",
 }
 
-# Строк на страницу при допечатке журнала — [Предполагаю] не согласовано явно,
-# разумный дефолт под таблицу А4 с таким набором граф. Легко поменять.
-JOURNAL_ROWS_PER_PAGE = 20
 
-# Порог "критично" для непроведённых вводного/первичного инструктажей: сколько
-# дней после ДАТЫ НАЧАЛА РАБОТЫ считается некритичной просрочкой, после чего —
-# критичной. Согласовано явно: 5 дней. Стадии: "overdue" (дата начала прошла,
-# 0..5 дней) → "critical" (> 5 дней). Стадия "заранее" для этих двух видов на
-# практике не возникает, пока даты начала в прошлом (см. диалог) — включится
-# сама, когда появятся будущие даты начала работы.
-INSTRUCTION_OVERDUE_CRITICAL_DAYS = 5
+# --- Простая HTML-обёртка без отдельных файлов шаблонов ---------------------
 
-# Виды инструктажа, проведение которых система ТРЕБУЕТ по дате начала работы
-# (разовые, привязаны к приёму). Повторный/внеплановый/целевой сюда НЕ входят:
-# повторный периодический (отложен), внеплановый/целевой — событийные, планового
-# срока по календарю у них нет.
-REQUIRED_INSTRUCTION_TYPES = (
-    InstructionType.INTRODUCTORY,
-    InstructionType.PRIMARY_WORKPLACE,
-)
-
-
-def get_employees_needing_instruction(
-    session: Session, instruction_type: InstructionType
-) -> list[Employee]:
-    """Активные сотрудники, у кого известна дата начала работы (дата договора,
-    а если её ещё нет — дата въезда), но инструктажа ДАННОГО типа ещё нет ни
-    одного. Обобщение прежней get_employees_needing_introductory на любой тип —
-    чтобы вводный и первичный проверялись одной логикой, а не двумя копиями."""
-    existing_ids = {
-        i.employee_id for i in
-        session.query(Instruction).filter_by(type=instruction_type).all()
-    }
-    employees = (
-        session.query(Employee)
-        .filter(Employee.contract_end_date.is_(None))
-        .filter((Employee.contract_date.isnot(None)) | (Employee.entry_date.isnot(None)))
-        .all()
+PAGE_HEAD = """<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+:root{{--ink:#111214;--sub:#5b626b;--line:#e6e9ee;--line-2:#eef1f4;--accent:#4a90e2;--accent-ink:#2f6fb0;
+--red-bg:#fdecec;--red-ink:#c0392b;--amber-bg:#fdf3e2;--amber-ink:#a5720a;--green-bg:#eaf6f0;--green-ink:#1f7a55;
+--neutral-bg:#eef1f4;--neutral-ink:#55606b;--serif:Georgia,"Times New Roman",serif;
+--sans:-apple-system,Segoe UI,Roboto,Arial,sans-serif}}
+*{{box-sizing:border-box}}
+body{{font-family:var(--sans);max-width:720px;margin:0 auto;padding:16px;background:#fff;color:var(--ink)}}
+header.org{{background:#fff;border:0;border-bottom:1px solid var(--line);border-radius:0;padding:14px 4px 16px;margin-bottom:8px}}
+header.org .org-name{{font-size:13px;color:var(--sub);letter-spacing:.01em}}
+header.org .page-title{{font-family:var(--serif);font-size:26px;font-weight:700;letter-spacing:-.02em;margin-top:2px}}
+h1{{font-family:var(--serif);font-size:24px;font-weight:700;letter-spacing:-.02em}}
+h2{{font-size:12px;margin:0 0 12px;color:var(--sub);text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid var(--line-2);padding-bottom:8px;font-weight:700}}
+section{{background:#fff;border:1px solid var(--line);border-radius:16px;padding:16px;margin-bottom:14px}}
+.card{{background:#fff;border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:10px;font-weight:600;color:var(--ink)}}
+.card:last-child{{margin-bottom:0}}
+.card .muted-line{{font-weight:400;color:var(--sub)}}
+a.btn,button{{display:inline-block;background:var(--accent);color:#fff;text-decoration:none;padding:14px 20px;min-height:48px;line-height:20px;border-radius:12px;border:none;font-size:16px;font-family:var(--sans);font-weight:600;margin:8px 8px 0 0;cursor:pointer}}
+a.btn.secondary,button.secondary{{background:#fff;color:var(--accent-ink);border:1px solid var(--accent)}}
+input[type=date],input[type=text],input[type=password],select{{width:100%;padding:12px;font-size:16px;font-family:inherit;border:1px solid #d9dde3;border-radius:12px;margin:6px 0 12px;background:#fff;color:var(--ink)}}
+select{{min-height:48px;-webkit-appearance:none;appearance:none;background-image:url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="%235b626b" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>');background-repeat:no-repeat;background-position:right 14px center;padding-right:40px}}
+.field-help{{margin:2px 0 8px}}
+.field-help summary{{list-style:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;color:var(--accent-ink);font-size:13px;font-weight:600}}
+.field-help summary::-webkit-details-marker{{display:none}}
+.field-help .i{{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;border:1.5px solid var(--accent);color:var(--accent-ink);font-size:12px;font-style:italic;font-weight:700;line-height:1}}
+.field-help p{{margin:6px 0 0;color:var(--sub);font-size:13px;font-weight:400;line-height:1.4}}
+.btn-full{{width:100%;text-align:center;margin:0 0 14px 0}}
+.btn-upload{{background:#eaf0fb;color:var(--accent);border:1px solid #cddcf5;font-weight:600}}
+.scans-grid > div{{margin-top:0}}
+.btn-upload:hover{{background:#dce8fa}}
+input:focus{{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px #4a90e222}}
+label{{font-size:13px;color:var(--sub)}}
+.badge{{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:600;margin:2px 4px 2px 0}}
+.badge.red{{background:var(--red-bg);color:var(--red-ink)}}
+.badge.orange{{background:var(--amber-bg);color:var(--amber-ink)}}
+.badge.green{{background:var(--green-bg);color:var(--green-ink)}}
+.badge.neutral{{background:var(--neutral-bg);color:var(--neutral-ink)}}
+.muted{{color:var(--sub);font-size:13px}}
+.warning-banner{{background:var(--amber-bg);border:1px solid #f0c674;border-left:4px solid var(--amber-ink);border-radius:12px;padding:12px 14px;margin-bottom:14px;font-weight:600;color:#7a4a00}}
+nav{{margin-bottom:16px;background:#fff;border:1px solid var(--line);border-radius:12px;padding:4px 8px;display:flex;flex-wrap:wrap;gap:2px}}
+nav a{{color:var(--sub);text-decoration:none;font-size:15px;padding:10px 12px 8px;white-space:nowrap;font-weight:600;border-radius:8px 8px 0 0;border-bottom:2px solid transparent}}
+nav a.active{{color:var(--ink);border-bottom-color:var(--accent)}}
+nav a:hover{{color:var(--ink);background:#f5f7f9}}
+form.inline{{display:inline}}
+fieldset{{border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:14px}}
+fieldset legend{{font-size:12px;color:var(--accent-ink);text-transform:uppercase;letter-spacing:.04em;font-weight:700;padding:0 6px}}
+@media (min-width:760px){{
+  body{{max-width:1080px;padding:24px 32px}}
+  header.org .page-title{{font-size:30px}}
+  section.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;align-items:start}}
+  section.grid.wide{{grid-template-columns:repeat(auto-fill,minmax(340px,1fr))}}
+  section.grid h2{{grid-column:1/-1}}
+  section.grid .card{{margin-bottom:0}}
+  section.narrow{{max-width:440px;margin:0 auto}}
+  section.card-form{{max-width:1000px;margin:0 auto}}
+  .card-cols{{display:grid;grid-template-columns:1fr 1fr;gap:20px;align-items:start}}
+  a.btn:hover,button:hover{{opacity:.9}}
+  /* Десктоп: кнопки на всю ширину (btn-full) не растягивать во всю колонку — ограничить и
+     прижать влево, иначе на широком экране кнопка-переросток. Мобильный не затронут (media). */
+  .btn-full{{width:auto;min-width:280px;display:inline-block}}
+  .btn-upload{{min-width:auto;padding:8px 18px;font-size:14px}}
+  .scans-grid{{display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start}}
+  /* Поля ввода не на всю ширину колонки — читаемая ширина. */
+  input[type=date],input[type=text],input[type=password],select{{max-width:420px}}
+  /* Форма квитанции: кнопки в ряд, а не столбиком. */
+  fieldset form .btn-full{{margin-right:10px}}
+}}
+</style></head><body>
+<header class="org">
+<div class="org-name">{org_name}</div>
+<div class="page-title">Автоматизированная система учёта на производстве — {title}</div>
+</header>
+"""
+PAGE_FOOT = """
+<button id="scrollTopBtn" onclick="window.scrollTo({top:0,behavior:'smooth'})"
+  style="display:none;position:fixed !important;right:12px;bottom:calc(16px + env(safe-area-inset-bottom,0px));
+  z-index:999;width:46px !important;height:46px !important;min-height:0 !important;min-width:0 !important;
+  padding:0 !important;margin:0 !important;border:none;border-radius:50% !important;
+  background:rgba(74,144,226,.9);color:#fff;font-size:22px;line-height:46px !important;text-align:center;
+  box-shadow:0 3px 10px rgba(20,24,30,.28);cursor:pointer" aria-label="Наверх">&#8593;</button>
+<script>
+(function(){
+  var btn = document.getElementById('scrollTopBtn');
+  if(!btn) return;
+  window.addEventListener('scroll', function(){
+    btn.style.display = (window.scrollY > 300) ? 'block' : 'none';
+  });
+})();
+</script>
+</body></html>"""
+def _nav(active: str = "", role: str = "") -> str:
+    """active: 'home' | 'employees' | 'medical' | 'admin' — подсвечивает корневой раздел.
+    role: роль пользователя — 'admin' добавляет пункт «Пользователи» (управление доступом)."""
+    items = [
+        ("home", "/", "Рабочий стол"),
+        ("tabel", "/tabel", "Табель"),
+        ("employees", "/employees", "Сотрудники"),
+        ("medical", "/medical", "Медкомиссия"),
+        ("production", "/production", "Производство"),
+        ("reports", "/reports", "Отчёты"),
+    ]
+    # Общие документы (паспорт директора, основание на адрес) — кадровику и админу, не прорабу.
+    if role in ("admin", "kadrovik"):
+        items.append(("common", "/common-docs", "Общие документы"))
+    if role == "admin":
+        items.append(("admin", "/admin/users", "Пользователи"))
+    items.append(("", "/logout", "Выйти"))
+    links = "".join(
+        f'<a href="{href}"{" class=\"active\"" if key and key == active else ""}>{label}</a>'
+        for key, href, label in items
     )
-    return [e for e in employees if e.id not in existing_ids]
+    return f"<nav>{links}</nav>"
 
 
-def get_employees_needing_introductory(session: Session) -> list[Employee]:
-    """Обёртка над get_employees_needing_instruction для вводного — сохранена,
-    чтобы не менять вызовы в webforms.py (кнопка «Заполнить вводный всем»)."""
-    return get_employees_needing_instruction(session, InstructionType.INTRODUCTORY)
+def _render(title: str, body: str, active: str = "", role: str = "") -> str:
+    return PAGE_HEAD.format(title=title, org_name=ORG_NAME) + _nav(active, role) + body + PAGE_FOOT
 
 
-def get_instruction_compliance_gaps(session: Session) -> list[dict]:
-    """Пробелы по ОБЯЗАТЕЛЬНЫМ инструктажам (вводный + первичный на рабочем месте):
-    активный сотрудник, у которого дата начала работы уже наступила, а инструктаж
-    этого типа не проведён. Для дашборда веба, раздела «Требует внимания» в боте
-    и утренней рассылки «до устранения».
-
-    Стадия:
-      "overdue"  — дата начала прошла, 0..INSTRUCTION_OVERDUE_CRITICAL_DAYS дней;
-      "critical" — прошло больше порога.
-    Сотрудники с ещё НЕ наступившей датой начала (будущий приём) сюда не попадают —
-    у них обязанность ещё не возникла (для них позже естественно оживёт стадия
-    «заранее», её добавим, когда появятся будущие даты)."""
-    today = date.today()
-    gaps: list[dict] = []
-    for itype in REQUIRED_INSTRUCTION_TYPES:
-        for emp in get_employees_needing_instruction(session, itype):
-            start_date = emp.contract_date or emp.entry_date
-            if start_date is None or start_date > today:
-                continue  # дата начала не наступила — обязанности ещё нет
-            days_overdue = (today - start_date).days
-            stage = "critical" if days_overdue > INSTRUCTION_OVERDUE_CRITICAL_DAYS else "overdue"
-            gaps.append({
-                "employee_id": emp.id,
-                "name": emp.full_name,
-                "instruction_type": itype,
-                "type_label": INSTRUCTION_LABELS.get(itype, itype.value),
-                "start_date": start_date,
-                "days_overdue": days_overdue,
-                "stage": stage,
-            })
-    # Критичные первыми, внутри — по возрастанию давности (свежие сверху),
-    # чтобы в рассылке/на дашборде взгляд цеплялся за самое горящее.
-    gaps.sort(key=lambda g: (g["stage"] != "critical", g["days_overdue"]))
-    return gaps
+LOGIN_HEAD = """<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Вход</title>
+<style>
+:root{--accent:#4a90e2;--ink:#111214;--sub:#5b626b;--serif:Georgia,"Times New Roman",serif;--sans:-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+*{box-sizing:border-box}
+body.login-page{margin:0;min-height:100dvh;display:flex;flex-direction:column;justify-content:flex-start;align-items:center;background:url('/login-bg.svg') no-repeat center bottom / cover, #fff;font-family:var(--sans);color:var(--ink)}
+.auth{width:100%;max-width:440px;margin:0 auto;padding:56px 24px 40px}
+.auth-row{background:#fff;border:1px solid #e6e9ee;border-radius:16px;padding:14px;box-shadow:0 6px 24px rgba(20,24,30,.10);display:flex;gap:10px;flex-wrap:wrap;align-items:stretch}
+.auth h1{font-family:var(--serif);font-weight:700;letter-spacing:-.02em;font-size:clamp(1.5rem,5.5vw,2.25rem);line-height:1.15;margin:0 0 .3em}
+.auth .subtitle{font-family:var(--serif);font-weight:400;color:var(--sub);font-size:clamp(1.125rem,2.5vw,1.375rem);margin:0 0 1.75rem}
+.auth input{flex:1 1 45%;min-width:130px;font-family:var(--sans);font-size:16px;padding:14px 16px;border:1px solid #b8c0cc;border-radius:12px;background:#fff;margin:0}
+.auth input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px #4a90e222}
+.auth button{flex:1 1 100%;border:0;border-radius:12px;background:var(--accent);color:#fff;font:16px/1 var(--sans);padding:15px 20px;min-height:50px;cursor:pointer}
+.auth .err{color:#c0392b;font-size:14px;margin:0 0 12px}
+.auth a.btn{display:inline-block;margin-top:14px;color:var(--accent);text-decoration:underline;font-size:14px}
+@media(min-width:520px){ .auth button{flex:0 0 auto} }
+@media(min-width:768px){
+  body.login-page{justify-content:center;background-position:right bottom;background-size:min(46vw,600px) auto}
+  .auth{padding:0 24px}
+}
+</style></head>
+<body class="login-page">
+"""
 
 
-def auto_create_introductory_instructions(session: Session, conducted_by: str) -> list[Instruction]:
-    """Заводит вводный инструктаж для ВСЕХ сотрудников разом — по договорённости
-    "заполнять всеми сотрудниками с разделением по дате начала работы". Дата
-    самого инструктажа = дата начала работы конкретного человека (дата договора,
-    а если пусто — дата въезда), НЕ сегодняшняя дата — так порядок строк в
-    журнале при печати совпадёт с реальной хронологией приёма, а не с датой,
-    когда кто-то нажал кнопку в системе.
-
-    2026-07: защита от гонки (двойное нажатие кнопки создавало дубли — нашли по
-    факту на первой же реальной распечатке, см. журнал патчей). Коммит ПО ОДНОМУ
-    сотруднику, а не одним общим commit() в конце — если где-то между чтением
-    списка и записью появился дубль (например, из-за параллельного запроса),
-    unique-индекс в БД (employee_id WHERE type='introductory') отклонит именно
-    эту одну вставку, не обрушив всю пачку остальных."""
-    from sqlalchemy.exc import IntegrityError
-
-    employees = get_employees_needing_introductory(session)
-    created = []
-    for e in employees:
-        start_date = e.contract_date or e.entry_date
-        instr = Instruction(
-            employee_id=e.id,
-            type=InstructionType.INTRODUCTORY,
-            conducted_by=conducted_by,
-            conducted_at=datetime.combine(start_date, datetime.min.time()),
-        )
-        session.add(instr)
-        try:
-            session.commit()
-            created.append(instr)
-        except IntegrityError:
-            session.rollback()  # уже есть (гонка/повторное нажатие) — пропускаем, не падаем
-    return created
+@app.get("/login", response_class=HTMLResponse)
+def login_form():
+    return LOGIN_HEAD + """
+<form class="auth" method="post" action="/login" autocomplete="on">
+<h1>Автоматизированная система учёта на производстве</h1>
+<p class="subtitle">Вход по номеру телефона</p>
+<div class="auth-row">
+<input type="text" name="phone" placeholder="Телефон" autocomplete="username" required>
+<input type="password" name="password" placeholder="Пароль" autocomplete="current-password" required>
+<button type="submit">Войти</button>
+</div>
+<p style="margin-top:14px;text-align:center"><a href="/register">Нет доступа? Подать заявку</a></p>
+</form>
+</body></html>"""
 
 
-def get_unprinted_instructions(session: Session, instruction_type: InstructionType) -> list[Instruction]:
-    return (
-        session.query(Instruction)
-        .filter_by(type=instruction_type, printed_at=None)
-        .order_by(Instruction.conducted_at)
-        .all()
+def _login_error(msg: str, code: int = 401):
+    return HTMLResponse(
+        LOGIN_HEAD + f"""
+<div class="auth">
+<h1>Автоматизированная система учёта на производстве</h1>
+<p class="err">{msg}</p>
+<a class="btn" href="/login">← Назад</a>
+</div>
+</body></html>""",
+        status_code=code,
     )
 
 
-def get_last_journal_row_number(session: Session, instruction_type: InstructionType) -> int:
-    last = (
-        session.query(Instruction)
-        .filter_by(type=instruction_type)
-        .filter(Instruction.journal_row_number.isnot(None))
-        .order_by(Instruction.journal_row_number.desc())
-        .first()
-    )
-    return last.journal_row_number if last else 0
+@app.post("/login")
+def login_submit(request: Request, phone: str = Form(...), password: str = Form(...),
+                 db: Session = Depends(get_db)):
+    """Вход по телефону+паролю. Защита от подбора: 5 неудачных попыток -> блок на час.
+    Проверяем статус (APPROVED) и временную блокировку (locked_until) до проверки пароля."""
+    norm = _normalize_phone(phone)
+    user = db.scalars(select(User).where(User.phone == norm)).first()
 
+    # неизвестный телефон — общая ошибка (не раскрываем, есть ли такой пользователь)
+    if user is None:
+        log.warning("Вход: неизвестный телефон %s", norm)
+        return _login_error("Неверный телефон или пароль")
 
-def print_new_journal_entries(session: Session, instruction_type: InstructionType) -> list[Instruction]:
-    """"Допечатать новые записи" — присваивает номера строк последовательно, продолжая
-    с последнего уже выданного номера (отдельная нумерация на каждый InstructionType —
-    это разные физические журналы), помечает printed_at. Старые (уже напечатанные и
-    подшитые) записи не трогает и не перепечатывает — см. договорённость в чате."""
-    unprinted = get_unprinted_instructions(session, instruction_type)
-    if not unprinted:
-        return []
-    next_num = get_last_journal_row_number(session, instruction_type) + 1
     now = datetime.utcnow()
-    for instr in unprinted:
-        instr.journal_row_number = next_num
-        instr.printed_at = now
-        next_num += 1
-    session.commit()
-    return unprinted
+
+    # временная блокировка за подбор
+    if user.locked_until is not None and user.locked_until > now:
+        mins = int((user.locked_until - now).total_seconds() // 60) + 1
+        log.warning("Вход: телефон %s заблокирован ещё %s мин", norm, mins)
+        return _login_error(f"Слишком много попыток. Вход заблокирован на ~{mins} мин.")
+
+    # статус аккаунта
+    if user.status == UserStatus.PENDING:
+        return _login_error("Заявка ещё не одобрена администратором.")
+    if user.status == UserStatus.BLOCKED:
+        return _login_error("Доступ заблокирован администратором.")
+
+    # проверка пароля
+    if not _verify_password(password, user.password_hash):
+        user.failed_attempts = (user.failed_attempts or 0) + 1
+        if user.failed_attempts >= 5:
+            from datetime import timedelta
+            user.locked_until = now + timedelta(hours=1)
+            user.failed_attempts = 0
+            log.warning("Вход: телефон %s — 5 неудач, блок на час", norm)
+            db.commit()
+            return _login_error("Слишком много попыток. Вход заблокирован на 1 час.")
+        db.commit()
+        return _login_error("Неверный телефон или пароль")
+
+    # успех — сброс счётчика, установка сессии
+    user.failed_attempts = 0
+    user.locked_until = None
+    db.commit()
+    request.session["user_id"] = user.id
+    request.session["role"] = user.role.value if user.role else ""
+    return RedirectResponse("/", status_code=303)
 
 
-def get_sheet_count(session: Session, instruction_type: InstructionType) -> int:
-    """Сколько партий (= "листов") уже когда-либо напечатано для этого типа —
-    приближённо, по числу различных printed_at. [Предполагаю] это не полный
-    учёт физических листов бумаги, просто счётчик распечаток."""
-    rows = (
-        session.query(Instruction.printed_at)
-        .filter_by(type=instruction_type)
-        .filter(Instruction.printed_at.isnot(None))
-        .distinct()
-        .all()
+@app.get("/register", response_class=HTMLResponse)
+def register_form():
+    return LOGIN_HEAD + """
+<form class="auth" method="post" action="/register" autocomplete="on">
+<h1>Заявка на доступ</h1>
+<p class="subtitle">Заполните — администратор одобрит и назначит роль</p>
+<div class="auth-row">
+<input type="text" name="full_name" placeholder="ФИО" required>
+<input type="text" name="phone" placeholder="Телефон" autocomplete="username" required>
+<input type="password" name="password" placeholder="Пароль (8+, буквы, цифра, регистр)" autocomplete="new-password" required>
+<button type="submit">Подать заявку</button>
+</div>
+<p style="margin-top:14px;text-align:center"><a href="/login">← Уже есть доступ</a></p>
+</form>
+</body></html>"""
+
+
+@app.post("/register")
+def register_submit(request: Request, full_name: str = Form(...), phone: str = Form(...),
+                    password: str = Form(...), db: Session = Depends(get_db)):
+    """Открытая регистрация: создаёт пользователя со status=PENDING. Роль НЕ назначается
+    (её даст админ при одобрении). Проверка сложности пароля. Уведомление админу — в bot.py."""
+    norm = _normalize_phone(phone)
+    problems = _password_problems(password)
+    if problems:
+        return _login_error("Пароль слабый: " + ", ".join(problems) + ".")
+    if not norm or len(norm) < 10:
+        return _login_error("Неверный номер телефона.")
+    existing = db.scalars(select(User).where(User.phone == norm)).first()
+    if existing is not None:
+        return _login_error("Пользователь с таким телефоном уже существует.")
+    user = User(
+        phone=norm,
+        password_hash=_hash_password(password),
+        full_name=full_name.strip(),
+        status=UserStatus.PENDING,
     )
-    return len(rows)
-
-
-def create_instruction(
-    session: Session, employee_id: str, instruction_type: InstructionType,
-    conducted_by: str, topic: str | None = None, next_due_date: date | None = None,
-) -> Instruction:
-    instr = Instruction(
-        employee_id=employee_id,
-        type=instruction_type,
-        topic=topic,
-        conducted_by=conducted_by,
-        next_due_date=next_due_date,
-    )
-    session.add(instr)
-    session.commit()
-    return instr
-
-
-def confirm_instruction(session: Session, instruction_id: str) -> bool:
-    """Работник подтвердил, что ознакомлен (подпись)."""
-    instr = session.get(Instruction, instruction_id)
-    if instr is None:
-        return False
-    instr.employee_confirmed_at = datetime.utcnow()
-    session.add(instr)
-    session.commit()
-    return True
-
-
-def get_instructions_for_employee(session: Session, employee_id: str) -> list[Instruction]:
-    return (
-        session.query(Instruction)
-        .filter_by(employee_id=employee_id)
-        .order_by(Instruction.conducted_at.desc())
-        .all()
+    db.add(user)
+    db.commit()
+    log.info("Новая заявка на доступ: %s (%s)", full_name, norm)
+    # 2026-07: код для привязки MAX-аккаунта — см. auth_binding.generate_max_confirm_code
+    # и docstring поля pending_max_code в models.py.
+    from auth_binding import generate_max_confirm_code
+    confirm_code = generate_max_confirm_code(db, user)
+    # TODO(bot): уведомить админа в MAX о новой заявке (реализуется в bot.py)
+    return HTMLResponse(
+        LOGIN_HEAD + f"""
+<div class="auth">
+<h1>Заявка отправлена</h1>
+<p class="subtitle">Администратор одобрит доступ и назначит роль.</p>
+<div class="card" style="text-align:center">
+<p style="margin:0 0 8px">Чтобы пользоваться ботом в MAX без повторного ввода телефона —
+отправьте боту команду:</p>
+<p style="font-size:22px;font-weight:700;letter-spacing:2px;margin:8px 0">/confirm {confirm_code}</p>
+<p class="muted" style="margin:0">Код действует 30 минут. Можно пропустить этот шаг и
+позже выполнить /login с телефоном — тоже сработает.</p>
+</div>
+<a class="btn" href="/login">← К входу</a>
+</div>
+</body></html>""",
     )
 
 
-def _set_cell(cell, text: str, size: int = 8, bold: bool = False) -> None:
-    """Текст ячейки с уменьшенным шрифтом — чтобы длинные ФИО помещались в одну
-    строку при печати, не переносились на две-три (см. договорённость)."""
-    cell.text = ""
-    p = cell.paragraphs[0]
-    run = p.add_run(text)
-    run.font.size = Pt(size)
-    run.bold = bold
+LOGIN_BG_SVG = """<svg viewBox="0 0 430 760" preserveAspectRatio="xMidYMid slice" xmlns="http://www.w3.org/2000/svg">
+<g fill="none" stroke="#aab4c2" stroke-width="1">
+<path d="M-40 300 Q215 280 470 300"/><path d="M-40 360 Q215 340 470 360"/>
+<path d="M-40 420 Q215 400 470 420"/><path d="M-40 480 Q215 460 470 480"/>
+<path d="M-40 540 Q215 520 470 540"/><path d="M-40 600 Q215 580 470 600"/>
+<path d="M-40 660 Q215 640 470 660"/><path d="M-40 720 Q215 700 470 720"/>
+<path d="M60 760 Q120 500 175 250"/><path d="M150 760 Q180 500 205 250"/>
+<path d="M240 760 Q235 500 235 250"/><path d="M330 760 Q290 500 265 250"/>
+<path d="M420 760 Q350 500 295 250"/></g>
+<g stroke="#8f9aa8" stroke-width="1"><path d="M231 300 L239 300 M231 360 L239 360 M231 420 L239 420 M231 480 L239 480 M231 600 L239 600 M231 660 L239 660 M231 720 L239 720"/></g>
+<g fill="none" stroke="#9ba6b3" stroke-width="1">
+<path d="M120 760 C150 660 120 600 175 545 C215 505 205 460 250 430"/>
+<path d="M170 560 l-6 -4 M158 588 l-6 -4 M150 618 l-6 -4 M146 650 l-6 -4"/></g>
+<g stroke="#8f9aa8" fill="none" stroke-width="1"><path d="M392 300 L392 330 M392 300 L387 309 M392 300 L397 309"/></g>
+<text x="388" y="292" font-family="-apple-system,system-ui,sans-serif" font-size="10" fill="#7f8a98">С</text>
+<g stroke="#2f80ed" fill="none" stroke-width="1.4"><circle cx="235" cy="540" r="7"/><path d="M235 522 L235 558 M217 540 L253 540"/></g>
+<circle cx="235" cy="540" r="2.4" fill="#2f80ed"/>
+<text x="248" y="536" font-family="-apple-system,system-ui,sans-serif" font-size="11" fill="#68737f">Белокаменка</text>
+<text x="248" y="551" font-family="-apple-system,system-ui,sans-serif" font-size="10" fill="#828d9a">69°14′ N · 33°17′ E</text>
+</svg>"""
 
 
-def get_journal_started_at(session: Session, instruction_type: InstructionType) -> date | None:
-    """Дата самой ранней записи в журнале этого типа — для графы "Начат" на обложке.
-    Не дата печати текущей партии, а дата первой КОГДА-ЛИБО занесённой записи."""
-    first = (
-        session.query(Instruction)
-        .filter_by(type=instruction_type)
-        .order_by(Instruction.conducted_at)
-        .first()
-    )
-    return first.conducted_at.date() if first else None
+@app.get("/login-bg.svg")
+def login_bg():
+    return Response(content=LOGIN_BG_SVG, media_type="image/svg+xml",
+                    headers={"Cache-Control": "public, max-age=86400"})
 
 
-def _set_a4(doc) -> None:
-    """Явный формат A4 — python-docx по умолчанию создаёт Letter (US), не A4,
-    для русских документов это неверно (см. замечание после первой распечатки)."""
-    section = doc.sections[0]
-    section.page_width = Mm(210)
-    section.page_height = Mm(297)
+@app.get("/admin/users", response_class=HTMLResponse)
+def admin_users(request: Request, db: Session = Depends(get_db)):
+    """Управление пользователями. Только ADMIN. Список: заявки (PENDING) сверху с кнопками
+    одобрения и выбором роли; активные и заблокированные ниже с действиями."""
+    user = _current_user(request, db)
+    if user is None:
+        return RedirectResponse("/login", status_code=303)
+    if user.role != UserRole.ADMIN:
+        raise HTTPException(403, "Доступ только для администратора")
 
+    users = db.scalars(select(User).order_by(User.created_at.desc())).all()
+    now = datetime.utcnow()
 
-def generate_instruction_journal_docx(
-    instructions: list[Instruction], instruction_type: InstructionType,
-    org_name: str, order_ref: str, journal_number: int = 1,
-    started_at: date | None = None, sheet_number: int = 1, total_sheets: int = 1,
-    output_dir: str = "/tmp",
-) -> str:
-    """
-    УСТАРЕЛО (2026-07): журнал переведён на Excel — см.
-    generate_instruction_journal_xlsx ниже, роут /production/instructions/print
-    в webforms.py теперь вызывает xlsx-версию. Эта docx-функция ОСТАВЛЕНА
-    НАМЕРЕННО как быстрый откат: если xlsx на реальном принтере ляжет криво,
-    достаточно вернуть вызов *_docx в одном роуте, не переписывая ничего с нуля.
-    УДАЛИТЬ, когда xlsx-версия подтверждена на живой печати.
-    ------------------------------------------------------------------------
-    Печать партии журнала инструктажей. 2026-07 (третий заход) — переписано
-    под официальный скелет таблицы, который прислал пользователь ("Журнал
-    регистрации вводного инструктажа"), а не по собственной реконструкции
-    ГОСТ 12.0.004-2015. Отличия от предыдущей версии:
-    - Обложка — не текстом, а таблицей: Начат/Окончен/Количество листов/Лист.
-    - НЕТ столбца "№" — в присланном скелете его нет вообще (номер строки
-      всё равно хранится в БД для сквозной нумерации, просто не печатается
-      отдельной графой, раз в образце так).
-    - Порядок подписей: СНАЧАЛА инструктирующего, ПОТОМ инструктируемого
-      (было наоборот).
-    - "Дата рождения" — полная дата, не только год (в Employee есть полная
-      дата, раньше зря обрезал до года).
-    - Двухуровневая шапка с объединёнными ячейками ("Сведения об
-      инструктируемом" на 3 подстолбца, "Подпись" на 2 подстолбца) — как в
-      присланном образце.
-
-    sheet_number/total_sheets — для графы "Лист"/"Количество листов" на
-    обложке. [Предполагаю] total_sheets = сколько партий уже напечатано
-    включая эту — простое приближение, не полноценный учёт физических
-    листов бумаги (это была бы отдельная задача подсчёта).
-    """
-    doc = Document()
-    _set_a4(doc)
-
-    title = doc.add_paragraph()
-    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    label = INSTRUCTION_LABELS.get(instruction_type, instruction_type.value)
-    run = title.add_run(f"ЖУРНАЛ РЕГИСТРАЦИИ ИНСТРУКТАЖА ({label.upper()})")
-    run.bold = True
-    run.font.size = Pt(14)
-
-    doc.add_paragraph(f"Организация: {org_name}          Журнал № {journal_number}")
-
-    # Обложка: Начат | значение | Окончен | значение | Количество листов | значение | Лист | значение
-    started_str = started_at.strftime("%d.%m.%Y") if started_at else "—"
-    cover = doc.add_table(rows=1, cols=8)
-    cover.style = "Table Grid"
-    cover_cells = cover.rows[0].cells
-    cover_values = [
-        ("Начат", started_str), ("Окончен", "—"),
-        ("Количество листов", str(total_sheets)), ("Лист", str(sheet_number)),
-    ]
-    for i, (lbl, val) in enumerate(cover_values):
-        _set_cell(cover_cells[i * 2], lbl, size=8, bold=True)
-        _set_cell(cover_cells[i * 2 + 1], val, size=8)
-
-    doc.add_paragraph()
-
-    # Основная таблица — двухуровневая шапка с объединением ячеек, 10 столбцов:
-    # 0 № сквозной | 1 № на листе | 2 Дата проведения |
-    # 3-5 Сведения об инструктируемом (ФИО/дата рожд./профессия) |
-    # 6 Подразделение | 7 ФИО+должность инструктирующего | 8-9 Подпись (инстр./инстр-емого)
-    table = doc.add_table(rows=2, cols=10)
-    table.style = "Table Grid"
-    table.autofit = False
-    r1 = table.rows[0].cells
-    r2 = table.rows[1].cells
-
-    # Вертикальное объединение (2 строки шапки в одну ячейку) для столбцов без подстолбцов.
-    for col in (0, 1, 2, 6, 7):
-        r1[col].merge(r2[col])
-    _set_cell(r1[0], "№ сквозной", size=7, bold=True)
-    _set_cell(r1[1], "№ на листе", size=7, bold=True)
-    _set_cell(r1[2], "Дата проведения", size=7, bold=True)
-    _set_cell(r1[6], "Наименование структурного подразделения, в которое направлен инструктируемый",
-              size=7, bold=True)
-    _set_cell(r1[7], "Фамилия, имя, отчество, должность инструктирующего", size=7, bold=True)
-
-    # Горизонтальное объединение верхней строки для "Сведения об инструктируемом" (3-5)
-    # и "Подпись" (8-9), с подписанными подстолбцами во второй строке.
-    r1[3].merge(r1[4]).merge(r1[5])
-    _set_cell(r1[3], "Сведения об инструктируемом", size=7, bold=True)
-    _set_cell(r2[3], "Фамилия, имя, отчество", size=7, bold=True)
-    _set_cell(r2[4], "Дата рождения", size=7, bold=True)
-    _set_cell(r2[5], "Профессия, должность", size=7, bold=True)
-
-    r1[8].merge(r1[9])
-    _set_cell(r1[8], "Подпись", size=7, bold=True)
-    _set_cell(r2[8], "Инструктирующего", size=7, bold=True)
-    _set_cell(r2[9], "Инструктируемого", size=7, bold=True)
-
-    # Номер на листе — позиция внутри ТЕКУЩЕЙ партии (1..JOURNAL_ROWS_PER_PAGE),
-    # не сквозной. Корректно, только если предыдущая партия допечатана прочерками
-    # ровно до конца страницы (см. довесок ниже) — тогда каждая новая партия
-    # гарантированно начинается с начала листа, позиция внутри нее = позиция на листе.
-    for i, instr in enumerate(instructions):
-        row = table.add_row().cells
-        emp = instr.employee
-        birth_str = emp.birth_date.strftime("%d.%m.%Y") if emp and emp.birth_date else ""
-        sheet_pos = (i % JOURNAL_ROWS_PER_PAGE) + 1
-        _set_cell(row[0], str(instr.journal_row_number))
-        _set_cell(row[1], str(sheet_pos))
-        _set_cell(row[2], instr.conducted_at.strftime("%d.%m.%Y"))
-        _set_cell(row[3], emp.full_name if emp else "?")
-        _set_cell(row[4], birth_str)
-        _set_cell(row[5], (emp.position or "") if emp else "")  # из карточки, если заполнено
-        _set_cell(row[6], (emp.subdivision or "") if emp else "")  # из карточки, если заполнено
-        _set_cell(row[7], instr.conducted_by)
-        _set_cell(row[8], "")  # подпись инструктирующего — от руки на распечатке
-        _set_cell(row[9], "")  # подпись инструктируемого — от руки на распечатке
-
-    # Довесок прочерками до конца страницы — визуальный, не данные (не создаёт
-    # записей Instruction, следующая допечатка продолжит нумерацию с реального
-    # следующего номера, не с номера довеска).
-    remainder = len(instructions) % JOURNAL_ROWS_PER_PAGE
-    if remainder != 0:
-        pad_rows = JOURNAL_ROWS_PER_PAGE - remainder
-        for _ in range(pad_rows):
-            row = table.add_row().cells
-            for cell in row:
-                _set_cell(cell, "—")
-
-    footer = doc.add_paragraph()
-    footer_run = footer.add_run(
-        f"Журнал ведётся по рекомендуемой форме ГОСТ 12.0.004-2015. Порядок регистрации "
-        f"определён работодателем самостоятельно (п. 88 Правил №2464 от 24.12.2021; "
-        f"разъяснение Роструда №15-2/В-1677 от 30.05.2022) — {order_ref}. "
-        f"Незаполненные строки погашены прочерком. Подписи — собственноручные. "
-        f"Сроки по закону: вводный — в день начала работы; первичный на рабочем месте — до "
-        f"допуска к самостоятельной работе; повторный — не реже 1 раза в 6–12 мес.; "
-        f"внеплановый/целевой — по факту события."
-    )
-    footer_run.font.size = Pt(7)
-    footer_run.italic = True
-
-    path = f"{output_dir}/journal_{instruction_type.value}_{datetime.utcnow():%Y%m%d%H%M%S}.docx"
-    doc.save(path)
-    return path
-
-
-# Границы/шрифт/выравнивание журнала — вынесены в модульные константы, чтобы
-# не пересоздавать объекты openpyxl на каждую ячейку (Border/Font неизменяемы,
-# один экземпляр можно назначать множеству ячеек).
-_XL_THIN = Side(style="thin", color="000000")
-_XL_BORDER = Border(left=_XL_THIN, right=_XL_THIN, top=_XL_THIN, bottom=_XL_THIN)
-_XL_FONT = Font(name="Times New Roman", size=9)
-_XL_FONT_BOLD = Font(name="Times New Roman", size=9, bold=True)
-_XL_FONT_SMALL = Font(name="Times New Roman", size=8)
-_XL_CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
-_XL_LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True)
-
-
-def _xl_cell(ws, row: int, col: int, value, *, bold: bool = False,
-             small: bool = False, left: bool = False, border: bool = True):
-    """Записать значение в ячейку с единым стилем журнала. Возвращает ячейку,
-    чтобы вызывающий код мог при желании доопределить (например, снять границу).
-
-    ВНИМАНИЕ: не вызывать для НЕ-левых-верхних ячеек объединённого диапазона —
-    у openpyxl они становятся MergedCell с read-only .value. Для обрамления
-    таких ячеек использовать _xl_border_range после merge_cells."""
-    cell = ws.cell(row=row, column=col, value=value)
-    cell.font = _XL_FONT_BOLD if bold else (_XL_FONT_SMALL if small else _XL_FONT)
-    cell.alignment = _XL_LEFT if left else _XL_CENTER
-    if border:
-        cell.border = _XL_BORDER
-    return cell
-
-
-def _xl_border_range(ws, r1: int, c1: int, r2: int, c2: int) -> None:
-    """Проставить границу _XL_BORDER на КАЖДУЮ ячейку прямоугольника r1..r2 × c1..c2,
-    включая MergedCell (им нельзя писать .value, но .border — можно). Нужно, чтобы
-    объединённые ячейки шапки печатались обрамлёнными по всем внутренним линиям."""
-    for r in range(r1, r2 + 1):
-        for c in range(c1, c2 + 1):
-            ws.cell(row=r, column=c).border = _XL_BORDER
-
-
-def generate_instruction_journal_xlsx(
-    instructions: list[Instruction], instruction_type: InstructionType,
-    org_name: str, order_ref: str, journal_number: int = 1,
-    started_at: date | None = None, sheet_number: int = 1, total_sheets: int = 1,
-    output_dir: str = "/tmp",
-) -> str:
-    """
-    Excel-версия печати журнала инструктажей (2026-07, замена docx). Тот же
-    официальный скелет таблицы 1:1, что и в generate_instruction_journal_docx:
-    те же 10 столбцов, двухуровневая шапка с объединением ячеек, обложка
-    Начат/Окончен/Кол-во листов/Лист, профессия/подразделение из карточки.
-
-    Отличия от docx — осознанные, продиктованы природой Excel (обсуждено с
-    заказчиком):
-    - НЕТ довеска пустыми строками "до конца страницы". В Excel разбивку на
-      печатные листы делает драйвер принтера, а не код, поэтому "погасить лист
-      прочерками до низа" технически невозможно и не нужно: каждая партия
-      печатается заново целым файлом из БД (print_new_journal_entries), а не
-      дописывается ручкой в старую распечатку. Журнал заканчивается на последней
-      реальной записи.
-    - Под таблицей — итоговая строка "Внесено записей: N (строки M–K)", где N —
-      сколько записей в ЭТОМ файле (эта партия печати), M–K — диапазон их
-      сквозных номеров. Снимает путаницу при подшивке партий в одну книгу.
-    - Печать: альбомная A4, повтор двухуровневой шапки таблицы на КАЖДОМ листе
-      (print_title_rows), запрет разрыва строки между листами по высоте (каждый
-      работник целиком на одном листе), вписывание по ширине (10 колонок не
-      уезжают за правый край).
-
-    sheet_number/total_sheets — для граф "Лист"/"Количество листов" обложки,
-    та же семантика-приближение, что в docx-версии.
-    """
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Журнал"
-
-    # --- Печать: альбомная A4, впис по ширине, поля ---
-    ws.page_setup.orientation = "landscape"
-    ws.page_setup.paperSize = 9  # A4
-    ws.page_setup.fitToWidth = 1
-    ws.page_setup.fitToHeight = 0  # по высоте — сколько листов нужно, не сжимать
-    ws.sheet_properties.pageSetUpPr.fitToPage = True
-
-    NCOLS = 10  # столбцы A..J
-
-    label = INSTRUCTION_LABELS.get(instruction_type, instruction_type.value)
-
-    # --- Строка 1: заголовок журнала (объединён на всю ширину) ---
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=NCOLS)
-    c = ws.cell(row=1, column=1, value=f"ЖУРНАЛ РЕГИСТРАЦИИ ИНСТРУКТАЖА ({label.upper()})")
-    c.font = Font(name="Times New Roman", size=14, bold=True)
-    c.alignment = Alignment(horizontal="center", vertical="center")
-
-    # --- Строка 2: организация + номер журнала ---
-    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=NCOLS)
-    c = ws.cell(row=2, column=1, value=f"Организация: {org_name}          Журнал № {journal_number}")
-    c.font = _XL_FONT
-    c.alignment = Alignment(horizontal="left", vertical="center")
-
-    # --- Строка 3: обложка Начат|Окончен|Кол-во листов|Лист (8 ячеек: label/value ×4) ---
-    started_str = started_at.strftime("%d.%m.%Y") if started_at else "—"
-    cover = [
-        ("Начат", started_str), ("Окончен", "—"),
-        ("Количество листов", str(total_sheets)), ("Лист", str(sheet_number)),
-    ]
-    col = 1
-    for lbl, val in cover:
-        _xl_cell(ws, 3, col, lbl, bold=True, small=True)
-        _xl_cell(ws, 3, col + 1, val, small=True)
-        col += 2
-    # столбцы 9,10 в строке обложки оставляем пустыми, но с границей — ровный низ
-    _xl_cell(ws, 3, 9, "", small=True)
-    _xl_cell(ws, 3, 10, "", small=True)
-
-    # --- Строки 4–5: двухуровневая шапка таблицы ---
-    HDR1, HDR2 = 4, 5
-    # Вертикальное объединение (шапка на 2 строки) для одиночных столбцов:
-    # 1 № сквозной | 2 № на листе | 3 Дата проведения | 7 Подразделение | 8 Инструктирующий
-    single = {
-        1: "№ сквозной",
-        2: "№ на листе",
-        3: "Дата проведения",
-        7: "Наименование структурного подразделения, в которое направлен инструктируемый",
-        8: "Фамилия, имя, отчество, должность инструктирующего",
-    }
-    for col_idx, text in single.items():
-        ws.merge_cells(start_row=HDR1, start_column=col_idx, end_row=HDR2, end_column=col_idx)
-        _xl_cell(ws, HDR1, col_idx, text, bold=True, small=True)
-        _xl_border_range(ws, HDR1, col_idx, HDR2, col_idx)  # обрамить обе строки объединения
-
-    # "Сведения об инструктируемом" — горизонтальное объединение колонок 4–6 в верхней строке,
-    # подстолбцы во второй.
-    ws.merge_cells(start_row=HDR1, start_column=4, end_row=HDR1, end_column=6)
-    _xl_cell(ws, HDR1, 4, "Сведения об инструктируемом", bold=True, small=True)
-    _xl_border_range(ws, HDR1, 4, HDR1, 6)  # обрамить всю верхнюю объединённую ячейку
-    _xl_cell(ws, HDR2, 4, "Фамилия, имя, отчество", bold=True, small=True)
-    _xl_cell(ws, HDR2, 5, "Дата рождения", bold=True, small=True)
-    _xl_cell(ws, HDR2, 6, "Профессия, должность", bold=True, small=True)
-
-    # "Подпись" — объединение колонок 9–10 в верхней строке, подстолбцы во второй.
-    ws.merge_cells(start_row=HDR1, start_column=9, end_row=HDR1, end_column=10)
-    _xl_cell(ws, HDR1, 9, "Подпись", bold=True, small=True)
-    _xl_border_range(ws, HDR1, 9, HDR1, 10)  # обрамить всю верхнюю объединённую ячейку
-    _xl_cell(ws, HDR2, 9, "Инструктирующего", bold=True, small=True)
-    _xl_cell(ws, HDR2, 10, "Инструктируемого", bold=True, small=True)
-
-    # Повтор шапки (строки 4–5) на каждом печатном листе.
-    ws.print_title_rows = f"{HDR1}:{HDR2}"
-
-    # --- Строки данных ---
-    # № на листе — позиция внутри текущей партии (1..JOURNAL_ROWS_PER_PAGE),
-    # та же семантика, что в docx-версии (см. комментарий там).
-    row_ptr = HDR2 + 1
-    for i, instr in enumerate(instructions):
-        emp = instr.employee
-        birth_str = emp.birth_date.strftime("%d.%m.%Y") if emp and emp.birth_date else ""
-        sheet_pos = (i % JOURNAL_ROWS_PER_PAGE) + 1
-        _xl_cell(ws, row_ptr, 1, str(instr.journal_row_number))
-        _xl_cell(ws, row_ptr, 2, str(sheet_pos))
-        _xl_cell(ws, row_ptr, 3, instr.conducted_at.strftime("%d.%m.%Y"))
-        _xl_cell(ws, row_ptr, 4, emp.full_name if emp else "?", left=True)
-        _xl_cell(ws, row_ptr, 5, birth_str)
-        _xl_cell(ws, row_ptr, 6, (emp.position or "") if emp else "", left=True)
-        _xl_cell(ws, row_ptr, 7, (emp.subdivision or "") if emp else "", left=True)
-        _xl_cell(ws, row_ptr, 8, instr.conducted_by, left=True)
-        _xl_cell(ws, row_ptr, 9, "")   # подпись инструктирующего — от руки
-        _xl_cell(ws, row_ptr, 10, "")  # подпись инструктируемого — от руки
-        row_ptr += 1
-
-    # --- Итоговая строка под таблицей: сколько внесено + диапазон сквозных номеров ---
-    # Ноль довеска пустыми строками (вариант заказчика): журнал кончается на
-    # последней реальной записи, сразу под ней — итог и футер.
-    if instructions:
-        nums = [instr.journal_row_number for instr in instructions
-                if instr.journal_row_number is not None]
-        if nums:
-            summary = f"Внесено записей: {len(instructions)} (строки {min(nums)}–{max(nums)})"
+    def _row(u):
+        locked = u.locked_until is not None and u.locked_until > now
+        role_ru = {"prorab": "прораб", "kadrovik": "кадровик", "admin": "админ"}.get(
+            u.role.value if u.role else "", "—")
+        parts = [f'<b>{u.full_name}</b> · {u.phone} · роль: {role_ru}']
+        if u.status == UserStatus.PENDING:
+            parts.append(
+                f'<form method="post" action="/admin/users/{u.id}/approve" style="margin:6px 0">'
+                '<select name="role" required>'
+                '<option value="">— назначить роль —</option>'
+                '<option value="prorab">Прораб (только чтение и скачивание)</option>'
+                '<option value="kadrovik">Кадровик (всё по работникам)</option>'
+                '<option value="admin">Админ</option>'
+                '</select> '
+                '<button type="submit">Одобрить</button></form>'
+            )
         else:
-            summary = f"Внесено записей: {len(instructions)}"
+            if u.status == UserStatus.BLOCKED:
+                parts.append('<span class="badge red">заблокирован</span> ')
+                parts.append(
+                    f'<form method="post" action="/admin/users/{u.id}/unblock" style="display:inline">'
+                    '<button type="submit">Разблокировать</button></form>')
+            else:
+                parts.append('<span class="badge green">активен</span> ')
+                if u.id != user.id:  # себя не блокируем
+                    parts.append(
+                        f'<form method="post" action="/admin/users/{u.id}/block" style="display:inline">'
+                        '<button type="submit" class="secondary">Заблокировать</button></form>')
+            if locked:
+                mins = int((u.locked_until - now).total_seconds() // 60) + 1
+                parts.append(
+                    f' <span class="badge orange">замок за попытки ~{mins} мин</span>'
+                    f'<form method="post" action="/admin/users/{u.id}/unlock" style="display:inline">'
+                    '<button type="submit">Снять замок</button></form>')
+        return '<fieldset><legend>' + ("заявка" if u.status == UserStatus.PENDING else "пользователь") + '</legend>' + "".join(parts) + '</fieldset>'
+
+    pending = [u for u in users if u.status == UserStatus.PENDING]
+    others = [u for u in users if u.status != UserStatus.PENDING]
+    body = "<h1>Пользователи</h1>"
+    if pending:
+        body += "<h2>Заявки на доступ</h2>" + "".join(_row(u) for u in pending)
     else:
-        summary = "Внесено записей: 0"
-    ws.merge_cells(start_row=row_ptr, start_column=1, end_row=row_ptr, end_column=NCOLS)
-    c = ws.cell(row=row_ptr, column=1, value=summary)
-    c.font = _XL_FONT_BOLD
-    c.alignment = Alignment(horizontal="left", vertical="center")
-    row_ptr += 1
-
-    # Пустая разделительная строка
-    row_ptr += 1
-
-    # --- Футер: ГОСТ / приказ / сроки по закону (объединён на всю ширину) ---
-    footer_text = (
-        f"Журнал ведётся по рекомендуемой форме ГОСТ 12.0.004-2015. Порядок регистрации "
-        f"определён работодателем самостоятельно (п. 88 Правил №2464 от 24.12.2021; "
-        f"разъяснение Роструда №15-2/В-1677 от 30.05.2022). Порядок и периодичность "
-        f"инструктажей установлены {order_ref}. Подписи — собственноручные."
-    )
-    ws.merge_cells(start_row=row_ptr, start_column=1, end_row=row_ptr, end_column=NCOLS)
-    c = ws.cell(row=row_ptr, column=1, value=footer_text)
-    c.font = Font(name="Times New Roman", size=8, italic=True)
-    c.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
-
-    # --- Ширины столбцов (символы). ФИО/подразделение/инструктирующий — шире. ---
-    widths = {
-        "A": 8,   # № сквозной
-        "B": 7,   # № на листе
-        "C": 12,  # дата
-        "D": 30,  # ФИО инструктируемого
-        "E": 12,  # дата рождения
-        "F": 20,  # профессия/должность
-        "G": 22,  # подразделение
-        "H": 22,  # инструктирующий
-        "I": 14,  # подпись инструктирующего
-        "J": 14,  # подпись инструктируемого
-    }
-    for col_letter, w in widths.items():
-        ws.column_dimensions[col_letter].width = w
-
-    # Запрет разрыва строки данных между печатными листами: openpyxl/Excel не рвёт
-    # содержимое строки, разрыв ложится ТОЛЬКО по границе строк. Дополнительно
-    # задаём разумную высоту строкам данных, чтобы длинные подразделения переносились
-    # внутри ячейки, а не растягивали лист непредсказуемо.
-    for r in range(HDR2 + 1, HDR2 + 1 + len(instructions)):
-        ws.row_dimensions[r].height = 22
-    # Явная высота строк шапки — иначе при повторе print_title_rows на 2-м/3-м
-    # листе объединённые заголовки ("Сведения об инструктируемом", "Подпись",
-    # длинные подписи столбцов) сжимаются и читаются хуже, чем на 1-м листе.
-    ws.row_dimensions[HDR1].height = 30
-    ws.row_dimensions[HDR2].height = 42
-
-    path = f"{output_dir}/journal_{instruction_type.value}_{datetime.utcnow():%Y%m%d%H%M%S}.xlsx"
-    wb.save(path)
-    return path
+        body += '<p class="muted">Новых заявок нет.</p>'
+    body += "<h2>Все пользователи</h2>" + "".join(_row(u) for u in others)
+    return _render("Пользователи", body, active="admin", role="admin")
 
 
-# ВРЕМЕННО (тест, 2026-07): очистка всех записей инструктажей, чтобы можно было
-# заново проверить автозаполнение/допечатку с чистого листа. УДАЛИТЬ эту функцию
-# и кнопку в webforms.py, когда тестирование закончится — см. пометку там же.
-def test_clear_all_instructions(session: Session) -> int:
-    count = session.query(Instruction).count()
-    session.query(Instruction).delete()
-    session.commit()
-    return count
+@app.post("/admin/users/{user_id}/approve")
+def admin_approve(user_id: str, request: Request, role: str = Form(...),
+                  db: Session = Depends(get_db)):
+    admin = _current_user(request, db)
+    if admin is None or admin.role != UserRole.ADMIN:
+        raise HTTPException(403, "Только администратор")
+    u = db.get(User, user_id)
+    if u is None:
+        raise HTTPException(404, "Пользователь не найден")
+    if role not in ("prorab", "kadrovik", "admin"):
+        raise HTTPException(400, "Неверная роль")
+    u.role = UserRole(role)
+    u.status = UserStatus.APPROVED
+    u.approved_at = datetime.utcnow()
+    db.commit()
+    return RedirectResponse("/admin/users", status_code=303)
 
 
-def get_due_instructions(session: Session, days_before: int = 7) -> list[dict]:
-    """Повторные инструктажи, у которых next_due_date приближается или уже
-    прошёл — для напоминания, по аналогии с get_rotation_reminders в tabel.py."""
-    today = date.today()
-    rows = (
-        session.query(Instruction)
-        .filter(Instruction.next_due_date.isnot(None))
-        .all()
-    )
-    result = []
-    for instr in rows:
-        delta = (instr.next_due_date - today).days
-        if delta <= days_before:
-            emp = session.get(Employee, instr.employee_id)
-            if emp is not None:
-                result.append({
-                    "employee_id": emp.id, "name": emp.full_name,
-                    "due_date": instr.next_due_date, "overdue": delta < 0,
-                    "instruction_id": instr.id,
-                })
-    return result
+@app.post("/admin/users/{user_id}/block")
+def admin_block(user_id: str, request: Request, db: Session = Depends(get_db)):
+    admin = _current_user(request, db)
+    if admin is None or admin.role != UserRole.ADMIN:
+        raise HTTPException(403, "Только администратор")
+    u = db.get(User, user_id)
+    if u is None:
+        raise HTTPException(404, "Пользователь не найден")
+    if u.id == admin.id:
+        raise HTTPException(400, "Нельзя заблокировать себя")
+    u.status = UserStatus.BLOCKED
+    db.commit()
+    return RedirectResponse("/admin/users", status_code=303)
 
 
-# ================= Удостоверения (корочки) =================
-
-def create_certificate(
-    session: Session, employee_id: str, profession: str,
-    issued_by_org: str | None = None, issue_date: date | None = None,
-    expiry_date: date | None = None, scan_key: str | None = None,
-) -> Certificate:
-    cert = Certificate(
-        employee_id=employee_id,
-        profession=profession,
-        issued_by_org=issued_by_org,
-        issue_date=issue_date,
-        expiry_date=expiry_date,
-        scan_key=scan_key,
-    )
-    session.add(cert)
-    session.commit()
-    return cert
+@app.post("/admin/users/{user_id}/unblock")
+def admin_unblock(user_id: str, request: Request, db: Session = Depends(get_db)):
+    admin = _current_user(request, db)
+    if admin is None or admin.role != UserRole.ADMIN:
+        raise HTTPException(403, "Только администратор")
+    u = db.get(User, user_id)
+    if u is None:
+        raise HTTPException(404, "Пользователь не найден")
+    u.status = UserStatus.APPROVED
+    u.failed_attempts = 0
+    u.locked_until = None
+    db.commit()
+    return RedirectResponse("/admin/users", status_code=303)
 
 
-def set_certificate_scan_key(session: Session, certificate_id: str, scan_key: str) -> None:
-    cert = session.get(Certificate, certificate_id)
-    if cert is not None:
-        cert.scan_key = scan_key
-        session.add(cert)
-        session.commit()
+@app.post("/admin/users/{user_id}/unlock")
+def admin_unlock(user_id: str, request: Request, db: Session = Depends(get_db)):
+    """Снять временный замок за попытки подбора (не меняя статус)."""
+    admin = _current_user(request, db)
+    if admin is None or admin.role != UserRole.ADMIN:
+        raise HTTPException(403, "Только администратор")
+    u = db.get(User, user_id)
+    if u is None:
+        raise HTTPException(404, "Пользователь не найден")
+    u.failed_attempts = 0
+    u.locked_until = None
+    db.commit()
+    return RedirectResponse("/admin/users", status_code=303)
 
 
-def get_certificates_for_employee(session: Session, employee_id: str) -> list[Certificate]:
-    return (
-        session.query(Certificate)
-        .filter_by(employee_id=employee_id)
-        .order_by(Certificate.expiry_date.is_(None), Certificate.expiry_date)
-        .all()
-    )
+@app.get("/logout")
+def logout(request: Request):
+    request.session.clear()
+    return RedirectResponse("/login", status_code=303)
 
 
-def certificate_status(cert: Certificate, today: date | None = None) -> str:
-    """'active' | 'expiring_soon' | 'expired' | 'no_expiry' — для бейджей в UI."""
-    if cert.expiry_date is None:
-        return "no_expiry"
-    today = today or date.today()
-    delta = (cert.expiry_date - today).days
-    if delta < 0:
-        return "expired"
-    if delta <= CERTIFICATE_EXPIRY_WARNING_DAYS:
-        return "expiring_soon"
-    return "active"
+# --- Рабочий стол ------------------------------------------------------------
 
+@app.get("/", response_class=HTMLResponse)
+def dashboard(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _current_user_obj = _current_user(request, db)
 
-def get_expiring_certificates(session: Session, days_before: int = CERTIFICATE_EXPIRY_WARNING_DAYS) -> list[dict]:
-    """Удостоверения, срок которых истекает в пределах days_before дней (включая
-    уже просроченные) — для напоминаний, та же схема, что и get_due_instructions."""
-    today = date.today()
-    rows = (
-        session.query(Certificate)
-        .filter(Certificate.expiry_date.isnot(None))
-        .all()
-    )
-    result = []
-    for cert in rows:
-        delta = (cert.expiry_date - today).days
-        if delta <= days_before:
-            emp = session.get(Employee, cert.employee_id)
-            if emp is not None:
-                result.append({
-                    "employee_id": emp.id, "name": emp.full_name,
-                    "profession": cert.profession, "expiry_date": cert.expiry_date,
-                    "overdue": delta < 0, "certificate_id": cert.id,
-                })
-    result.sort(key=lambda r: r["expiry_date"])
-    return result
+    today = datetime.now(MSK).date()  # МСК, не UTC — иначе граница "сегодня" съезжает у полуночи
 
+    # Все активные несделанные обязательства; раскладываем по статусу в Python, потому что
+    # порог "скоро" теперь per-type (deadlines.lead_days_for), а не плоские 7 дней —
+    # одним SQL-диапазоном его не выразить.
+    _pending = db.scalars(
+        select(Obligation)
+        .where(Obligation.is_current == True)  # noqa: E712 — SQLAlchemy требует именно так, не `is True`
+        .where(Obligation.status == ObligationStatus.PENDING)
+        .order_by(Obligation.deadline_date)
+    ).all()
+    overdue = [o for o in _pending if _obligation_status(o, today)[2] == "overdue"]
+    due_soon = [o for o in _pending if _obligation_status(o, today)[2] == "soon"]
 
-# ================= Печатный бланк наряда-допуска =================
-# Печатный (не рукописный) наряд-допуск разрешён действующими Правилами по ОТ —
-# "документ можно составлять на компьютере или от руки" (проверено, см. журнал
-# патчей/обсуждение). Единственное, что должно остаться "живым" — подписи на
-# распечатанном экземпляре, сам текст печатать можно.
-#
-# [Предполагаю] Это ОБЩИЙ бланк, не учитывает разницу форм по видам работ
-# (электроустановки — приложение №7 к Приказу №903н, высотные — приложение №2
-# и т.д. — формы РАЗНЫЕ и менять их содержание нельзя). Пока WorkOrder не имеет
-# поля work_type, бланк один на все случаи — годится для общих/ремонтных работ,
-# где унифицированной формы законом не установлено. Для регламентированных видов
-# (электро-, высотные, огневые) нужен отдельный шаблон под конкретное приложение
-# правил — это следующий шаг, не делать вид, что текущий бланк их закрывает.
-
-def generate_work_order_docx(work_order: WorkOrder, members: list[WorkOrderMember],
-                              org_name: str, output_dir: str = "/tmp") -> str:
-    """
-    2026-07: переписано по образцу реального бланка ООО «Промстроймонтаж»
-    (наряд №25 на работы на высоте, фото прислал пользователь) — см. подробный
-    docstring WorkOrder в models.py про структурные поправки. Разделы идут в
-    том же порядке, что и в реальном бланке, для узнаваемости.
-    """
-    doc = Document()
-    _set_a4(doc)
-
-    title = doc.add_paragraph()
-    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = title.add_run(f"НАРЯД-ДОПУСК № {work_order.number}")
-    run.bold = True
-    run.font.size = Pt(16)
-
-    sub = doc.add_paragraph()
-    sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    sub.add_run("на производство работ повышенной опасности").italic = True
-
-    doc.add_paragraph(f"Организация: {org_name}")
-    if work_order.subdivision:
-        doc.add_paragraph(f"Подразделение: {work_order.subdivision}")
-    doc.add_paragraph(f"Выдан: «{work_order.created_at.strftime('%d')}» "
-                       f"{work_order.created_at.strftime('%m.%Y')} г.")
-    doc.add_paragraph(
-        f"Действителен до: «{work_order.valid_to.strftime('%d')}» "
-        f"{work_order.valid_to.strftime('%m.%Y')} г."
-    )
-    doc.add_paragraph(
-        f"Ответственному руководителю работ: "
-        f"{work_order.responsible_supervisor.full_name if work_order.responsible_supervisor else '—'}"
-    )
-    doc.add_paragraph(
-        f"Ответственному исполнителю работ: "
-        f"{work_order.responsible_executor.full_name if work_order.responsible_executor else '—'}"
-    )
-    doc.add_paragraph()
-    doc.add_paragraph(f"На выполнение работ: {work_order.work_description}")
-    doc.add_paragraph(f"Место выполнения работ: {work_order.location}")
-
-    # Материалы/инструменты/приспособления/спецтехника — только если заполнены
-    # (необязательные поля, не все наряды их требуют).
-    for label, value in [
-        ("Материалы", work_order.materials),
-        ("Инструменты", work_order.tools),
-        ("Приспособления", work_order.equipment),
-        ("Спецтехника", work_order.special_machinery),
-    ]:
-        if value:
-            doc.add_paragraph(f"{label}: {value}")
-
-    if work_order.technological_card_ref:
-        doc.add_paragraph()
-        doc.add_paragraph(
-            f"Работы производить в соответствии с требованиями технологической карты "
-            f"({work_order.technological_card_ref})."
+    def obl_row(o: Obligation) -> str:
+        emp_name = o.employee.full_name if o.employee else "?"
+        chip_class, chip_label, _ = _obligation_status(o, today)
+        # medical_exam решается в разделе Медкомиссия (направление/результат), остальные типы
+        # (registration, contract_notice, efs1_report) — правкой соответствующей даты в карточке
+        # сотрудника, откуда их дедлайн и считается.
+        action_url = "/medical" if o.type == ObligationType.MEDICAL_EXAM else f"/employees/{o.employee_id}"
+        action_label = "Открыть медкомиссию" if o.type == ObligationType.MEDICAL_EXAM else "Открыть карточку"
+        type_label = OBLIGATION_LABELS.get(o.type, o.type.value)
+        return (
+            f'<div class="card">{emp_name} — {type_label}<br>'
+            f'<span class="badge {chip_class}">до {o.deadline_date.strftime("%d.%m.%Y")} · {chip_label}</span><br>'
+            f'<a class="btn" href="{action_url}">{action_label}</a></div>'
         )
 
-    if work_order.safety_systems:
-        doc.add_paragraph()
-        doc.add_paragraph("Системы обеспечения безопасности работ:").bold = True
-        doc.add_paragraph(work_order.safety_systems)
+    # Сотрудники, у которых не хватает хотя бы одного из ключевых полей карточки —
+    # единый список вместо четырёх отдельных разделов, все ведут в /employees/{id}.
+    all_employees = db.scalars(select(Employee).order_by(Employee.full_name)).all()
 
-    if work_order.special_conditions:
-        doc.add_paragraph()
-        doc.add_paragraph("Особые условия проведения работ:").bold = True
-        doc.add_paragraph(work_order.special_conditions)
+    def missing_badges(e: Employee) -> list[str]:
+        badges = []
+        if e.entry_date is None:
+            badges.append('<span class="badge red">нет даты въезда</span>')
+        if e.registration_status is None:
+            badges.append('<span class="badge red">статус учёта не задан</span>')
+        if e.contract_date is None:
+            badges.append('<span class="badge orange">нет даты договора</span>')
+        if e.consent_status == ConsentStatus.DRAFT:
+            badges.append('<span class="badge red">нет согласия</span>')
+        return badges
 
-    doc.add_paragraph()
-    doc.add_paragraph("Состав исполнителей работ (члены бригады):").bold = True
-    table = doc.add_table(rows=1, cols=3)
-    table.style = "Table Grid"
-    hdr = table.rows[0].cells
-    hdr[0].text = "№"
-    hdr[1].text = "Фамилия, имя, отчество"
-    hdr[2].text = "С условиями работ ознакомил, инструктаж провёл (подпись)"
-    for i, member in enumerate(members, start=1):
-        row = table.add_row().cells
-        row[0].text = str(i)
-        row[1].text = member.employee.full_name if member.employee else "?"
-        row[2].text = ""  # печатный бланк — подпись ставится от руки на распечатке
+    needs_attention = [(e, missing_badges(e)) for e in all_employees]
+    needs_attention = [(e, b) for e, b in needs_attention if b]
 
-    # Ежедневный допуск к работе — по одной строке на каждый день периода действия
-    # наряда (см. WorkOrderDailyAdmission). Пустые графы — заполняются от руки/по
-    # факту при подтверждении в системе (record_daily_briefing/completion).
-    doc.add_paragraph()
-    doc.add_paragraph("Ежедневный допуск к работе:").bold = True
-    daily_table = doc.add_table(rows=1, cols=4)
-    daily_table.style = "Table Grid"
-    dhdr = daily_table.rows[0].cells
-    dhdr[0].text = "Дата"
-    dhdr[1].text = "Целевой инструктаж выдан (дата, время, подпись руководителя)"
-    dhdr[2].text = "Работа закончена, место убрано (дата, время, подпись исполнителя)"
-    dhdr[3].text = ""
-    day = work_order.valid_from
-    while day <= work_order.valid_to:
-        drow = daily_table.add_row().cells
-        drow[0].text = day.strftime("%d.%m.%Y")
-        drow[1].text = ""
-        drow[2].text = ""
-        drow[3].text = ""
-        day += timedelta(days=1)
+    # Медобязательства, ожидающие направления: PENDING medical_exam без связанного Referral.
+    referred_obligation_ids = {r.obligation_id for r in db.scalars(select(Referral)).all()}
+    need_referral = [
+        o for o in db.scalars(
+            select(Obligation)
+            .where(Obligation.is_current == True)  # noqa: E712
+            .where(Obligation.type == ObligationType.MEDICAL_EXAM)
+            .where(Obligation.status == ObligationStatus.PENDING)
+        ).all()
+        if o.id not in referred_obligation_ids
+    ]
+    awaiting_result = db.scalars(
+        select(Referral).where(Referral.exam_status == ExamStatus.REFERRED)
+    ).all()
+    # Из тех, кому нужно направление — у кого прошло >=5 дней от въезда ("пора выдавать").
+    _today_dash = date.today()
+    urge_referral = 0
+    for _o in need_referral:
+        _emp_u = db.get(Employee, _o.employee_id)
+        if _emp_u and _emp_u.entry_date and (_today_dash - _emp_u.entry_date).days >= 5:
+            urge_referral += 1
 
-    doc.add_paragraph()
-    doc.add_paragraph("Подписи:")
-    doc.add_paragraph("Наряд выдал: _________________________  (подпись, расшифровка)")
-    doc.add_paragraph("Ответственный руководитель работ: _________________________  (подпись, расшифровка)")
-    doc.add_paragraph("Ответственный исполнитель работ: _________________________  (подпись, расшифровка)")
+    def attention_row(e: Employee, badges: list[str]) -> str:
+        return (
+            f'<div class="card">{e.full_name}<br>'
+            f'{"".join(badges)}<br>'
+            f'<a class="btn" href="/employees/{e.id}">Открыть карточку</a></div>'
+        )
 
-    path = f"{output_dir}/naryad_{work_order.number}_{work_order.id[:8]}.docx"
-    doc.save(path)
-    return path
+    # Непроведённые обязательные инструктажи (вводный / первичный на рабочем месте):
+    # дата начала работы наступила, а инструктажа нет. Отдельный раздел от "пробелов
+    # в карточке" — это не незаполненное поле, а невыполненное действие по охране труда.
+    instruction_gaps = prod.get_instruction_compliance_gaps(db)
+
+    def instruction_gap_row(g: dict) -> str:
+        badge_class = "red" if g["stage"] == "critical" else "orange"
+        stage_word = "критично" if g["stage"] == "critical" else "просрочено"
+        return (
+            f'<div class="card">{html.escape(g["name"])} — {g["type_label"]}<br>'
+            f'<span class="badge {badge_class}">{stage_word} · с {g["start_date"].strftime("%d.%m.%Y")} '
+            f'({g["days_overdue"]} дн.)</span><br>'
+            f'<a class="btn" href="/production/instructions">К инструктажам</a> '
+            f'<a class="btn secondary" href="/employees/{g["employee_id"]}">Карточка</a></div>'
+        )
+
+    # Межвахта с открытыми обязательствами (2026-07, слияние с ботом ТабельБелокаменка).
+    # Видит только кадровик/админ — прораб ставит межвахту не глядя на это (см.
+    # UserRole.PRORAB в models.py и договорённость "данные направлены в отдел кадров").
+    role = request.session.get("role", "")
+    rotation_flags = []
+    if role in ("kadrovik", "admin"):
+        rotation_flags = db.scalars(
+            select(RotationReturn)
+            .where(RotationReturn.flagged == True)  # noqa: E712
+            .where(RotationReturn.reviewed_at.is_(None))
+        ).all()
+
+    def rotation_row(rr: RotationReturn) -> str:
+        emp = rr.employee
+        open_obl = [
+            o for o in (emp.obligations if emp else [])
+            if o.is_current and o.status in (ObligationStatus.PENDING, ObligationStatus.OVERDUE)
+        ]
+        obl_labels = ", ".join(
+            f"{OBLIGATION_LABELS.get(o.type, o.type.value)} ({o.status.value})" for o in open_obl
+        ) or "—"
+        return (
+            f'<div class="card">{emp.full_name if emp else "?"} — межвахта до '
+            f'{rr.expected_return_date.strftime("%d.%m.%Y") if rr.expected_return_date else "не уточнена"}<br>'
+            f'<span class="badge red">Открытые обязательства: {obl_labels}</span><br>'
+            f'<form method="post" action="/attention/rotation/{rr.employee_id}/resolve" style="display:inline">'
+            f'<button type="submit" class="btn">✅ Разобрано</button></form> '
+            f'<a class="btn" href="/employees/{rr.employee_id}">Открыть карточку</a></div>'
+        )
+
+    # На оформлении (2026-07): договор ещё не начался (нет даты или дата в будущем) —
+    # такие сотрудники исключены из табеля (см. tabel.get_active_employees). Видит
+    # только кадровик/админ, как и флаги межвахты.
+    onboarding_employees = []
+    if role in ("kadrovik", "admin"):
+        onboarding_employees = tabel.get_onboarding_employees(db)
+
+    def onboarding_row(e: Employee) -> str:
+        cd = e.contract_date.strftime("%d.%m.%Y") if e.contract_date else "не указана"
+        return (
+            f'<div class="card">{e.full_name} — дата договора: {cd}<br>'
+            f'<a class="btn" href="/employees/{e.id}">Открыть карточку</a></div>'
+        )
+
+    # Уточнить дату возврата с межвахты (2026-07): заглушки RotationReturn с
+    # expected_return_date=NULL, см. tabel.get_pending_clarification_rotations.
+    # Кадровик минимально работает в MAX — эта задача теперь в первую очередь
+    # здесь, в веб-дашборде (прорабу отдельно шлётся напоминание в боте, см.
+    # bot.py morning_job).
+    pending_rotation = []
+    if role in ("kadrovik", "admin"):
+        pending_rotation = tabel.get_pending_clarification_rotations(db)
+
+    def pending_rotation_row(item: dict) -> str:
+        return (
+            f'<div class="card">{item["name"]} — дата возврата с межвахты не уточнена<br>'
+            f'<a class="btn" href="/employees/{item["employee_id"]}">Открыть карточку</a></div>'
+        )
+
+    # СРОЧНАЯ проверка (2026-07): явка есть, а договор не действует. См. подробный
+    # docstring tabel.get_marks_without_valid_contract. Веб безопасен для проактивного
+    # показа (вход персональный, не рассылка) — в отличие от бота, где это оставлено
+    # только пассивным пунктом меню (см. решение про NotificationSubscriber).
+    invalid_contract_marks = []
+    if role in ("kadrovik", "admin"):
+        invalid_contract_marks = tabel.get_marks_without_valid_contract(db)
+
+    def invalid_contract_row(item: dict) -> str:
+        cd = item["contract_date"].strftime("%d.%m.%Y") if item["contract_date"] else "не указана"
+        ced = item["contract_end_date"]
+        reason = f"уволен {ced:%d.%m.%Y}" if ced else f"дата договора: {cd}"
+        marks_str = ", ".join(f"{d:%d.%m}" for d, _slot, _code in item["marks"])
+        return (
+            f'<div class="card">{item["name"]} ({reason})<br>'
+            f'<span class="badge red">Явка: {marks_str}</span><br>'
+            f'<a class="btn" href="/employees/{item["employee_id"]}">Открыть карточку</a></div>'
+        )
+
+    test_banner = (
+        '<div class="warning-banner">⚠ Тестовый режим включён (TEST_ALLOW_MISSING_FIELDS): '
+        'документы для медкомиссии генерируются с прочерками вместо незаполненных полей. '
+        'Выключите флаг в переменных окружения перед реальной работой с сотрудниками.</div>'
+        if TEST_ALLOW_MISSING_FIELDS else ""
+    )
+
+    if db.get(SystemFlag, "dactyloscopy_backfill_done") is not None:
+        recompute_section = (
+            '<section><h2>Разовая операция</h2>'
+            '<div class="card"><span class="badge green">Прогон дактилоскопии выполнен</span>'
+            '<div class="muted-line">Кнопку и эту секцию можно удалить отдельной правкой '
+            '(см. TODO в models.py у таблицы SystemFlag).</div></div></section>'
+        )
+    else:
+        recompute_section = (
+            '<section><h2>Разовая операция</h2>'
+            '<div class="card">Создать обязанности дактилоскопии для существующих сотрудников — '
+            'разово, для тех, кто заведён до добавления правила. Запускать один раз.'
+            '<form method="post" action="/admin/recompute-dactyloscopy">'
+            '<button type="submit">Запустить прогон</button></form></div></section>'
+        )
+
+    body = f"""
+{test_banner}
+{f'''<div class="warning-banner" style="background:#fdecec;border-left-color:#c0392b;color:#7a1f1f">
+🚨 СРОЧНО: явка без действующего договора у {len(invalid_contract_marks)} чел. — проверьте ниже.
+</div>''' if invalid_contract_marks else ""}
+<p class="muted" style="margin:0 0 10px">Рабочее место: Автоматизированная система учёта на производстве.
+Вы вошли как {html.escape(_current_user_obj.full_name if _current_user_obj else "?")},
+роль: {role or "—"}.</p>
+<h1>Задачи</h1>
+<p><a class="btn" href="/employees/new">+ Добавить сотрудника</a></p>
+
+{f'''<section class="grid">
+<h2>🚨 Явка без действующего договора ({len(invalid_contract_marks)})</h2>
+{"".join(invalid_contract_row(item) for item in invalid_contract_marks)}
+</section>''' if invalid_contract_marks else ""}
+
+<section class="grid">
+<h2>Просрочено ({len(overdue)})</h2>
+{''.join(obl_row(o) for o in overdue) or '<p class="muted">Нет просроченных.</p>'}
+</section>
+
+<section class="grid">
+<h2>Дедлайн в ближайшие 7 дней ({len(due_soon)})</h2>
+{''.join(obl_row(o) for o in due_soon) or '<p class="muted">Нет.</p>'}
+</section>
+
+<section class="grid">
+<h2>Требуют внимания в карточке ({len(needs_attention)})</h2>
+{''.join(attention_row(e, b) for e, b in needs_attention) or '<p class="muted">У всех сотрудников заполнены ключевые поля.</p>'}
+</section>
+
+<section class="grid">
+<h2>🦺 Инструктажи не проведены ({len(instruction_gaps)}{f", из них критично: {sum(1 for g in instruction_gaps if g['stage'] == 'critical')}" if any(g['stage'] == 'critical' for g in instruction_gaps) else ""})</h2>
+{''.join(instruction_gap_row(g) for g in instruction_gaps) or '<p class="muted">Вводный и первичный проведены у всех, кто уже начал работу.</p>'}
+</section>
+
+{f'''<section class="grid">
+<h2>🔄 Межвахта с открытыми обязательствами ({len(rotation_flags)})</h2>
+{"".join(rotation_row(rr) for rr in rotation_flags) or '<p class="muted">Нет.</p>'}
+</section>''' if role in ("kadrovik", "admin") else ""}
+
+{f'''<section class="grid">
+<h2>🧾 На оформлении, не в табеле ({len(onboarding_employees)})</h2>
+{"".join(onboarding_row(e) for e in onboarding_employees) or '<p class="muted">Нет.</p>'}
+</section>''' if role in ("kadrovik", "admin") else ""}
+
+{f'''<section class="grid">
+<h2>❓ Уточнить дату возврата с межвахты ({len(pending_rotation)})</h2>
+{"".join(pending_rotation_row(item) for item in pending_rotation) or '<p class="muted">Нет.</p>'}
+</section>''' if role in ("kadrovik", "admin") else ""}
+
+<section>
+<h2>Медкомиссия</h2>
+<div class="card">Нужно направление: {len(need_referral)}<br>
+{('<b style="color:#c47f00">Пора выдать (5+ дней от въезда): ' + str(urge_referral) + '</b><br>') if urge_referral else ''}Ждут результата: {len(awaiting_result)}<br>
+<a class="btn" href="/medical">Открыть раздел</a></div>
+</section>
+
+{recompute_section}
+"""
+    return _render("Рабочий стол", body, active="home", role=request.session.get("role",""))
 
 
-# ================= Реестр приказов =================
-
-def create_order(session: Session, number: str, order_date: date, topic: str,
-                  category: OrderCategory = OrderCategory.OTHER,
-                  note: str | None = None) -> InternalOrder:
-    order = InternalOrder(number=number, order_date=order_date, topic=topic,
-                           category=category, note=note)
-    session.add(order)
-    session.commit()
-    return order
-
-
-def get_orders(session: Session) -> list[InternalOrder]:
-    return session.query(InternalOrder).order_by(InternalOrder.order_date.desc()).all()
+@app.post("/attention/rotation/{employee_id}/resolve")
+def attention_rotation_resolve(employee_id: str, request: Request, db: Session = Depends(get_db)):
+    """Кадровик отмечает флаг межвахты как разобранный — вручную, не снимается
+    автоматически при закрытии обязательств (см. docstring RotationReturn в models.py)."""
+    user = _require_role(request, db, UserRole.KADROVIK)
+    rr = db.get(RotationReturn, employee_id)
+    if rr is not None and rr.flagged:
+        rr.reviewed_at = datetime.now(MSK)
+        rr.reviewed_by = user.id
+        db.add(rr)
+        db.commit()
+    return RedirectResponse("/", status_code=303)
 
 
-def get_orders_by_category(session: Session, category: OrderCategory) -> list[InternalOrder]:
-    return (
-        session.query(InternalOrder)
-        .filter_by(category=category)
-        .order_by(InternalOrder.order_date.desc())
-        .all()
+# --- Табель (2026-07, слияние с ботом ТабельБелокаменка) --------------------
+# Видят все три роли (PRORAB тоже — узкое исключение из "не пишет в БД", см.
+# UserRole.PRORAB в models.py). Разметка через веб — та же tabel.py, что и бот,
+# один источник правды (attendance_marks), просто два интерфейса ввода.
+
+_TABEL_CODE_OPTIONS = [
+    ("", "—"),
+    (tabel.DAY, "Д — день"),
+    ("С", "С — сутки"),
+    (tabel.NIGHT, "НЧ — ночь"),
+    (tabel.REST, "О — отдых"),
+    (tabel.SICK, "Б — больничный"),
+    (tabel.ROTATION, "МЖ — межвахта"),
+    (tabel.ABSENT, "Н — неявка"),
+    (tabel.MIGR, "МУ — мигр.учёт"),
+    (tabel.WEEKEND, "В — выходной"),
+]
+
+
+@app.get("/tabel", response_class=HTMLResponse)
+def tabel_page(request: Request, year: int | None = None, month: int | None = None,
+                db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    today = datetime.now(MSK).date()
+    year = year or today.year
+    month = month or today.month
+    days_in_month = calendar.monthrange(year, month)[1]
+
+    s = tabel.day_summary(db)
+    active_count = len(tabel.get_active_employees(db))
+    grid = tabel.get_month_codes(db, year, month)
+
+    # Навигация месяц назад/вперёд.
+    prev_month, prev_year = (12, year - 1) if month == 1 else (month - 1, year)
+    next_month, next_year = (1, year + 1) if month == 12 else (month + 1, year)
+    month_names = ["", "январь", "февраль", "март", "апрель", "май", "июнь",
+                    "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
+
+    _stat = lambda emoji, label, value: (
+        f'<div style="flex:1 1 auto;min-width:70px;text-align:center;padding:8px 4px">'
+        f'<div style="font-size:20px">{emoji}</div>'
+        f'<div style="font-size:20px;font-weight:700">{value}</div>'
+        f'<div style="font-size:11px;color:var(--sub)">{label}</div></div>'
+    )
+    summary_html = f"""
+<div class="card" style="font-weight:400">
+<div style="font-size:13px;color:var(--sub);margin-bottom:6px">Табель за {today.strftime("%d.%m.%Y")} — активных по списку: {active_count}</div>
+<div style="display:flex;flex-wrap:wrap;gap:2px">
+{_stat("☀️", "День", s['day'])}{_stat("🌙", "Ночь", s['night'])}{_stat("😴", "Отдых", s['rest'])}
+{_stat("🤒", "Больн.", s['sick'])}{_stat("✈️", "Межвахта", s['rotation'])}{_stat("❌", "Неявка", s['absent'])}
+{_stat("📋", "Мигр.учёт", s['migr'])}
+</div>
+</div>
+"""
+    if s["absent_list"]:
+        _absent_badge = {
+            tabel.ABSENT: "red", tabel.SICK: "orange", tabel.ROTATION: "neutral",
+            tabel.MIGR: "neutral", tabel.WEEKEND: "green",
+        }
+        absent_cards = "".join(
+            f'<div class="card" style="display:flex;justify-content:space-between;'
+            f'align-items:center;gap:8px;font-weight:400">'
+            f'<span>{html.escape(name)}</span>'
+            f'<span class="badge {_absent_badge.get(code, "neutral")}" style="margin:0">{code}</span></div>'
+            for name, code in s["absent_list"]
+        )
+        summary_html += f'<section><h2>Отсутствуют/особое ({len(s["absent_list"])})</h2>{absent_cards}</section>'
+
+    # ✈️ На межвахте — с датой ожидаемого возврата (не просто бейдж в общем списке).
+    rotation_rows = db.scalars(
+        select(RotationReturn)
+        .join(Employee, Employee.id == RotationReturn.employee_id)
+        .where(Employee.contract_end_date.is_(None))
+    ).all()
+    if rotation_rows:
+        _dep_label = {
+            "abroad": "за границу", "domestic": "в РФ, с площадки", "none": "не выезжал",
+        }
+        rotation_cards = "".join(
+            f'<div class="card" style="display:flex;justify-content:space-between;'
+            f'align-items:center;gap:8px;font-weight:400">'
+            f'<span>{html.escape(rr.employee.full_name if rr.employee else "?")}'
+            f'<br><span class="muted">{_dep_label.get(rr.departure_type, "не указано")}</span></span>'
+            + (
+                f'<span class="badge neutral" style="margin:0">до {rr.expected_return_date:%d.%m.%Y}</span>'
+                if rr.expected_return_date
+                else '<span class="badge red" style="margin:0">дата не уточнена</span>'
+            )
+            + '</div>'
+            for rr in rotation_rows
+        )
+        summary_html += f'<section><h2>✈️ На межвахте ({len(rotation_rows)})</h2>{rotation_cards}</section>'
+
+    # Закреплённый (sticky) стиль для колонки номера — при горизонтальной прокрутке
+
+    # Закреплённый (sticky) стиль для колонки номера — при горизонтальной прокрутке
+    # ФИО и дни уходят влево вместе с остальной таблицей, а № остаётся на месте.
+    _num_sticky = "position:sticky;left:0;background:#fff;z-index:2;"
+
+    # Заголовок с числами месяца.
+    header_cells = "".join(f'<th style="min-width:30px">{d}</th>' for d in range(1, days_in_month + 1))
+    is_current_month = (year == today.year and month == today.month)
+
+    rows_html = ""
+    for row_num, (emp_id, data) in enumerate(
+        sorted(grid.items(), key=lambda kv: kv[1]["name"]), start=1
+    ):
+        cells = ""
+        for i, code in enumerate(data["codes"]):
+            day_num = i + 1
+            day_date = date(year, month, day_num)
+            is_today_col = is_current_month and day_num == today.day
+            bg = " background:#eaf0fb;" if is_today_col else ""
+            code_bg = {
+                tabel.DAY: "#eaf6f0", tabel.NIGHT: "#eef1f4", tabel.REST: "#eef1f4",
+                tabel.SICK: "#fdf3e2", tabel.ROTATION: "#eef1f4", tabel.ABSENT: "#fdecec",
+                tabel.MIGR: "#eef1f4", tabel.WEEKEND: "#eaf6f0", "С": "#eaf6f0",
+            }.get(code, "#fff")
+            options_html = "".join(
+                f'<option value="{val}"{" selected" if val == code else ""}>{val or "—"}</option>'
+                for val, _label in _TABEL_CODE_OPTIONS
+            )
+            cells += (
+                f'<td style="padding:2px;{bg}">'
+                f'<form method="post" action="/tabel/mark" class="inline">'
+                f'<input type="hidden" name="employee_id" value="{emp_id}">'
+                f'<input type="hidden" name="mark_date" value="{day_date.isoformat()}">'
+                f'<input type="hidden" name="year" value="{year}">'
+                f'<input type="hidden" name="month" value="{month}">'
+                f'<select name="code" onchange="this.form.submit()" '
+                f'style="min-height:32px;padding:2px;margin:0;font-size:12px;width:56px;'
+                f'background-color:{code_bg}">'
+                f'{options_html}</select></form></td>'
+            )
+        rows_html += (
+            f'<tr>'
+            f'<td style="{_num_sticky}padding:4px 8px;text-align:right;color:var(--sub)">{row_num}</td>'
+            f'<td style="white-space:nowrap;font-weight:600;padding:4px 8px 4px 0">'
+            f'{html.escape(data["name"])}</td>{cells}</tr>'
+        )
+
+    body = f"""
+<h1>Табель</h1>
+{summary_html}
+<section style="overflow-x:auto">
+<h2>{month_names[month]} {year}
+&nbsp;
+<a class="btn secondary" href="/tabel?year={prev_year}&month={prev_month}">← </a>
+<a class="btn secondary" href="/tabel?year={next_year}&month={next_month}"> →</a>
+</h2>
+<table style="border-collapse:collapse;font-size:13px">
+<thead><tr><th style="position:sticky;left:0;background:#fff;z-index:2">№</th><th></th>{header_cells}</tr></thead>
+<tbody>{rows_html}</tbody>
+</table>
+<p class="muted">Изменение ячейки применяется сразу при выборе. "С" (сутки) и полноценная
+постановка "МЖ" с указанием даты возврата и типа отбытия — доступны с полными проверками
+через MAX-бота; здесь — быстрая правка кода без пошагового флоу.</p>
+</section>
+"""
+    return _render("Табель", body, active="tabel", role=request.session.get("role", ""))
+
+
+@app.post("/tabel/mark")
+def tabel_mark(
+    request: Request,
+    employee_id: str = Form(...),
+    mark_date: str = Form(...),
+    code: str = Form(""),
+    year: int = Form(...),
+    month: int = Form(...),
+    db: Session = Depends(get_db),
+):
+    """Запись одной ячейки табеля из веба. Роль не ограничивается (см. договорённость —
+    все три роли могут ставить/менять отметки), но вход обязателен."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    actor = _actor_name(request, db)
+    employee = db.get(Employee, employee_id)
+    if employee is None:
+        return RedirectResponse(f"/tabel?year={year}&month={month}", status_code=303)
+
+    d = datetime.strptime(mark_date, "%Y-%m-%d").date()
+
+    if code == "":
+        tabel.clear_day_slot(db, employee, d)
+        tabel.clear_night_slot(db, employee, d)
+    elif code == tabel.DAY:
+        tabel.mark_day(db, employee, actor, d)
+    elif code == "С":
+        tabel.mark_sutki(db, employee, actor, d)
+    elif code == tabel.NIGHT:
+        tabel.mark_night(db, employee, actor, d)
+    elif code == tabel.REST:
+        tabel.set_rest(db, employee, actor, d)
+    elif code in (tabel.SICK, tabel.ROTATION, tabel.ABSENT, tabel.MIGR, tabel.WEEKEND):
+        # МЖ через веб — без даты возврата/типа отбытия (упрощённая правка кода,
+        # см. предупреждение на странице). Полноценная постановка — через бота.
+        tabel.set_reason(db, employee, code, actor, d)
+
+    return RedirectResponse(f"/tabel?year={year}&month={month}", status_code=303)
+
+
+# --- Отчёты (2026-07) --------------------------------------------------------
+# Данные — в reports.py (общие с ботом, см. bot.py "📊 Отчёты"). Здесь только
+# HTML-рендер. Чтобы добавить отчёт: новая запись в reports.REPORTS_REGISTRY +
+# функция данных в reports.py + маршрут здесь (полный HTML) + опционально
+# урезанный текстовый рендер в bot.py.
+
+import reports as reports_data
+
+
+@app.get("/reports", response_class=HTMLResponse)
+def reports_page(request: Request):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    cards = "".join(
+        f'<div class="card"><h3 style="margin:0 0 6px">{title}</h3>'
+        f'<p class="muted" style="margin:0 0 10px">{desc}</p>'
+        f'<a class="btn" href="{href}">Открыть</a></div>'
+        for _key, href, title, desc in reports_data.REPORTS_REGISTRY
+    )
+    body = f"""
+<h1>Отчёты</h1>
+<section class="grid">{cards}</section>
+"""
+    return _render("Отчёты", body, active="reports", role=request.session.get("role", ""))
+
+
+@app.get("/reports/changelog", response_class=HTMLResponse)
+def report_changelog(request: Request):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    def section(title: str, entries: list[tuple[str, str, str]]) -> str:
+        rows = "".join(
+            f'<div class="card"><h3 style="margin:0 0 6px">{h}</h3>'
+            f'<p style="margin:0 0 6px"><b>Было:</b> {problem}</p>'
+            f'<p style="margin:0"><b>Исправлено:</b> {fix}</p></div>'
+            for h, problem, fix in entries
+        )
+        return f'<section class="grid"><h2>{title}</h2>{rows}</section>'
+
+    body = f"""
+<h1>🐛 Журнал ошибок и патчей</h1>
+<p class="muted">Собрано по ходу разработки табеля (ТабельБелокаменка) и слияния с ботом
+миграционного учёта. Не автоматический отчёт — фиксирует находки вручную по мере работы.</p>
+{section(f"ТабельБелокаменка ({len(reports_data.CHANGELOG_TABEL)})", reports_data.CHANGELOG_TABEL)}
+{section(f"Слияние с миграционным учётом ({len(reports_data.CHANGELOG_MIGBOT)})", reports_data.CHANGELOG_MIGBOT)}
+<p><a class="btn secondary" href="/reports">← Все отчёты</a></p>
+"""
+    return _render("Журнал патчей", body, active="reports", role=request.session.get("role", ""))
+
+
+@app.get("/reports/monthly-problems", response_class=HTMLResponse)
+def report_monthly_problems(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    data = reports_data.get_monthly_problems_report(db)
+    rows = "".join(
+        f'<div class="card">{p["name"]}<br>'
+        + (f'<span class="badge red" style="margin-right:6px">неявок: {p["absent_count"]}</span>'
+           if p["absent_count"] >= data["absent_threshold"] else "")
+        + (f'<span class="badge orange">выходных: {p["weekend_count"]}</span>'
+           if p["weekend_count"] >= data["weekend_threshold"] else "")
+        + '</div>'
+        for p in data["problems"]
+    )
+    body = f"""
+<h1>📊 Проблемные за месяц</h1>
+<p class="muted">{data["month_label"]} — пороги: неявки от {data["absent_threshold"]},
+выходные от {data["weekend_threshold"]}. Учитываются только активные сотрудники (действующий договор).</p>
+<section class="grid">
+<h2>Всего: {len(data["problems"])}</h2>
+{rows or '<p class="muted">Никто не превысил пороги.</p>'}
+</section>
+<p><a class="btn secondary" href="/reports">← Все отчёты</a></p>
+"""
+    return _render("Проблемные за месяц", body, active="reports", role=request.session.get("role", ""))
+
+
+@app.get("/reports/obligations", response_class=HTMLResponse)
+def report_obligations(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    data = reports_data.get_obligations_report(db)
+    summary_rows = "".join(
+        f'<div class="card" style="display:flex;justify-content:space-between;align-items:center">'
+        f'<span>{OBLIGATION_LABELS.get(_t, _t)} — {_s}</span>'
+        f'<span class="badge {"red" if _s == "overdue" else ("green" if _s == "done" else "neutral")}">{_c}</span>'
+        f'</div>'
+        for (_t, _s), _c in sorted(data["counts"].items())
+    )
+    overdue_rows = "".join(
+        f'<div class="card">{item["name"]} — {OBLIGATION_LABELS.get(item["type_value"], item["type_value"])}<br>'
+        f'<span class="badge red">Дедлайн был {item["deadline_date"]:%d.%m.%Y}</span><br>'
+        f'<a class="btn" href="/employees/{item["employee_id"]}">Открыть карточку</a></div>'
+        for item in data["overdue_details"]
+    )
+    body = f"""
+<h1>📋 Обязательства — сводка по статусам</h1>
+<p class="muted">Только активные сотрудники (действующий договор). Только актуальные версии обязательств (is_current).</p>
+<section class="grid"><h2>По типам и статусам</h2>{summary_rows or '<p class="muted">Нет данных.</p>'}</section>
+<section class="grid"><h2>🚨 Просроченные, с деталями ({len(data["overdue_details"])})</h2>
+{overdue_rows or '<p class="muted">Просроченных нет.</p>'}</section>
+<p><a class="btn secondary" href="/reports">← Все отчёты</a></p>
+"""
+    return _render("Обязательства", body, active="reports", role=request.session.get("role", ""))
+
+
+@app.get("/reports/activity", response_class=HTMLResponse)
+def report_activity(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    data = reports_data.get_activity_report(db)
+    rows = "".join(
+        f'<div class="card">{a["label"]}<br>'
+        f'<span class="badge neutral">{a["count"]} отметок</span> '
+        f'<span class="muted">{a["first"]:%d.%m}–{a["last"]:%d.%m}</span></div>'
+        for a in data["actors"]
+    )
+    body = f"""
+<h1>🕵️ Активность в табеле</h1>
+<p class="muted">{data["month_start"].strftime("%B %Y")} — кто и сколько отметок поставил
+(включая перенесённую историю из Google Sheets).</p>
+<section class="grid"><h2>Всего отметок за месяц: {data["total"]}</h2>{rows or '<p class="muted">Нет данных.</p>'}</section>
+<p><a class="btn secondary" href="/reports">← Все отчёты</a></p>
+"""
+    return _render("Активность", body, active="reports", role=request.session.get("role", ""))
+
+
+# --- Производство (2026-07) --------------------------------------------------
+# Наряды-допуски, инструктажи, удостоверения — отдельный модуль (production.py),
+# минимально связанный с остальной системой. См. docstring в production.py.
+
+import production as prod
+
+
+@app.get("/production", response_class=HTMLResponse)
+def production_page(request: Request):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    body = """
+<h1>Производство</h1>
+<section class="grid">
+<div class="card"><h3 style="margin:0 0 6px">📋 Наряды-допуски</h3>
+<p class="muted" style="margin:0 0 10px">Официальные документы на производство работ — ответственный, бригада, срок действия.</p>
+<a class="btn" href="/production/work-orders">Открыть</a></div>
+<div class="card"><h3 style="margin:0 0 6px">🎓 Инструктажи</h3>
+<p class="muted" style="margin:0 0 10px">Вводный, первичный, повторный, внеплановый, целевой — учёт по каждому сотруднику.</p>
+<a class="btn" href="/production/instructions">Открыть</a></div>
+<div class="card"><h3 style="margin:0 0 6px">🪪 Удостоверения</h3>
+<p class="muted" style="margin:0 0 10px">Удостоверения по профессиям — сроки действия, сканы, напоминания об истечении.</p>
+<a class="btn" href="/production/certificates">Открыть</a></div>
+<div class="card"><h3 style="margin:0 0 6px">📑 Приказы</h3>
+<p class="muted" style="margin:0 0 10px">Реестр внутренних приказов — сканы, номера, используется в футерах печатных бланков.</p>
+<a class="btn" href="/production/orders">Открыть</a></div>
+<div class="card"><h3 style="margin:0 0 6px">👷 Бригады</h3>
+<p class="muted" style="margin:0 0 10px">Сохранённые составы — выбор бригадой целиком при создании наряда, без ручной отметки каждого.</p>
+<a class="btn" href="/production/brigades">Открыть</a></div>
+</section>
+"""
+    return _render("Производство", body, active="production", role=request.session.get("role", ""))
+
+
+# --- Наряды-допуски -----------------------------------------------------------
+
+@app.get("/production/work-orders", response_class=HTMLResponse)
+def work_orders_page(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    orders = prod.get_active_work_orders(db)
+    employees = db.scalars(
+        select(Employee).where(Employee.contract_end_date.is_(None)).order_by(Employee.full_name)
+    ).all()
+    emp_options = "".join(f'<option value="{e.id}">{e.full_name}</option>' for e in employees)
+    emp_checkboxes = "".join(
+        f'<label style="display:block;margin:2px 0"><input type="checkbox" name="member_ids" '
+        f'id="memberCb_{e.id}" value="{e.id}"> {e.full_name}</label>'
+        for e in employees
+    )
+    brigades = prod.get_brigades(db)
+    brigade_options = "".join(f'<option value="{b.id}">{b.name}</option>' for b in brigades)
+    import json as _json
+    brigades_js_map = _json.dumps({
+        b.id: prod.get_brigade_member_ids(db, b.id) for b in brigades
+    })
+
+    def order_row(o) -> str:
+        members = db.query(WorkOrderMember).filter_by(work_order_id=o.id).all()
+        signed = sum(1 for m in members if m.signed_at is not None)
+        return (
+            f'<div class="card">№{o.number} — {o.work_description}<br>'
+            f'<span class="muted">{o.location} · {o.valid_from:%d.%m}–{o.valid_to:%d.%m.%Y}</span><br>'
+            f'<span class="muted">Руководитель: {o.responsible_supervisor.full_name if o.responsible_supervisor else "?"} · '
+            f'Исполнитель: {o.responsible_executor.full_name if o.responsible_executor else "?"}</span><br>'
+            f'<span class="badge neutral">Подписали: {signed}/{len(members)}</span> '
+            f'<a class="btn secondary" href="/production/work-orders/{o.id}/print">Печатный бланк</a> '
+            f'<form method="post" action="/production/work-orders/{o.id}/close" style="display:inline">'
+            f'<button type="submit" class="btn secondary">Закрыть наряд</button></form></div>'
+        )
+
+    rows = "".join(order_row(o) for o in orders)
+    body = f"""
+<h1>📋 Наряды-допуски</h1>
+<section class="grid"><h2>Активные ({len(orders)})</h2>{rows or '<p class="muted">Нет активных нарядов.</p>'}</section>
+<section>
+<h2>Новый наряд</h2>
+<form method="post" action="/production/work-orders/new">
+<input type="text" name="number" placeholder="Номер наряда" required>
+<input type="text" name="subdivision" placeholder="Подразделение (например: ОС)">
+<textarea name="work_description" placeholder="На выполнение работ" required rows="3"></textarea>
+<input type="text" name="location" placeholder="Место выполнения работ" required>
+<label>Ответственный руководитель работ:
+<select name="responsible_supervisor_id" required>{emp_options}</select></label>
+<label>Ответственный исполнитель работ (бригадир):
+<select name="responsible_executor_id" required>{emp_options}</select></label>
+<label>Действует с: <input type="date" name="valid_from" required></label>
+<label>Действует по: <input type="date" name="valid_to" required></label>
+<label>Выбрать готовую бригаду (необязательно):
+<select id="brigadeSelect"><option value="">— вручную —</option>{brigade_options}</select></label>
+<button type="button" class="secondary" onclick="_applyBrigade()">Применить состав</button>
+<fieldset><legend>Члены бригады</legend>{emp_checkboxes}</fieldset>
+<fieldset><legend>Дополнительно (необязательно)</legend>
+<textarea name="materials" placeholder="Материалы" rows="2"></textarea>
+<textarea name="tools" placeholder="Инструменты" rows="2"></textarea>
+<textarea name="equipment" placeholder="Приспособления" rows="2"></textarea>
+<textarea name="special_machinery" placeholder="Спецтехника" rows="2"></textarea>
+<input type="text" name="technological_card_ref" placeholder="Ссылка на технологическую карту (шифр ТК)">
+<textarea name="safety_systems" placeholder="Системы обеспечения безопасности (страховочные/поддерживающие/эвакуационные)" rows="2"></textarea>
+<textarea name="special_conditions" placeholder="Особые условия (погодные ограничения и т.п.)" rows="2"></textarea>
+</fieldset>
+<button type="submit">Создать наряд</button>
+</form>
+</section>
+<p><a class="btn secondary" href="/production">← Производство</a></p>
+<script>
+var _brigadesData = {brigades_js_map};
+function _applyBrigade(){{
+  var sel = document.getElementById('brigadeSelect');
+  var brigadeId = sel.value;
+  document.querySelectorAll('input[name=member_ids]').forEach(function(cb){{ cb.checked = false; }});
+  if (!brigadeId) return;
+  var ids = _brigadesData[brigadeId] || [];
+  ids.forEach(function(id){{
+    var cb = document.getElementById('memberCb_' + id);
+    if (cb) cb.checked = true;
+  }});
+}}
+</script>
+"""
+    return _render("Наряды-допуски", body, active="production", role=request.session.get("role", ""))
+
+
+@app.post("/production/work-orders/new")
+def work_order_create(
+    request: Request,
+    number: str = Form(...),
+    subdivision: str = Form(""),
+    work_description: str = Form(...),
+    location: str = Form(...),
+    responsible_supervisor_id: str = Form(...),
+    responsible_executor_id: str = Form(...),
+    valid_from: str = Form(...),
+    valid_to: str = Form(...),
+    member_ids: list[str] = Form(default=[]),
+    materials: str = Form(""),
+    tools: str = Form(""),
+    equipment: str = Form(""),
+    special_machinery: str = Form(""),
+    technological_card_ref: str = Form(""),
+    safety_systems: str = Form(""),
+    special_conditions: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    actor = _actor_name(request, db)
+    prod.create_work_order(
+        db, number, work_description, location,
+        responsible_supervisor_id, responsible_executor_id, actor,
+        datetime.strptime(valid_from, "%Y-%m-%d").date(),
+        datetime.strptime(valid_to, "%Y-%m-%d").date(),
+        member_ids,
+        subdivision=subdivision or None,
+        materials=materials or None,
+        tools=tools or None,
+        equipment=equipment or None,
+        special_machinery=special_machinery or None,
+        technological_card_ref=technological_card_ref or None,
+        safety_systems=safety_systems or None,
+        special_conditions=special_conditions or None,
+    )
+    return RedirectResponse("/production/work-orders", status_code=303)
+
+
+@app.post("/production/work-orders/{work_order_id}/close")
+def work_order_close(work_order_id: str, request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    prod.close_work_order(db, work_order_id)
+    return RedirectResponse("/production/work-orders", status_code=303)
+
+
+@app.get("/production/work-orders/{work_order_id}/print")
+def work_order_print(work_order_id: str, request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    order = db.get(WorkOrder, work_order_id)
+    if order is None:
+        raise HTTPException(404, "Наряд не найден.")
+    members = db.query(WorkOrderMember).filter_by(work_order_id=order.id).all()
+    path = prod.generate_work_order_docx(order, members, org_name=ORG_NAME)
+    with open(path, "rb") as f:
+        data = f.read()
+    fn = f"Наряд-допуск_№{order.number}.docx"
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": _content_disposition(fn)},
     )
 
 
-def set_order_scan_key(session: Session, order_id: str, scan_key: str) -> None:
-    order = session.get(InternalOrder, order_id)
-    if order is not None:
-        order.scan_key = scan_key
-        session.add(order)
-        session.commit()
+# --- Инструктажи ---------------------------------------------------------------
+
+@app.get("/production/instructions", response_class=HTMLResponse)
+def instructions_page(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    due = prod.get_due_instructions(db)
+    employees = db.scalars(
+        select(Employee).where(Employee.contract_end_date.is_(None)).order_by(Employee.full_name)
+    ).all()
+    emp_options = "".join(f'<option value="{e.id}">{e.full_name}</option>' for e in employees)
+    type_options = "".join(f'<option value="{t.value}">{label}</option>' for t, label in prod.INSTRUCTION_LABELS.items())
+
+    due_rows = "".join(
+        f'<div class="card">{d["name"]} — {"просрочен" if d["overdue"] else "срок"} '
+        f'{d["due_date"]:%d.%m.%Y}<br>'
+        f'<a class="btn" href="/employees/{d["employee_id"]}">Открыть карточку</a></div>'
+        for d in due
+    )
+
+    # Автозаполнение вводного всем + допечатка журнала партиями по каждому типу —
+    # см. договорённость: журналы заполняются ВСЕМИ сотрудниками (не по одному
+    # вручную), печать — только новых непечатанных записей, отдельная нумерация
+    # на каждый InstructionType.
+    need_intro = len(prod.get_employees_needing_introductory(db))
+    need_primary = len(prod.get_employees_needing_instruction(db, InstructionType.PRIMARY_WORKPLACE))
+    journal_rows = ""
+    for t, label in prod.INSTRUCTION_LABELS.items():
+        unprinted = len(prod.get_unprinted_instructions(db, t))
+        journal_rows += (
+            f'<div class="card">{label}<br>'
+            f'<span class="badge {"orange" if unprinted else "neutral"}">Ждут печати: {unprinted}</span><br>'
+            f'<form method="post" action="/production/instructions/print" style="display:inline">'
+            f'<input type="hidden" name="instruction_type" value="{t.value}">'
+            f'<button type="submit" class="btn secondary">Допечатать новые записи</button></form></div>'
+        )
+
+    body = f"""
+<h1>🎓 Инструктажи</h1>
+{f'<section class="grid"><h2>⏰ Требуют повторного проведения ({len(due)})</h2>{due_rows}</section>' if due else ''}
+
+<section class="grid">
+<h2>Журналы — допечатка партиями</h2>
+{journal_rows}
+</section>
+
+<section>
+<h2>Вводный инструктаж — автозаполнение</h2>
+<p class="muted">Сотрудников без вводного инструктажа: {need_intro}. Заводит запись каждому
+датой начала работы (дата договора, а если её нет — дата въезда) — не сегодняшним числом,
+чтобы порядок строк в журнале при печати совпадал с реальной хронологией приёма.</p>
+<form method="post" action="/production/instructions/auto-introductory">
+<button type="submit"{" disabled" if not need_intro else ""}>Заполнить вводный всем ({need_intro})</button>
+</form>
+</section>
+
+<section>
+<h2>Первичный на рабочем месте — автозаполнение</h2>
+<p class="muted">Сотрудников без первичного инструктажа: {need_primary}. Проводится вместе с
+вводным в день начала работы, но регистрируется в ОТДЕЛЬНОМ журнале со своей нумерацией.
+Заводит запись каждому датой начала работы — так же, как вводный.</p>
+<form method="post" action="/production/instructions/auto-primary">
+<button type="submit"{" disabled" if not need_primary else ""}>Заполнить первичный всем ({need_primary})</button>
+</form>
+</section>
+
+<section>
+<h2>⚠️ ВРЕМЕННО (тест)</h2>
+<p class="muted">Очищает ВСЕ записи инструктажей всех видов — вводный, на рабочем месте,
+повторный, внеплановый, целевой. Только для проверки автозаполнения/допечатки с чистого
+листа. Удалить эту кнопку и функцию production.test_clear_all_instructions после теста.</p>
+<form method="post" action="/production/instructions/test-clear"
+onsubmit="return confirm('Удалить ВСЕ записи инструктажей без возможности отмены?')">
+<button type="submit" class="secondary">🧪 Очистить инструктажи (тест)</button>
+</form>
+</section>
+
+<section>
+<h2>Провести инструктаж (по одному)</h2>
+<form method="post" action="/production/instructions/new">
+<label>Сотрудник: <select name="employee_id" required>{emp_options}</select></label>
+<label>Вид: <select name="instruction_type" required>{type_options}</select></label>
+<input type="text" name="topic" placeholder="Тема (для целевого/внепланового)">
+<label>Следующий срок (для повторного, необязательно): <input type="date" name="next_due_date"></label>
+<button type="submit">Зафиксировать проведение</button>
+</form>
+</section>
+<p><a class="btn secondary" href="/production">← Производство</a></p>
+"""
+    return _render("Инструктажи", body, active="production", role=request.session.get("role", ""))
 
 
-def get_latest_order_ref(session: Session) -> str:
-    """
-    Ссылка на актуальный приказ для футеров печатных бланков (наряд-допуск,
-    журналы инструктажа) — INTERNAL_ORDER_REF. Берёт последний по дате приказ
-    из реестра. Если реестр пуст — явная заглушка, чтобы не выглядело как
-    настоящая ссылка на несуществующий документ (см. договорённость)."""
-    orders = get_orders(session)
-    if not orders:
-        return "[Приказ не издан — заполнить в разделе «Приказы»]"
-    latest = orders[0]
-    return f"Приказ № {latest.number} от {latest.order_date.strftime('%d.%m.%Y')}"
+@app.post("/production/instructions/auto-introductory")
+def instruction_auto_introductory(request: Request, db: Session = Depends(get_db)):
+    """Вводный инструктаж всем сотрудникам, у кого его ещё нет — датой начала работы,
+    не сегодняшним числом (см. договорённость в чате)."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    actor = _actor_name(request, db)
+    prod.auto_create_introductory_instructions(db, actor)
+    return RedirectResponse("/production/instructions", status_code=303)
+
+
+@app.post("/production/instructions/auto-primary")
+def instruction_auto_primary(request: Request, db: Session = Depends(get_db)):
+    """Первичный на рабочем месте всем, у кого его ещё нет — датой начала работы.
+    Проводится вместе с вводным, но отдельный журнал. Защищён unique-индексом
+    uq_primary_workplace_once от дублей при двойном нажатии (см. auto_create_instructions)."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    actor = _actor_name(request, db)
+    prod.auto_create_instructions(db, InstructionType.PRIMARY_WORKPLACE, actor)
+    return RedirectResponse("/production/instructions", status_code=303)
+
+
+@app.post("/production/instructions/test-clear")
+def instruction_test_clear(request: Request, db: Session = Depends(get_db)):
+    """ВРЕМЕННО (тест) — удаляет ВСЕ записи инструктажей, чтобы проверить
+    автозаполнение/допечатку с чистого листа. УДАЛИТЬ этот роут вместе с
+    production.test_clear_all_instructions и кнопкой в instructions_page,
+    когда тестирование закончится."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    prod.test_clear_all_instructions(db)
+    return RedirectResponse("/production/instructions", status_code=303)
+
+
+@app.post("/production/instructions/print")
+def instruction_print_journal(
+    request: Request, instruction_type: str = Form(...), db: Session = Depends(get_db),
+):
+    """Допечатать новые записи журнала — присваивает номера строк, отдаёт xlsx
+    (2026-07: переведено с docx на Excel, см. production.print_new_journal_entries /
+    generate_instruction_journal_xlsx). Довеска прочерками нет — журнал кончается
+    на последней записи, под таблицей итог "Внесено записей: N"."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    t = InstructionType(instruction_type)
+    printed = prod.print_new_journal_entries(db, t)
+    if not printed:
+        return RedirectResponse("/production/instructions", status_code=303)
+    order_ref = prod.get_latest_order_ref(db)
+    started_at = prod.get_journal_started_at(db, t)
+    path = prod.generate_instruction_journal_xlsx(
+        printed, t, org_name=ORG_NAME, order_ref=order_ref, started_at=started_at,
+    )
+    with open(path, "rb") as f:
+        data = f.read()
+    label = prod.INSTRUCTION_LABELS.get(t, t.value)
+    fn = f"Журнал_{label.replace(' ', '_')}_{datetime.now(MSK):%d.%m.%Y}.xlsx"
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": _content_disposition(fn)},
+    )
+
+
+@app.post("/production/instructions/new")
+def instruction_create(
+    request: Request,
+    employee_id: str = Form(...),
+    instruction_type: str = Form(...),
+    topic: str = Form(""),
+    next_due_date: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    actor = _actor_name(request, db)
+    due = datetime.strptime(next_due_date, "%Y-%m-%d").date() if next_due_date else None
+    prod.create_instruction(
+        db, employee_id, InstructionType(instruction_type), actor,
+        topic=topic or None, next_due_date=due,
+    )
+    return RedirectResponse("/production/instructions", status_code=303)
+
+
+# --- Удостоверения (корочки) ---------------------------------------------------
+
+@app.get("/production/certificates", response_class=HTMLResponse)
+def certificates_page(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    expiring = prod.get_expiring_certificates(db)
+    employees = db.scalars(
+        select(Employee).where(Employee.contract_end_date.is_(None)).order_by(Employee.full_name)
+    ).all()
+    emp_options = "".join(f'<option value="{e.id}">{e.full_name}</option>' for e in employees)
+
+    expiring_rows = "".join(
+        f'<div class="card">{item["name"]} — {item["profession"]}<br>'
+        f'<span class="badge {"red" if item["overdue"] else "orange"}">'
+        f'{"Просрочено" if item["overdue"] else "Истекает"} {item["expiry_date"]:%d.%m.%Y}</span><br>'
+        f'<a class="btn" href="/employees/{item["employee_id"]}">Открыть карточку</a></div>'
+        for item in expiring
+    )
+
+    all_certs = db.query(Certificate).order_by(Certificate.created_at.desc()).all()
+
+    def cert_row(c) -> str:
+        status = prod.certificate_status(c)
+        badge_class = {"expired": "red", "expiring_soon": "orange", "active": "green", "no_expiry": "neutral"}[status]
+        badge_text = {"expired": "Просрочено", "expiring_soon": "Истекает", "active": "Действует", "no_expiry": "Бессрочное"}[status]
+        exp = f' до {c.expiry_date:%d.%m.%Y}' if c.expiry_date else ''
+        scan_link = (f'<a class="btn secondary" href="/production/certificates/{c.id}/download">Скачать скан</a>'
+                     if c.scan_key else '<span class="muted">без скана</span>')
+        return (
+            f'<div class="card">{c.employee.full_name if c.employee else "?"} — {c.profession}<br>'
+            f'<span class="badge {badge_class}">{badge_text}{exp}</span><br>{scan_link}</div>'
+        )
+
+    all_rows = "".join(cert_row(c) for c in all_certs)
+    body = f"""
+<h1>🪪 Удостоверения по профессиям</h1>
+{f'<section class="grid"><h2>⏰ Истекают/просрочены ({len(expiring)})</h2>{expiring_rows}</section>' if expiring else ''}
+<section class="grid"><h2>Все удостоверения ({len(all_certs)})</h2>{all_rows or '<p class="muted">Пока нет ни одного.</p>'}</section>
+<section>
+<h2>Добавить удостоверение</h2>
+<form method="post" action="/production/certificates/new" enctype="multipart/form-data">
+<label>Сотрудник: <select name="employee_id" required>{emp_options}</select></label>
+<input type="text" name="profession" placeholder="Профессия / вид допуска (например «Электробезопасность IV группа»)" required>
+<input type="text" name="issued_by_org" placeholder="Кем выдано">
+<label>Дата выдачи: <input type="date" name="issue_date"></label>
+<label>Действует до (пусто — бессрочное): <input type="date" name="expiry_date"></label>
+<label>Скан:</label>
+<input type="file" name="scan_file" accept="application/pdf,image/*,.doc,.docx" style="display:block;width:100%;margin:8px 0;padding:10px;border:1px solid #d9dde3;border-radius:8px;background:#fff;font-size:16px">
+<button type="submit">Добавить</button>
+</form>
+</section>
+<p><a class="btn secondary" href="/production">← Производство</a></p>
+"""
+    return _render("Удостоверения", body, active="production", role=request.session.get("role", ""))
+
+
+@app.post("/production/certificates/new")
+async def certificate_create(
+    request: Request,
+    employee_id: str = Form(...),
+    profession: str = Form(...),
+    issued_by_org: str = Form(""),
+    issue_date: str = Form(""),
+    expiry_date: str = Form(""),
+    scan_file: UploadFile = File(None),
+    db: Session = Depends(get_db),
+):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    cert = prod.create_certificate(
+        db, employee_id, profession,
+        issued_by_org=issued_by_org or None,
+        issue_date=datetime.strptime(issue_date, "%Y-%m-%d").date() if issue_date else None,
+        expiry_date=datetime.strptime(expiry_date, "%Y-%m-%d").date() if expiry_date else None,
+    )
+
+    if scan_file is not None and scan_file.filename:
+        # Свой scan_type на каждый сертификат (сотрудник может иметь несколько
+        # удостоверений разных профессий) — _s3_upload/_scan_key строят ключ
+        # как employee_{id}/{scan_type}, поэтому тип должен быть уникальным
+        # в рамках сотрудника, не фиксированным "certificate".
+        from s3_storage import _s3_upload, _scan_key
+        scan_type = f"certificate_{cert.id}"
+        content = await scan_file.read()
+        content_type = scan_file.content_type or "application/octet-stream"
+        try:
+            _s3_upload(scan_type, employee_id, content, content_type)
+            prod.set_certificate_scan_key(db, cert.id, _scan_key(scan_type, employee_id))
+        except RuntimeError as e:
+            log.warning("certificate_create: загрузка скана не удалась: %s", e)
+            # Удостоверение уже создано без скана — не откатываем, просто без файла.
+
+    return RedirectResponse("/production/certificates", status_code=303)
+
+
+@app.get("/production/certificates/{certificate_id}/download")
+def certificate_download(certificate_id: str, request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    cert = db.get(Certificate, certificate_id)
+    if cert is None or not cert.scan_key:
+        raise HTTPException(404, "Скан не найден.")
+    from s3_storage import _s3_download
+    # scan_key хранится как employee_{id}/certificate_{cert.id} — scan_type для
+    # _s3_download нужен без префикса "employee_{id}/", восстанавливаем.
+    scan_type = f"certificate_{cert.id}"
+    try:
+        data, ct = _s3_download(scan_type, cert.employee_id)
+    except RuntimeError as e:
+        raise HTTPException(404, str(e))
+    ext = "pdf" if "pdf" in ct else ("jpg" if "jpeg" in ct or "jpg" in ct else "bin")
+    fio = (cert.employee.full_name if cert.employee else "").strip().replace(" ", "_")
+    fn = f"{fio}_{cert.profession.replace(' ', '_')}.{ext}" if fio else f"certificate.{ext}"
+    return Response(content=data, media_type=ct,
+                    headers={"Content-Disposition": _content_disposition(fn)})
+
+
+# --- Приказы (2026-07) ---------------------------------------------------------
+
+@app.get("/production/orders", response_class=HTMLResponse)
+def orders_page(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    orders = prod.get_orders(db)
+
+    _category_label = {
+        OrderCategory.PERSONNEL: "Кадровый", OrderCategory.PRODUCTION: "Производственный",
+        OrderCategory.OTHER: "Прочее",
+    }
+    _category_badge = {
+        OrderCategory.PERSONNEL: "orange", OrderCategory.PRODUCTION: "green", OrderCategory.OTHER: "neutral",
+    }
+
+    def order_row(o) -> str:
+        scan_link = (f'<a class="btn secondary" href="/production/orders/{o.id}/download">Скачать скан</a>'
+                     if o.scan_key else '<span class="muted">без скана</span>')
+        note = f'<br><span class="muted">{o.note}</span>' if o.note else ''
+        badge = f'<span class="badge {_category_badge[o.category]}">{_category_label[o.category]}</span>'
+        return (
+            f'<div class="card">№ {o.number} от {o.order_date:%d.%m.%Y} — {o.topic} {badge}{note}<br>'
+            f'{scan_link}</div>'
+        )
+
+    rows = "".join(order_row(o) for o in orders)
+    # Предзаполнение первой записи данными уже готового приказа №20-ПСМ/2026 —
+    # только пока реестр пуст, чтобы не подставлять эти значения повторно для
+    # следующих приказов.
+    _prefill = not orders
+    _pf_number = "20-ПСМ/2026" if _prefill else ""
+    _pf_date = "2026-06-01" if _prefill else ""
+    _pf_topic = ("О порядке ведения журналов инструктажей по охране труда и учёта "
+                 "нарядов-допусков" if _prefill else "")
+    category_options = "".join(
+        f'<option value="{c.value}"{" selected" if _prefill and c == OrderCategory.PRODUCTION else ""}>{label}</option>'
+        for c, label in _category_label.items()
+    )
+    body = f"""
+<h1>📑 Приказы</h1>
+<section class="grid"><h2>Реестр ({len(orders)})</h2>{rows or '<p class="muted">Пока пусто.</p>'}</section>
+<section>
+<h2>Новый приказ</h2>
+<form method="post" action="/production/orders/new" enctype="multipart/form-data">
+<input type="text" name="number" id="orderNumber" placeholder="Номер (например: 20-ПСМ/2026)" value="{_pf_number}" required>
+<label>Дата: <input type="date" name="order_date" id="orderDate" value="{_pf_date}" required></label>
+<input type="text" name="topic" id="orderTopic" placeholder="Тема приказа" value="{html.escape(_pf_topic)}" required>
+<label>Раздел: <select name="category">{category_options}</select></label>
+<textarea name="note" placeholder="Примечание (необязательно)" rows="2"></textarea>
+<label>Скан приказа (PDF/фото):</label>
+<input type="file" name="scan_file" id="orderScanFile" accept="application/pdf,image/*,.doc,.docx" style="display:block;width:100%;margin:8px 0;padding:10px;border:1px solid #d9dde3;border-radius:8px;background:#fff;font-size:16px">
+<p class="muted" style="margin:0 0 10px">Имя файла вида Prikaz_20-ПСМ2026_Тема_01-06-2026 —
+поля заполнятся сами при выборе файла.</p>
+<button type="submit">Добавить в реестр</button>
+</form>
+</section>
+<p><a class="btn secondary" href="/production">← Производство</a></p>
+<script>
+(function(){{
+  var input = document.getElementById('orderScanFile');
+  if (!input) return;
+  // Известные темы по короткому обозначению в имени файла — расширять по мере
+  // появления новых приказов с другими темами.
+  var topicMap = {{
+    'OT-zhurnaly-naryady': 'О порядке ведения журналов инструктажей по охране труда и учёта нарядов-допусков',
+    'zhurnaly-naryady': 'О порядке ведения журналов инструктажей по охране труда и учёта нарядов-допусков'
+  }};
+  var customerMap = {{'PSM': 'ПСМ'}};
+  input.addEventListener('change', function(e){{
+    var f = e.target.files && e.target.files[0];
+    if (!f) return;
+    var name = f.name.replace(/\\.[^.]+$/, '');
+    // Формат: Prikaz_{{номер}}-{{заказчик}}{{год}}_{{тема}}_{{дд}}-{{мм}}-{{гггг}}
+    var m = name.match(/^Prikaz_(\\d+)-([A-Za-zА-Яа-я]+)(\\d{{4}})_(.+)_(\\d{{2}})-(\\d{{2}})-(\\d{{4}})$/);
+    if (!m) return;  // имя не по формату — не мешаем ручному вводу
+    var num = m[1], customerRaw = m[2].toUpperCase(), year = m[3];
+    var topicSlug = m[4], dd = m[5], mm = m[6], yyyy = m[7];
+    var customerRu = customerMap[customerRaw] || customerRaw;
+    document.getElementById('orderNumber').value = num + '-' + customerRu + '/' + year;
+    document.getElementById('orderDate').value = yyyy + '-' + mm + '-' + dd;
+    document.getElementById('orderTopic').value = topicMap[topicSlug] || topicSlug.replace(/-/g, ' ');
+  }});
+}})();
+</script>
+"""
+    return _render("Приказы", body, active="production", role=request.session.get("role", ""))
+
+
+@app.post("/production/orders/new")
+async def order_create(
+    request: Request,
+    number: str = Form(...),
+    order_date: str = Form(...),
+    topic: str = Form(...),
+    category: str = Form(OrderCategory.OTHER.value),
+    note: str = Form(""),
+    scan_file: UploadFile = File(None),
+    db: Session = Depends(get_db),
+):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    order = prod.create_order(
+        db, number, datetime.strptime(order_date, "%Y-%m-%d").date(), topic,
+        category=OrderCategory(category), note=note or None,
+    )
+    if scan_file is not None and scan_file.filename:
+        from s3_storage import _s3_upload, _scan_key
+        scan_type = f"order_{order.id}"
+        content = await scan_file.read()
+        content_type = scan_file.content_type or "application/octet-stream"
+        try:
+            _s3_upload(scan_type, None, content, content_type)
+            prod.set_order_scan_key(db, order.id, _scan_key(scan_type, None))
+        except RuntimeError as e:
+            log.warning("order_create: загрузка скана не удалась: %s", e)
+    return RedirectResponse("/production/orders", status_code=303)
+
+
+@app.get("/production/orders/{order_id}/download")
+def order_download(order_id: str, request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    order = db.get(InternalOrder, order_id)
+    if order is None or not order.scan_key:
+        raise HTTPException(404, "Скан не найден.")
+    from s3_storage import _s3_download
+    scan_type = f"order_{order.id}"
+    try:
+        data, ct = _s3_download(scan_type, None)
+    except RuntimeError as e:
+        raise HTTPException(404, str(e))
+    ext = "pdf" if "pdf" in ct else ("jpg" if "jpeg" in ct or "jpg" in ct else "bin")
+    fn = f"Приказ_{order.number.replace('/', '-')}.{ext}"
+    return Response(content=data, media_type=ct,
+                    headers={"Content-Disposition": _content_disposition(fn)})
+
+
+# --- Бригады (2026-07) ---------------------------------------------------------
+
+@app.get("/production/brigades", response_class=HTMLResponse)
+def brigades_page(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    brigades = prod.get_brigades(db)
+    employees = db.scalars(
+        select(Employee).where(Employee.contract_end_date.is_(None)).order_by(Employee.full_name)
+    ).all()
+    emp_checkboxes = "".join(
+        f'<label style="display:block;margin:2px 0"><input type="checkbox" name="member_ids" '
+        f'value="{e.id}"> {e.full_name}</label>'
+        for e in employees
+    )
+
+    def brigade_row(b) -> str:
+        member_ids = set(prod.get_brigade_member_ids(db, b.id))
+        names = [e.full_name for e in employees if e.id in member_ids]
+        return (
+            f'<div class="card">{b.name}<br>'
+            f'<span class="muted">{", ".join(names) or "пусто"}</span><br>'
+            f'<form method="post" action="/production/brigades/{b.id}/delete" style="display:inline"'
+            f' onsubmit="return confirm(\'Удалить бригаду?\')">'
+            f'<button type="submit" class="btn secondary">Удалить</button></form></div>'
+        )
+
+    rows = "".join(brigade_row(b) for b in brigades)
+    body = f"""
+<h1>👷 Бригады</h1>
+<section class="grid"><h2>Сохранённые ({len(brigades)})</h2>{rows or '<p class="muted">Пока нет ни одной.</p>'}</section>
+<section>
+<h2>Новая бригада</h2>
+<form method="post" action="/production/brigades/new">
+<input type="text" name="name" placeholder="Название (например: Бригада бетонщиков №1)" required>
+<fieldset><legend>Состав</legend>{emp_checkboxes}</fieldset>
+<button type="submit">Сохранить</button>
+</form>
+</section>
+<p><a class="btn secondary" href="/production">← Производство</a></p>
+"""
+    return _render("Бригады", body, active="production", role=request.session.get("role", ""))
+
+
+@app.post("/production/brigades/new")
+def brigade_create(
+    request: Request, name: str = Form(...),
+    member_ids: list[str] = Form(default=[]), db: Session = Depends(get_db),
+):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    prod.create_brigade(db, name, member_ids)
+    return RedirectResponse("/production/brigades", status_code=303)
+
+
+@app.post("/production/brigades/{brigade_id}/delete")
+def brigade_delete(brigade_id: str, request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    prod.delete_brigade(db, brigade_id)
+    return RedirectResponse("/production/brigades", status_code=303)
+
+
+# --- Сотрудники: список + единая карточка ------------------------------------
+
+@app.get("/employees", response_class=HTMLResponse)
+def employees_list(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    today = datetime.now(MSK).date()
+    # 2026-07: исключены уволенные (contract_end_date заполнен) — для них уже есть
+    # отдельный /archive; раньше показывались в обоих местах одновременно.
+    employees = db.scalars(
+        select(Employee).where(Employee.contract_end_date.is_(None))
+        .order_by(Employee.full_name)
+    ).all()
+
+    def nearest_pending(e: Employee):
+        obs = [o for o in e.obligations if o.is_current and o.status == ObligationStatus.PENDING]
+        return min(obs, key=lambda o: o.deadline_date) if obs else None
+
+    # Медстатусы для чипа в списке: одним запросом все Referral (последний на работника).
+    from models import Referral as _Ref, ExamStatus as _ES
+    _all_refs = db.scalars(select(_Ref).order_by(_Ref.referral_date.desc())).all()
+    _ref_by_emp = {}
+    for _r in _all_refs:
+        _ref_by_emp.setdefault(_r.employee_id, _r)  # первый = самый свежий (order desc)
+
+    def _med_chip(e: Employee) -> str:
+        """Краткий чип статуса медкомиссии для списка. Пусто, если работник ещё не прибыл."""
+        r = _ref_by_emp.get(e.id)
+        if r is None:
+            if e.entry_date and (today - e.entry_date).days >= 5:
+                return '<span class="badge amber">мед: пора направление</span>'
+            return ''
+        if r.exam_status == _ES.COMPLETED:
+            return '<span class="badge green">мед: пройдена</span>'
+        _md = (today - r.referral_date).days
+        if _md > 14:
+            return '<span class="badge red">мед: справка просрочена</span>'
+        if _md >= 10:
+            return '<span class="badge amber">мед: ждём справку</span>'
+        return '<span class="badge neutral">мед: направлен</span>'
+
+    def row(e: Employee) -> str:
+        cit = e.citizenship or "—"
+        # Ожидающие прибытия (без даты въезда): обязательства по въезду не создаются,
+        # поэтому чип нейтральный "ожидает прибытия", а не "в норме" (которое врёт — человека
+        # ещё нет). Дедлайны появятся, когда в карточку впишут дату въезда.
+        if e.entry_date is None:
+            chip = '<span class="badge neutral">ожидает прибытия</span>'
+            ob_line = '<div class="muted-line">дата въезда не указана — дедлайны не идут</div>'
+        elif e.consent_status != ConsentStatus.CONFIRMED:
+            chip = '<span class="badge neutral">без согласия</span>'
+            ob_line = '<div class="muted-line">обязанности создаются после согласия</div>'
+        else:
+            o = nearest_pending(e)
+            if o is None:
+                chip = '<span class="badge green">в норме</span>'
+                ob_line = '<div class="muted-line">нет активных сроков</div>'
+            else:
+                cls, lbl, _ = _obligation_status(o, today)
+                type_label = OBLIGATION_LABELS.get(o.type, o.type.value)
+                chip = f'<span class="badge {cls}">{lbl}</span>'
+                ob_line = (
+                    f'<div class="muted-line">{type_label} · '
+                    f'до {o.deadline_date.strftime("%d.%m.%Y")}</div>'
+                )
+        # data-search: ФИО + табельный в нижнем регистре — по нему фильтрует JS-поиск.
+        _search_key = f"{e.full_name or ''} {e.tab_number or ''}".lower()
+        return (
+            f'<div class="card emp-row" data-search="{html.escape(_search_key, quote=True)}">{e.full_name} {chip} {_med_chip(e)}<br>'
+            f'<span class="muted-line">{cit}</span>{ob_line}'
+            f'<a class="btn" href="/employees/{e.id}">Открыть карточку</a></div>'
+        )
+
+    # Уволенные (contract_end_date заполнен) -> в архив, из основного списка убираем.
+    working = [e for e in employees if e.contract_end_date is None]
+    active = [e for e in working if e.entry_date is not None]
+    awaiting = [e for e in working if e.entry_date is None]
+    archived_count = sum(1 for e in employees if e.contract_end_date is not None)
+
+    active_rows = "".join(row(e) for e in active) or '<p class="muted">Нет активных сотрудников.</p>'
+    active_section = (
+        f'<section class="grid"><h2>Активные ({len(active)})</h2>{active_rows}</section>'
+    )
+
+    awaiting_section = ""
+    if awaiting:
+        awaiting_rows = "".join(row(e) for e in awaiting)
+        awaiting_section = (
+            f'<section class="grid"><h2>Ожидают прибытия ({len(awaiting)})</h2>{awaiting_rows}</section>'
+        )
+
+    _search_box = (
+        '<input type="text" id="empSearch" placeholder="Поиск по ФИО или табельному номеру…" '
+        'oninput="_filterEmployees()" '
+        'style="width:100%;font-size:16px;padding:12px 14px;margin:8px 0 4px;border:1px solid #b8c0cc;'
+        'border-radius:12px;background:#fff">'
+        '<p class="muted" id="empSearchEmpty" style="display:none">Никого не найдено.</p>'
+    )
+    _search_js = """
+<script>
+function _filterEmployees(){
+  var q = (document.getElementById('empSearch').value || '').toLowerCase().trim();
+  var rows = document.querySelectorAll('.emp-row');
+  var shown = 0;
+  rows.forEach(function(r){
+    var key = r.getAttribute('data-search') || '';
+    var match = q === '' || key.indexOf(q) !== -1;
+    r.style.display = match ? '' : 'none';
+    if(match) shown++;
+  });
+  var empty = document.getElementById('empSearchEmpty');
+  if(empty) empty.style.display = (shown === 0 && q !== '') ? 'block' : 'none';
+  // скрыть заголовки секций, если в них никого не осталось
+  document.querySelectorAll('.grid').forEach(function(sec){
+    var vis = sec.querySelectorAll('.emp-row:not([style*="display: none"])').length;
+    sec.style.display = (q !== '' && vis === 0) ? 'none' : '';
+  });
+}
+</script>"""
+    _archive_link = (
+        f'<a class="btn secondary" href="/archive">Архив уволенных ({archived_count})</a>'
+        if archived_count else ''
+    )
+    return _render(
+        "Сотрудники",
+        f'<h1>Сотрудники ({len(working)})</h1>'
+        f'<p><a class="btn" href="/employees/new">+ Добавить сотрудника</a> {_archive_link}</p>'
+        f'{_search_box}'
+        f'{active_section}{awaiting_section}'
+        f'{_search_js}',
+        active="employees",
+        role=request.session.get("role", ""),
+    )
+
+
+@app.get("/archive", response_class=HTMLResponse)
+def employees_archive(request: Request, db: Session = Depends(get_db)):
+    """Архив уволенных сотрудников (contract_end_date заполнен). Их обязательства (уведомление
+    об убытии и пр.) остаются в задачах/дашборде — здесь только список для истории/справок."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    archived = db.scalars(
+        select(Employee).where(Employee.contract_end_date.is_not(None))
+        .order_by(Employee.full_name)
+    ).all()
+    if not archived:
+        body = ('<h1>Архив уволенных</h1>'
+                '<p class="muted">Уволенных сотрудников нет.</p>'
+                '<p><a class="btn secondary" href="/employees">← К сотрудникам</a></p>')
+        return _render("Архив", body, active="employees", role=request.session.get("role", ""))
+    rows = ""
+    for e in archived:
+        _end = e.contract_end_date.isoformat() if e.contract_end_date else "—"
+        rows += (
+            f'<div class="card"><b>{html.escape(e.full_name)}</b><br>'
+            f'<span class="muted">уволен: {_end}</span><br>'
+            f'<a class="btn secondary" href="/employees/{e.id}">Открыть карточку</a></div>'
+        )
+    body = (
+        f'<h1>Архив уволенных ({len(archived)})</h1>'
+        f'<p><a class="btn secondary" href="/employees">← К действующим сотрудникам</a></p>'
+        f'<section class="grid">{rows}</section>'
+    )
+    return _render("Архив", body, active="employees", role=request.session.get("role", ""))
+
+
+# --- Создание нового сотрудника ---------------------------------------------
+# Гражданство выбирается из стран ЕАЭС; категория ВЫВОДИТСЯ из него (не отдельное поле),
+# чтобы исключить рассинхрон "Казахстан + BELARUS". Беларусь -> BELARUS, остальные -> EAEU.
+CITIZENSHIP_OPTIONS = ["Казахстан", "Киргизия", "Армения", "Беларусь"]
+from common_utils import (
+    CITIZENSHIP_TO_CATEGORY,
+    category_for_citizenship as _category_for_citizenship,
+)
+# Вынесено в common_utils.py — используется и здесь, и в bot.py (там раньше была
+# другая, неверная проверка на английское "belarus" вместо русского "Беларусь" —
+# несовпадение обнаружилось только при выносе в общий модуль).
+
+
+def _new_employee_form_html(values: dict, error: str = "") -> str:
+    v = values
+    cit_sel = v.get("citizenship", "Казахстан")
+    opts = "".join(
+        f'<option value="{c}"{" selected" if c == cit_sel else ""}>{c}</option>'
+        for c in CITIZENSHIP_OPTIONS
+    )
+    err = f'<div class="warning-banner">Заполни обязательные поля: {html.escape(error)}</div>' if error else ""
+    ocr_note = ""
+    if v.get("_ocr_filled"):
+        ocr_note = ('<div style="margin:12px 0;padding:12px;border:1px solid #e0a800;border-radius:8px;'
+                    'background:#fff8e1;color:#7a5c00">⚠ Поля предзаполнены распознаванием (ТЕСТ). '
+                    'ОБЯЗАТЕЛЬНО проверьте, особенно ФИО — сверьте с кириллицей на лицевой стороне '
+                    'удостоверения (транслит может отличаться от официального написания).</div>')
+    return f"""
+<h1>Новый сотрудник</h1>
+<section class="card-form">
+{err}
+<fieldset>
+<legend>⚡ Распознать из фото удостоверения (ТЕСТ)</legend>
+<p class="muted">Фото стороной с MRZ (3 строки латиницей внизу). Поля заполнятся распознанными
+данными — проверьте их. Тестовая функция.</p>
+<form method="post" action="/employees/new/ocr" enctype="multipart/form-data">
+<input type="file" name="photo" accept="image/*" required style="display:block;width:100%;margin:8px 0;padding:10px;border:1px solid #d9dde3;border-radius:8px;background:#fff;font-size:16px">
+<button type="submit" class="secondary btn-full">Распознать и заполнить</button>
+</form>
+</fieldset>
+{ocr_note}
+<form method="post" action="/employees/new">
+
+<fieldset>
+<legend>ФИО (обязательно)</legend>
+<input type="text" name="full_name" value="{html.escape(v.get('full_name',''))}">
+</fieldset>
+
+<fieldset>
+<legend>Гражданство (обязательно)</legend>
+<select name="citizenship">{opts}</select>
+<p class="muted">Категория учёта определяется автоматически: Беларусь — 90 дней, остальные ЕАЭС — 30.</p>
+</fieldset>
+
+<fieldset>
+<legend>Дата рождения (обязательно)</legend>
+<input type="date" name="birth_date" max="{datetime.now(MSK).date().isoformat()}" value="{html.escape(v.get('birth_date',''))}">
+</fieldset>
+
+<fieldset>
+<legend>Паспорт (обязательно)</legend>
+<label>Серия</label>
+<input type="text" name="passport_series" value="{html.escape(v.get('passport_series','ID'))}">
+<label>Номер</label>
+<input type="text" name="passport_number" value="{html.escape(v.get('passport_number',''))}">
+<p class="muted">Для нац. удостоверения РК серия «ID». Для загранпаспорта — впиши свою серию.</p>
+</fieldset>
+
+<fieldset>
+<legend>ИИН (необязательно)</legend>
+<input type="text" name="iin" value="{html.escape(v.get('iin',''))}" placeholder="12 цифр">
+<p class="muted">Индивидуальный идентификационный номер (Казахстан). Можно распознать из фото.</p>
+</fieldset>
+<input type="hidden" name="doc_type" value="{html.escape(v.get('doc_type',''))}">
+
+<fieldset>
+<legend>Дата въезда (необязательно)</legend>
+<input type="date" name="entry_date" max="{datetime.now(MSK).date().isoformat()}" value="{html.escape(v.get('entry_date',''))}">
+<p class="muted">Пусто — если сотрудник ещё не прибыл. Дедлайны начнут считаться после ввода даты въезда.</p>
+</fieldset>
+
+<fieldset>
+<legend>Дата договора (необязательно)</legend>
+<input type="date" name="contract_date" max="{datetime.now(MSK).date().isoformat()}" value="{html.escape(v.get('contract_date',''))}">
+</fieldset>
+
+<fieldset>
+<legend>Телефон (необязательно)</legend>
+<input type="text" name="phone" value="{html.escape(v.get('phone',''))}">
+</fieldset>
+
+<button type="submit">Создать</button>
+</form>
+<p class="muted">Адрес пребывания проставится автоматически (адрес площадки). Согласие на обработку ПД
+подтверждается отдельно в карточке — до этого обязательства не создаются.</p>
+<a class="btn secondary" href="/employees">← Ко всем сотрудникам</a>
+</section>"""
+
+
+@app.get("/employees/new", response_class=HTMLResponse)
+def employee_new_form(request: Request):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    return _render("Новый сотрудник", _new_employee_form_html({}), active="employees", role=request.session.get("role",""))
+
+
+@app.post("/employees/new/ocr", response_class=HTMLResponse)
+async def employee_new_ocr(request: Request, photo: UploadFile = File(...),
+                           db: Session = Depends(get_db)):
+    """ТЕСТ: распознаёт удостоверение и перерисовывает форму создания с предзаполненными полями
+    (ФИО-транслит черновик, дата рождения, номер паспорта, ИИН, гражданство). Ничего не сохраняет
+    — только заполняет форму для проверки кадровиком."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    data = await photo.read()
+    if not data:
+        return HTMLResponse(_render("Новый сотрудник",
+            _new_employee_form_html({}, "пустой файл фото"), active="employees",
+            role=request.session.get("role", "")))
+    ocr = _ocr_id_card(data)
+    if not ocr:
+        vals = {"_ocr_failed": True}
+        note = ("Не удалось распознать MRZ (нужна библиотека passporteye и tesseract, либо фото "
+                "нечёткое/не та сторона). Заполните форму вручную.")
+        return HTMLResponse(_render("Новый сотрудник",
+            _new_employee_form_html(vals, note), active="employees",
+            role=request.session.get("role", "")))
+    _dtype = ocr.get("doc_type", "id")
+    # Серия: для удостоверения (id) — "ID"; для загранпаспорта — обычно нет отдельной серии,
+    # весь номер в поле «номер», серию оставляем пустой (кадровик уточнит).
+    _series = "ID" if _dtype == "id" else ""
+    values = {
+        "full_name": ocr.get("full_name_translit", ""),
+        "citizenship": ocr.get("citizenship") if ocr.get("citizenship") in CITIZENSHIP_OPTIONS else "Казахстан",
+        "birth_date": ocr.get("birth_date", ""),
+        "passport_series": _series,
+        "passport_number": ocr.get("passport_number", ""),
+        "iin": ocr.get("iin", ""),
+        "doc_type": _dtype,
+        "_ocr_filled": True,
+    }
+    return HTMLResponse(_render("Новый сотрудник", _new_employee_form_html(values),
+        active="employees", role=request.session.get("role", "")))
+
+
+@app.post("/employees/new")
+def employee_create(
+    request: Request,
+    full_name: str = Form(""),
+    citizenship: str = Form("Казахстан"),
+    birth_date: str = Form(""),
+    passport_series: str = Form("ID"),
+    passport_number: str = Form(""),
+    iin: str = Form(""),
+    doc_type: str = Form(""),
+    entry_date: str = Form(""),
+    contract_date: str = Form(""),
+    phone: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+
+    values = {
+        "full_name": full_name, "citizenship": citizenship, "birth_date": birth_date,
+        "passport_series": passport_series, "passport_number": passport_number, "iin": iin,
+        "entry_date": entry_date, "contract_date": contract_date, "phone": phone,
+    }
+
+    def _pdate(s):
+        s = (s or "").strip()
+        return date.fromisoformat(s) if s else None
+
+    errors = []
+    fn = full_name.strip()
+    if not fn:
+        errors.append("ФИО")
+    cit = citizenship.strip()
+    if cit not in CITIZENSHIP_OPTIONS:
+        errors.append("гражданство")
+    try:
+        bd = _pdate(birth_date)
+    except ValueError:
+        bd = None
+    if bd is None:
+        errors.append("дата рождения")
+    ps = passport_series.strip()
+    if not ps:
+        errors.append("серия паспорта")
+    pn = passport_number.strip()
+    if not pn:
+        errors.append("номер паспорта")
+
+    # необязательные даты: если введены с ошибкой формата — тоже ошибка
+    ed = cd = None
+    for label, raw, setter in (("дата въезда", entry_date, "ed"), ("дата договора", contract_date, "cd")):
+        try:
+            val = _pdate(raw)
+        except ValueError:
+            errors.append(f"{label} (неверный формат)")
+            val = None
+        if setter == "ed":
+            ed = val
+        else:
+            cd = val
+
+    if errors:
+        return HTMLResponse(_render("Новый сотрудник", _new_employee_form_html(values, ", ".join(errors)), active="employees", role=request.session.get("role","")))
+
+    emp = Employee(
+        full_name=fn,
+        citizenship=cit,
+        category=_category_for_citizenship(cit),
+        birth_date=bd,
+        passport_series=ps,
+        passport_number=pn,
+        iin=(iin.strip() or None),
+        doc_type=(doc_type.strip() or None),
+        entry_date=ed,
+        contract_date=cd,
+        phone=(phone.strip() or None),
+        address=SITE_ADDRESS,          # адрес площадки по умолчанию
+        # address_since НЕ ставим: первый адрес, не переезд — обязательство регистрации не плодим
+        consent_status=ConsentStatus.DRAFT,  # согласие отдельно; до него obligations не создаются
+        created_by=_actor_name(request, db),
+        language="ru",
+    )
+    db.add(emp)
+    db.commit()
+    db.refresh(emp)
+    return RedirectResponse(f"/employees/{emp.id}", status_code=303)
+
+
+def _help(text: str) -> str:
+    """Значок-подсказка (i) с раскрытием по тапу. Надёжно на мобильном (нативный <details>,
+    без JS и без title, который на телефоне не показывается)."""
+    return (
+        '<details class="field-help"><summary><span class="i">i</span> подсказка</summary>'
+        f'<p>{html.escape(text)}</p></details>'
+    )
+
+
+@app.get("/employees/{employee_id}", response_class=HTMLResponse)
+def employee_card(employee_id: str, request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    _warn_banner = ""
+    if request.query_params.get("warn") == "payment":
+        _warn_banner = (
+            '<div style="margin:12px 0;padding:12px;border:1px solid #e0a800;border-radius:8px;'
+            'background:#fff8e1;color:#7a5c00">⚠ Платёжка помечена «требует проверки»: не совпала '
+            'фамилия работника и/или сумма (возможно, платёжка не на ту госпошлину). Проверьте '
+            'вручную и подтвердите в блоке платёжки (или текст не распознан, если это скан).</div>'
+        )
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    today_s = datetime.now(MSK).date().isoformat()
+
+    # Плательщик госпошлины, запомненный на сессию (prefill поля). Экранируем — уходит в HTML-атрибут.
+    _last_payer = html.escape(request.session.get("last_payer", ""), quote=True)
+
+
+    # Роль: прораб — только чтение и скачивание, формы записи ему не показываем (сервер их
+    # тоже режет 403, но кнопки-впустую путают). can_write = не прораб.
+    _cu = _current_user(request, db)
+    can_write = bool(_cu and _cu.role != UserRole.PRORAB)
+
+    # Блок обязательств и сроков в карточке: показывает активные (с кнопкой «Отметить поданным»
+    # для тех, что подаются вовне — ЕФС-1, уведомление МВД, регистрация) и выполненные
+    # (с датой/автором отметки и кнопкой отмены). Только для пишущих (кадровик/админ).
+    _obligations_section = ""
+    if can_write:
+        # Медосмотр и дактилоскопия исключены — они в объединённой зоне «Медкомиссия и
+        # дактилоскопия» выше (со своим закрытием: скан справки / дата). Здесь — остальные.
+        _obs = sorted(
+            [o for o in emp.obligations if o.is_current
+             and o.type not in (ObligationType.MEDICAL_EXAM, ObligationType.DACTYLOSCOPY)],
+            key=lambda o: (o.status == ObligationStatus.DONE, o.deadline_date),
+        )
+        if _obs:
+            _ob_rows = ""
+            for _o in _obs:
+                _olabel = OBLIGATION_LABELS.get(_o.type, _o.type.value)
+                _dl = _o.deadline_date.strftime("%d.%m.%Y")
+                if _o.status == ObligationStatus.DONE:
+                    _who = html.escape(_o.done_by or "—")
+                    _when = _o.done_date.strftime("%d.%m.%Y") if _o.done_date else "—"
+                    _ob_rows += f'''<div style="margin:8px 0;padding:10px;border:1px solid #e6e9ee;border-radius:8px;background:#f6faf7">
+<b>{_olabel}</b> — <span style="color:#1a7f37">выполнено ✓</span><br>
+<span class="muted">отмечено {_when}, {_who}. Срок был до {_dl}.</span>
+<form method="post" action="/employees/{emp.id}/obligation/reopen" style="margin-top:6px"
+onsubmit="return confirm(&#39;Вернуть обязательство в работу?&#39;)">
+<input type="hidden" name="obligation_id" value="{_o.id}">
+<button type="submit" class="secondary">Отменить отметку</button></form>
+</div>'''
+                elif _o.status == ObligationStatus.CANCELLED:
+                    _ob_rows += f'''<div style="margin:8px 0;padding:10px;border:1px solid #e6e9ee;border-radius:8px;background:#f5f5f5">
+<b>{_olabel}</b> — <span class="muted">снято при увольнении</span><br>
+<span class="muted">Работник уволен/убыл, обязательство неактуально. Срок был до {_dl}.</span>
+</div>'''
+                else:
+                    _overdue = _o.status == ObligationStatus.OVERDUE
+                    _mark = "🔴 просрочено" if _overdue else "🟡 в работе"
+                    # Связь с СНИЛС: для ЕФС-1 нужен СНИЛС. Не блокируем (срок ЕФС-1 жёсткий),
+                    # но предупреждаем, если СНИЛС нет — форму подать в срок, потом корректировку.
+                    _snils_warn = ""
+                    if _o.type == ObligationType.EFS1_REPORT and not emp.snils:
+                        if emp.snils_appointment_date:
+                            _snils_warn = ('<br><span style="color:#c47f00;font-size:13px">⚠ СНИЛС оформляется '
+                                           '(запись в СФР ' + emp.snils_appointment_date.strftime("%d.%m.%Y")
+                                           + '). Подайте ЕФС-1 в срок, при получении СНИЛС — корректировку.</span>')
+                        else:
+                            _snils_warn = ('<br><span style="color:#b00;font-size:13px">⚠ СНИЛС отсутствует '
+                                           '(нужен для ЕФС-1). Оформите запись в СФР в блоке «СНИЛС». '
+                                           'ЕФС-1 подайте в срок, потом корректировку.</span>')
+                    _ob_rows += f'''<div style="margin:8px 0;padding:10px;border:1px solid #e6e9ee;border-radius:8px">
+<b>{_olabel}</b> — {_mark}, срок до {_dl}{_snils_warn}
+<form method="post" action="/employees/{emp.id}/obligation/mark_done" style="margin-top:6px">
+<input type="hidden" name="obligation_id" value="{_o.id}">
+<button type="submit" class="btn-full">Отметить поданным</button></form>
+</div>'''
+            _obligations_section = f'''
+<fieldset>
+<legend>Обязательства и сроки</legend>
+<p class="muted">Отметьте «поданным» то, что уже подали в ведомство (ЕФС-1 в СФР, уведомление
+МВД, постановка на учёт). Отметка фиксирует дату и кто отметил. Обязательства с собственным
+закрытием (медосмотр — результатом, дактилоскопия — датой) закрываются в своих блоках.</p>
+{_ob_rows}
+</fieldset>'''
+
+    # Секция сканов для пакета Госуслуг — только для пишущих (кадровик/админ), паспортные
+    # данные прорабу недоступны. Показывает, какие сканы загружены, даёт загрузить/скачать/удалить.
+    _scans_section = ""
+    # Прораб: только просмотр и скачивание сканов работника (без загрузки/удаления/пакета).
+    if _cu and _cu.role == UserRole.PRORAB:
+        _pr_present = _s3_list_for_employee(emp.id)
+        _pr_rows = ""
+        for _st, _label in SCAN_TYPES.items():
+            if _st == "medical_certificate":
+                continue  # справка — в объединённой зоне
+            _info = _pr_present.get(_st) or {}
+            if not _info.get("present"):
+                continue
+            _pr_rows += (
+                '<div style="margin:12px 0;padding:12px;border:1px solid #e6e9ee;border-radius:8px">'
+                f'<b>{_label}</b> — <span style="color:#1a7f37">загружен ✓</span>'
+                '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">'
+                f'<a href="/employees/{emp.id}/scan/view?scan_type={_st}" target="_blank" class="btn secondary" style="display:inline-block">Просмотр</a>'
+                f'<form method="post" action="/employees/{emp.id}/scan/download" style="display:inline">'
+                f'<input type="hidden" name="scan_type" value="{_st}">'
+                '<button type="submit" class="secondary">Скачать</button></form>'
+                '</div></div>'
+            )
+        if not _pr_rows:
+            _pr_rows = '<p class="muted">Документы ещё не загружены.</p>'
+        _scans_section = (
+            '<fieldset id="scans-section">'
+            '<legend>Документы работника</legend>'
+            '<p class="muted">Просмотр и скачивание загруженных сканов.</p>'
+            '<div class="scans-grid">'
+            + _pr_rows +
+            '</div></fieldset>'
+        )
+    if can_write:
+        # Считаем наличие сканов ОДИН раз (персональные + общие) и переиспользуем ниже и в
+        # _package_missing — иначе S3 опрашивается дважды за рендер карточки (было медленно).
+        _present = _s3_list_for_employee(emp.id)
+        _common_present = _s3_list_common()
+        _rows = ""
+        for _st, _label in SCAN_TYPES.items():
+            # Справка медкомиссии грузится в объединённой зоне «Медкомиссия и дактилоскопия»,
+            # в общей секции сканов не дублируем (остаётся обязательной для пакета — см. _package_missing).
+            if _st == "medical_certificate":
+                continue
+            _info = _present.get(_st) or {}
+            _has = bool(_info.get("present"))
+            _check = bool(_info.get("check"))
+            _status = ('<span style="display:inline-block;padding:2px 10px;border-radius:12px;background:#e3f5e9;color:#1a7f37;font-weight:600;font-size:14px">✓ загружен</span>' if _has else '<span style="display:inline-block;padding:2px 10px;border-radius:12px;background:#f0f1f3;color:#889;font-size:14px">нет</span>')
+            # Скан помечен «требует проверки» (косячная платёжка: фамилия/сумма не сошлись).
+            _check_row = ""
+            if _has and _check:
+                _check_row = f'''<div style="margin-top:8px;padding:8px;border:1px solid #e0a800;border-radius:8px;background:#fff8e1;color:#7a5c00">
+⚠ Требует проверки: фамилия или сумма в платёжке не совпали. Проверьте вручную и подтвердите.
+<form method="post" action="/employees/{emp.id}/scan/confirm" style="margin-top:6px">
+<input type="hidden" name="scan_type" value="{_st}">
+<button type="submit" class="secondary">Подтвердить (снять метку)</button></form>
+</div>'''
+            _actions = ""
+            if _has:
+                _actions = f'''<a href="/employees/{emp.id}/scan/view?scan_type={_st}" target="_blank" class="btn secondary" style="display:inline-block">Просмотр</a>
+<form method="post" action="/employees/{emp.id}/scan/download" style="display:inline">
+<input type="hidden" name="scan_type" value="{_st}">
+<button type="submit" class="secondary">Скачать</button></form>
+<form method="post" action="/employees/{emp.id}/scan/delete" style="display:inline"
+onsubmit="return confirm(&#39;Удалить скан?&#39;)">
+<input type="hidden" name="scan_type" value="{_st}">
+<button type="submit" class="secondary">Удалить</button></form>'''
+            _border = "#e0a800" if (_has and _check) else "#e6e9ee"
+            _rows += f'''<div style="margin:12px 0;padding:12px;border:1px solid {_border};border-radius:8px">
+<b>{_label}</b> — {_status}
+{_check_row}
+<form method="post" action="/employees/{emp.id}/scan/upload" enctype="multipart/form-data" style="margin-top:8px">
+<input type="hidden" name="scan_type" value="{_st}">
+<input type="file" name="files" accept="application/pdf,image/*" multiple required style="display:block;width:100%;margin:8px 0;padding:10px;border:1px solid #d9dde3;border-radius:8px;background:#fff;font-size:16px">
+<p class="muted" style="margin:4px 0 0;font-size:13px">Можно выбрать несколько файлов сразу (напр. 2 фото удостоверения — лицевая и оборотная) — склеятся в один PDF.</p>
+<button type="submit" class="btn-full btn-upload">Загрузить</button></form>
+<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">{_actions}</div>
+</div>'''
+        # Проверка комплектности пакета: если чего-то нет — показываем список, кнопку выгрузки
+        # не даём (пакет не должен выходить дырявым и уходить на Госуслуги с отказом).
+        _missing = _package_missing(emp, present=_present, common=_common_present)
+        if _missing:
+            _pkg_block = ('<p class="muted">Пакет пока неполный. Не хватает:</p><ul>'
+                          + "".join(f"<li>{html.escape(_m)}</li>" for _m in _missing)
+                          + "</ul><p class=\"muted\">Догрузите недостающее (общие документы — на "
+                          '<a href="/common-docs">странице общих документов</a>).</p>')
+        else:
+            _pkg_block = f'''<p style="color:#1a7f37">Пакет полный ✓</p>
+<form method="post" action="/employees/{emp.id}/package">
+<button type="submit" class="btn-full">Выгрузить пакет (ZIP) для Госуслуг</button>
+</form>'''
+
+        # Тип документа: passport явно, или (пусто И серия не "ID") -> считаем паспортом.
+        _is_passport = (emp.doc_type == "passport") or (
+            not emp.doc_type and (emp.passport_series or "").strip().upper() != "ID"
+        )
+        _passport_pages_block = ""
+        if _is_passport:
+            _checked = "checked" if getattr(emp, "passport_all_pages", False) else ""
+            _passport_pages_block = f'''<div style="margin:12px 0;padding:12px;border:1px solid #e0a800;border-radius:8px;background:#fff8e1">
+<b>Загранпаспорт:</b> нужны сканы ВСЕХ страниц (не только разворот с фото).
+<form method="post" action="/employees/{emp.id}/passport_pages" style="margin-top:8px">
+<label style="display:flex;align-items:center;gap:8px">
+<input type="checkbox" name="all_pages" {_checked} onchange="this.form.submit()">
+Все страницы паспорта загружены
+</label></form></div>'''
+        _scans_section = f'''
+<fieldset id="scans-section">
+<legend>Пакет для Госуслуг</legend>
+<p class="muted">Персональные сканы работника: паспорт, миграционная карта, исполненная платёжка
+(подтверждение оплаты госпошлины из банка). PDF или фото, до 15 МБ. Общие документы (паспорт
+директора, основание на адрес) — на <a href="/common-docs">отдельной странице</a>.</p>
+<div class="scans-grid">
+{_rows}
+</div>
+{_passport_pages_block}
+<hr>
+{_pkg_block}
+</fieldset>'''
+
+    # Тексты справок у полей карточки (значок i с раскрытием). Коротко: что это и что делает.
+    help_entry = _help(
+        "Дата пересечения ГРАНИЦЫ РФ по миграционной карте/штампу — когда иностранец въехал в "
+        "Россию. НЕ дата переезда внутри страны (например, из Москвы в Мурманск): для переезда "
+        "есть поле «Дата, с которой действует адрес» ниже. Пример: въехал в РФ 03.04, приехал на "
+        "объект 15.06 — сюда ставится 03.04. От этой даты идут сроки: регистрация (30 дней ЕАЭС), "
+        "медосмотр, дактилоскопия. Пусто — ещё не прибыл в РФ, сроки не идут."
+    )
+    help_dact = _help(
+        "Дата прохождения дактилоскопии и фотографирования («грин карта»). Заполнение закрывает "
+        "обязанность. Пусто — обязанность горит от даты въезда + 30 дней. Изменение потребует "
+        "подтверждения (закроет обязательство)."
+    )
+    help_country = _help(
+        "Государство, из которого сотрудник въехал в РФ. Информационное поле, на сроки не влияет."
+    )
+    help_address = _help(
+        "Фактическое место пребывания в РФ (адрес объекта/общежития). «Дата, с которой действует "
+        "адрес» — день прибытия на ЭТО место (переезд внутри РФ), НЕ дата въезда в страну. Пример: "
+        "въехал в РФ 03.04, прибыл на объект в Белокаменке 15.06 — здесь 15.06. "
+        "СРОК ПОСТАНОВКИ: для граждан Казахстана (ЕАЭС) без ВНЖ и без статуса ВКС — 30 суток с "
+        "даты въезда в РФ (Договор о ЕАЭС, п.6 ст.97). При переезде в другой регион встать на "
+        "учёт по новому адресу нужно, но общий 30-дневный режим сохраняется. Правило «7 дней при "
+        "смене региона» к ним НЕ относится — оно только для ВКС и обладателей ВНЖ. Смена адреса "
+        "создаёт новое обязательство постановки; первый ввод адреса обязательство не создаёт."
+    )
+    help_contract_date = _help(
+        "Дата заключения трудового договора. Это поле (слева) сохраняется кнопкой «Сохранить» и "
+        "создаёт обязательства: уведомление МВД (3 рабочих дня) и ЕФС-1 (1 рабочий день). "
+        "Отдельная «Дата договора» справа, в блоке заключения — это дата, с которой сформируется "
+        "документ при нажатии «Заключить»; она не сохраняется сама по себе, а применяется в момент "
+        "заключения. Если нужно просто зафиксировать дату — используйте это поле слева и «Сохранить»."
+    )
+    help_contract = _help(
+        "Заключение проставит дату договора в карточку и создаст обязательства (уведомление МВД, "
+        "ЕФС-1). Скачается .docx с реквизитами ООО «ТРЕСТСТРОЙМОНТАЖ». Номер договора — из "
+        "табельного. «Кем/когда выдан паспорт» в документе — прочерк, заполняется вручную."
+    )
+    help_position = _help(
+        "Должность работника для договора. Идёт в документ как есть, не проверяется. По умолчанию "
+        "«Монтажник» — измените под конкретного работника."
+    )
+    help_salary = _help(
+        "Оклад в рублях (только оклад, без районного коэффициента — он добавляется в договоре "
+        "отдельно, 1,500). Идёт в документ как есть, не проверяется."
+    )
+    help_status = _help(
+        "Первичный учёт — сотрудник впервые встаёт на учёт в РФ: регистрация, медосмотр и "
+        "дактилоскопия считаются от даты въезда. Ранее стоял на учёте — приехал на вахту из "
+        "другого региона РФ: регистрация от прибытия (даты адреса), медосмотр и дактилоскопия "
+        "заново НЕ требуются. Пустой статус блокирует создание обязательств."
+    )
+
+    # Блок трудового договора. Предусловия: (1) задан статус учёта — от него зависят
+    # обязательства, договор без статуса заключать нельзя; (2) есть табельный номер — иначе
+    # номер договора соберётся как "БК-ПСМ-" без хвоста. Проверяем статус первым.
+    if emp.registration_status is None:
+        contract_block = (
+            '<p class="muted">Нельзя заключить договор: не задан статус миграционного учёта. '
+            'Сначала выберите статус выше — от него зависит расчёт обязательств.</p>'
+        )
+    elif not (emp.tab_number or "").strip():
+        contract_block = (
+            '<p class="muted">Нельзя заключить договор: у сотрудника нет табельного номера. '
+            'Он идёт в номер договора (' + CONTRACT_NUMBER_PREFIX + '{таб}). '
+            'Присвойте табельный номер.</p>'
+        )
+    else:
+        _contract_no = CONTRACT_NUMBER_PREFIX + emp.tab_number.strip()
+        # Кнопка отмены — только если договор уже заключён (стоит дата). Отмена откатывает
+        # contract_date и снимает НЕ выполненные обязательства от договора (МВД/ЕФС-1);
+        # выполненные (DONE) сохраняются как след исполнения.
+        # Скачать и отменить доступны только ПОСЛЕ заключения (стоит contract_date).
+        if emp.contract_date is not None:
+            # Отмена договора: админ — всегда; кадровик — только в день заключения (свежая ошибка
+            # ввода). После — только админ. cancel-роут это тоже проверяет на сервере.
+            _cancel_allowed = (_cu and _cu.role == UserRole.ADMIN) or (
+                _cu and _cu.role == UserRole.KADROVIK
+                and emp.contract_date == date.today()
+            )
+            _cancel = ""
+            if _cancel_allowed:
+                _cancel = f'''<form method="post" action="/employees/{emp.id}/labor_contract/cancel"
+onsubmit="return confirm(&#39;Отменить договор? Дата договора будет снята, а незакрытые обязательства (уведомление МВД, ЕФС-1) удалены. Выполненные останутся.&#39;)">
+<button type="submit" class="secondary btn-full">Отменить договор</button>
+</form>'''
+            elif _cu and _cu.role == UserRole.KADROVIK:
+                _cancel = '<p class="muted">Отмена договора доступна только в день заключения. Позже — обратитесь к администратору.</p>'
+
+            # Секция увольнения — только для пишущих (кадровик/админ), после заключения договора.
+            _termination = ""
+            if can_write:
+                if emp.contract_end_date is not None:
+                    _termination = f'''
+<hr>
+<p><b>Увольнение оформлено:</b> {emp.contract_end_date.strftime("%d.%m.%Y")}.</p>
+<p class="muted">Созданы обязательства: уведомление МВД о расторжении (3 раб. дня) и снятие с
+учёта / уведомление об убытии (7 раб. дней). Если дата в будущем — обязательства включатся в день увольнения.</p>
+<form method="post" action="/employees/{emp.id}/termination_notice">
+<button type="submit" class="secondary btn-full">Уведомление о расторжении — скачать</button>
+</form>
+<form method="post" action="/employees/{emp.id}/departure_notice">
+<button type="submit" class="secondary btn-full">Уведомление об убытии — скачать</button>
+</form>
+<form method="post" action="/employees/{emp.id}/termination/cancel"
+onsubmit="return confirm(&#39;Отменить оформление увольнения? Дата увольнения снимется, связанные обязательства удалятся.&#39;)">
+<button type="submit" class="secondary btn-full">Отменить увольнение</button>
+</form>'''
+                else:
+                    _termination = f'''
+<hr>
+<p><b>Увольнение / расторжение договора</b></p>
+<p class="muted">Отдельно от «Отменить договор»: отмена = договора не было (ошибка ввода);
+увольнение = работник был трудоустроён, история сохраняется. Дата не раньше даты договора.
+Будущую дату можно (обязательства включатся в день увольнения).</p>
+<form method="post" action="/employees/{emp.id}/termination">
+<label>Дата увольнения (расторжения договора)</label>
+<input type="date" name="termination_date" min="{emp.contract_date.isoformat()}" value="{today_s}">
+<label>Основание расторжения</label>
+<select name="basis" id="basis_select" onchange="_toggleBasisNote()">
+<option value="по собственному желанию">По собственному желанию</option>
+<option value="по инициативе работодателя">По инициативе работодателя</option>
+<option value="по соглашению сторон">По соглашению сторон</option>
+<option value="истечение срока договора">Истечение срока договора</option>
+<option value="иное">Иное (указать в примечании)</option>
+</select>
+<div id="basis_note_wrap" style="display:none">
+<label>Примечание к основанию</label>
+<input type="text" name="basis_note" placeholder="">
+</div>
+<button type="submit" class="btn-full">Оформить увольнение</button>
+</form>
+<script>
+function _toggleBasisNote(){{
+  var sel = document.getElementById('basis_select');
+  var wrap = document.getElementById('basis_note_wrap');
+  if (sel && wrap) wrap.style.display = (sel.value === 'иное') ? 'block' : 'none';
+}}
+_toggleBasisNote();
+</script>'''
+
+            _post = f'''
+<p class="muted">Договор заключён {emp.contract_date.strftime("%d.%m.%Y")}.</p>
+<form method="post" action="/employees/{emp.id}/labor_contract/download">
+<input type="hidden" name="position" value="Монтажник">
+<input type="hidden" name="salary" value="30000">
+<button type="submit" class="btn-full">Скачать .docx</button>
+</form>
+<form method="post" action="/employees/{emp.id}/labor_contract/download_pdf">
+<input type="hidden" name="position" value="Монтажник">
+<input type="hidden" name="salary" value="30000">
+<button type="submit" class="secondary btn-full">Скачать .pdf (для Госуслуг)</button>
+</form>
+{_cancel}
+{_termination}'''
+        else:
+            _post = ""
+        # До заключения: форма с предпросмотром и заключением. Предпросмотр (formaction preview)
+        # ничего не пишет — только показывает HTML по введённым данным. Заключение пишет дату
+        # и создаёт обязательства. Скачивание доступно только после заключения (блок _post).
+        # Форма заключения показывается ТОЛЬКО пока договор НЕ заключён. После заключения
+        # (contract_date задана) видны лишь скачивание и «Отменить договор» (блок _post) —
+        # чтобы нельзя было заключить повторно. Отмена договора вернёт форму заключения.
+        if emp.contract_date is None:
+            _conclude_form = f"""
+<p class="muted">Номер договора: {_contract_no}. Дата по умолчанию — сегодня; можно изменить.</p>
+{help_contract}
+<form method="post" action="/employees/{emp.id}/labor_contract">
+<label>Должность</label>
+<input type="text" name="position" value="Монтажник">
+{help_position}
+<label>Оклад (руб.)</label>
+<input type="text" name="salary" value="30000">
+{help_salary}
+<label>Дата договора</label>
+<input type="date" name="contract_date" max="{today_s}" value="{today_s}">
+<button type="submit" formaction="/employees/{emp.id}/labor_contract/preview" class="secondary btn-full">Предпросмотр</button>
+<button type="submit" class="btn-full">Заключить трудовой договор</button>
+</form>"""
+        else:
+            _conclude_form = ""
+        contract_block = f"""{_conclude_form}
+{_post}"""
+
+    # Секция статуса учёта. Отдельная форма со своим confirm — смена пересоздаёт
+    # обязательства по новому статусу, это не рутинное сохранение, мешать с saveform нельзя.
+    _rs = emp.registration_status
+    _rs_val = _rs.value if _rs is not None else ""
+    def _opt(v, label):
+        sel = " selected" if _rs_val == v else ""
+        return f'<option value="{v}"{sel}>{label}</option>'
+    if _rs is None:
+        _status_warn = (
+            '<p><span class="badge red">Статус учёта не задан</span></p>'
+            '<p class="muted">Пока статус не выбран, обязательства НЕ создаются '
+            '(ни регистрация, ни медосмотр, ни уведомления). Выберите статус.</p>'
+        )
+    else:
+        _status_warn = ""
+    _confirm = (
+        "return confirm(&#39;Сменить статус учёта? Обязательства будут пересозданы: "
+        "лишние незакрытые удалены, недостающие добавлены. Выполненные останутся.&#39;)"
+    )
+    _sel_empty = " selected" if _rs_val == "" else ""
+    status_block = (
+        _status_warn + help_status
+        + f'<form method="post" action="/employees/{emp.id}/registration_status" onsubmit="{_confirm}">'
+        + '<label>Статус миграционного учёта</label>'
+        + '<select name="registration_status">'
+        + f'<option value=""{_sel_empty}>— не задан —</option>'
+        + _opt("primary", "Первичный учёт (сроки от даты въезда)")
+        + _opt("prior", "Ранее стоял на учёте в РФ (сроки от прибытия на вахту)")
+        + '</select>'
+        + '<button type="submit" class="btn-full">Сохранить статус</button>'
+        + '</form>'
+    )
+
+    if emp.consent_status == ConsentStatus.CONFIRMED:
+        consent_block = '<p><span class="badge green">Согласие подтверждено</span></p>'
+    else:
+        consent_block = f"""
+<p class="muted">Подтвердить согласие кнопкой? Это тестовый способ — юридически слабее,
+чем сканированная подпись (ст.9 152-ФЗ требует осознанного согласия, клик без верификации
+личности это не подтверждает).</p>
+<form method="post" action="/employees/{emp.id}/consent_confirm">
+<button type="submit">✅ Подтвердить (кнопкой, тест)</button>
+</form>"""
+
+    # Левая колонка: пишущим — форма сохранения; прорабу — те же данные текстом (только чтение).
+    if can_write:
+        left_col = f"""
+<p class="muted">Заполни известные поля и нажми одну кнопку внизу. Пустые поля не трогаются.</p>
+<form id="saveform" method="post" action="/employees/{emp.id}/save">
+<input type="hidden" name="confirmed" value="">
+<fieldset>
+<legend>Дата въезда</legend>
+<input type="date" name="entry_date" max="{today_s}"
+value="{emp.entry_date.isoformat() if emp.entry_date else ''}">
+{help_entry}
+</fieldset>
+<fieldset>
+<legend>Место пребывания</legend>
+<p class="muted">Текущий адрес: {emp.address or "не указан"}</p>
+<label>Адрес</label>
+<input type="text" name="address" data-orig="{emp.address or ''}" value="{emp.address or ''}">
+<label>Дата, с которой действует этот адрес</label>
+<input type="date" name="address_since" max="{today_s}" value="{emp.address_since.isoformat() if emp.address_since else today_s}">
+<label>Срок регистрации до (из уведомления Госуслуг)</label>
+<input type="date" name="registration_valid_until" value="{emp.registration_valid_until.isoformat() if emp.registration_valid_until else ''}">
+<p class="muted">Дата окончания срока пребывания — та, что стоит в отрывной части уведомления
+(«срок пребывания до»). На Госуслугах даты начала нет, печатается только эта. Справочно, для
+напоминания о продлении.</p>
+{help_address}
+</fieldset>
+<fieldset>
+<legend>Дата договора</legend>
+<input type="date" name="contract_date" max="{today_s}"
+value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
+{help_contract_date}
+</fieldset>
+<fieldset>
+<legend>Должность и подразделение</legend>
+<label>Должность (профессия)</label>
+<input type="text" name="position" value="{html.escape(emp.position or '')}" placeholder="например: Бетонщик">
+<label>Подразделение</label>
+<input type="text" name="subdivision" value="{html.escape(emp.subdivision or '')}" placeholder="например: ОС">
+<p class="muted">Подставляется автоматически в журналы инструктажей (графы по ГОСТ) —
+заполнить один раз здесь, дальше не нужно вписывать вручную в каждой распечатке.</p>
+</fieldset>
+<button type="submit" class="btn-full">Сохранить</button>
+</form>"""
+    else:
+        _d = lambda v: v if v else "—"
+        left_col = f"""
+<p class="muted">Режим чтения. Изменение данных доступно кадровику.</p>
+<fieldset><legend>Дата въезда</legend><p>{_d(emp.entry_date.isoformat() if emp.entry_date else None)}</p></fieldset>
+<fieldset><legend>Дактилоскопия</legend><p>{_d(emp.dactyloscopy_date.isoformat() if emp.dactyloscopy_date else None)}</p></fieldset>
+<fieldset><legend>Место пребывания</legend><p>{_d(emp.address)}</p></fieldset>
+<fieldset><legend>Дата договора</legend><p>{_d(emp.contract_date.isoformat() if emp.contract_date else None)}</p></fieldset>"""
+
+    # Прораб — только чтение: убираем формы записи из правой колонки. Согласие/статус
+    # показываем текстом-статусом; договор оставляем ТОЛЬКО предпросмотр и скачивание
+    # (генерация документа — разрешена прорабу), но без «Заключить»/«Отменить».
+    if not can_write:
+        # согласие: только статус, без кнопки подтверждения
+        if emp.consent_status == ConsentStatus.CONFIRMED:
+            consent_block = '<p><span class="badge green">Согласие подтверждено</span></p>'
+        else:
+            consent_block = '<p class="muted">Согласие не подтверждено. Подтверждение доступно кадровику.</p>'
+        # статус: только текущее значение, без формы смены
+        _rs_ru = {"primary": "Первичный учёт", "prior": "Ранее стоял на учёте в РФ"}.get(
+            (emp.registration_status.value if emp.registration_status else ""), "не задан")
+        status_block = f'<p>Статус: <b>{_rs_ru}</b></p><p class="muted">Изменение доступно кадровику.</p>'
+        # договор: предпросмотр + скачивание (если заключён), без заключения/отмены
+        if (emp.tab_number or "").strip() and emp.registration_status is not None:
+            _dl = ""
+            if emp.contract_date is not None:
+                _dl = f"""<p class="muted">Договор заключён {emp.contract_date.strftime("%d.%m.%Y")}.</p>
+<form method="post" action="/employees/{emp.id}/labor_contract/download">
+<input type="hidden" name="position" value="Монтажник">
+<input type="hidden" name="salary" value="30000">
+<button type="submit" class="btn-full">Скачать .docx</button>
+</form>"""
+            contract_block = f"""
+<p class="muted">Режим чтения. Заключение договора доступно кадровику.</p>
+<form method="post" action="/employees/{emp.id}/labor_contract/preview">
+<input type="hidden" name="position" value="Монтажник">
+<input type="hidden" name="salary" value="30000">
+<input type="hidden" name="contract_date" value="{today_s}">
+<button type="submit" class="secondary btn-full">Предпросмотр договора</button>
+</form>
+{_dl}"""
+        else:
+            contract_block = '<p class="muted">Договор недоступен: не задан статус учёта или табельный номер.</p>'
+
+    # === Объединённая зона: Медкомиссия и дактилоскопия ===
+    from models import Referral, ExamStatus
+    # законные дедлайны (30 дней от въезда) из obligations — показать в зоне, т.к. из блока
+    # обязательств медосмотр/дактилоскопия убраны.
+    _med_ob = next((o for o in emp.obligations if o.is_current and o.type == ObligationType.MEDICAL_EXAM), None)
+    _dact_ob = next((o for o in emp.obligations if o.is_current and o.type == ObligationType.DACTYLOSCOPY), None)
+    _med_legal = f' · срок по закону до {_med_ob.deadline_date.strftime("%d.%m.%Y")}' if _med_ob else ''
+    _dact_legal = f' · срок по закону до {_dact_ob.deadline_date.strftime("%d.%m.%Y")}' if _dact_ob else ''
+    _ref = db.scalars(
+        select(Referral).where(Referral.employee_id == emp.id)
+        .order_by(Referral.referral_date.desc())
+    ).first()
+    if _ref is None:
+        if emp.entry_date:
+            _since = (date.today() - emp.entry_date).days
+            if _since >= 5:
+                _med_html = f'<b style="color:#c47f00">Пора выдать направление</b> (прошло {_since} дн. от въезда)'
+            else:
+                _med_html = f'<span class="muted">Направление ещё не требуется (прошло {_since} дн. из 5)</span>'
+        else:
+            _med_html = '<span class="muted">Ожидает прибытия — сроки не идут</span>'
+        _med_html += ' · <a href="/medical">выписать направление</a>'
+        _med_done = False
+    elif _ref.exam_status == ExamStatus.COMPLETED:
+        _med_html = '<b style="color:#1a7f37">Медкомиссия пройдена</b>'
+        if _ref.result_date:
+            _med_html += f' <span class="muted">({_ref.result_date.isoformat()})</span>'
+        _med_done = True
+    else:
+        _md = (date.today() - _ref.referral_date).days
+        if _md > 14:
+            _med_html = f'<b style="color:#b00">Справка просрочена</b> (прошло {_md} дн., внутр. срок 14)'
+        elif _md >= 10:
+            _med_html = f'<b style="color:#c47f00">Ждём справку</b> (прошло {_md} дн. из 14)'
+        else:
+            _med_html = f'<span>Направлен {_ref.referral_date.isoformat()}, прошло {_md} дн. из 14</span>'
+        _med_done = False
+    # Форму загрузки справки показываем, пока СКАНА СПРАВКИ НЕТ — независимо от статуса медкомиссии
+    # (иначе тупик: медкомиссия «пройдена», а скана нет и загрузить негде; пакет требует справку).
+    _cert_uploaded = False
+    try:
+        _cert_uploaded = bool((_s3_list_for_employee(emp.id).get("medical_certificate") or {}).get("present"))
+    except Exception:
+        _cert_uploaded = False
+    # Подсказка: медкомиссия пройдена, но скана справки нет — он нужен для пакета Госуслуг.
+    _cert_hint = ""
+    if _med_done and not _cert_uploaded:
+        _cert_hint = '<br><span style="color:#c47f00;font-size:13px">⚠ Медкомиссия пройдена, но скан справки не загружен — он нужен для пакета Госуслуг. Загрузите ниже.</span>'
+    _med_upload = ""
+    if not _cert_uploaded:
+        _med_upload = f'''<form method="post" action="/employees/{emp.id}/scan/upload" enctype="multipart/form-data" style="margin-top:8px">
+<input type="hidden" name="scan_type" value="medical_certificate">
+<input type="file" name="files" accept="application/pdf,image/*" multiple required style="display:block;width:100%;margin:6px 0;padding:8px;border:1px solid #d9dde3;border-radius:8px;background:#fff;font-size:15px">
+<button type="submit" class="btn-full">Загрузить справку (закроет медкомиссию)</button></form>'''
+    _today_s_dact = date.today().isoformat()
+    _dact_action = f'/employees/{emp.id}/dactyloscopy_date'
+    if emp.dactyloscopy_date:
+        _dv = emp.dactyloscopy_date.isoformat()
+        _dact_form = (
+            '<form method="post" action="' + _dact_action + '" style="margin-top:8px">'
+            '<label style="font-size:13px" class="muted">Изменить дату:</label>'
+            '<input type="date" name="dactyloscopy_date" max="' + _today_s_dact + '" value="' + _dv + '" '
+            'style="display:block;margin:4px 0;padding:8px;border:1px solid #d9dde3;border-radius:8px">'
+            '<button type="submit" class="secondary">Сохранить дату</button></form>'
+        )
+        _dact_html = (
+            '<b style="color:#1a7f37">Дактилоскопия сделана</b> '
+            '<span class="muted">(' + _dv + ')</span>' + _dact_form
+        )
+    else:
+        _dact_seq = "" if _med_done else ' <span class="muted">(обычно после медкомиссии)</span>'
+        _dact_form = (
+            '<form method="post" action="' + _dact_action + '" style="margin-top:8px">'
+            '<label style="font-size:13px" class="muted">Дата прохождения (заполнение закроет обязательство):</label>'
+            '<input type="date" name="dactyloscopy_date" max="' + _today_s_dact + '" '
+            'style="display:block;margin:4px 0;padding:8px;border:1px solid #d9dde3;border-radius:8px">'
+            '<button type="submit" class="btn-full">Сохранить дату дактилоскопии</button></form>'
+        )
+        _dact_html = (
+            '<b style="color:#c47f00">Дактилоскопия не сделана</b>' + _dact_seq + '<br>' + _dact_form
+        )
+    _medzone_section = f'''
+<fieldset>
+<legend>Медкомиссия и дактилоскопия</legend>
+<div style="padding:10px 0;border-bottom:1px solid #eee">
+<div style="font-size:13px;color:#889;text-transform:uppercase;letter-spacing:.5px">Медкомиссия{_med_legal}</div>
+{_med_html}{_cert_hint}
+{_med_upload}
+</div>
+<div style="padding:10px 0">
+<div style="font-size:13px;color:#889;text-transform:uppercase;letter-spacing:.5px">Дактилоскопия{_dact_legal}</div>
+{_dact_html}
+</div>
+</fieldset>'''
+
+    # === Блок СНИЛС (нужен для корректного ЕФС-1) ===
+    _snils_action = '/employees/' + emp.id + '/snils'
+    if emp.snils:
+        _snils_status = '<b style="color:#1a7f37">СНИЛС: ' + html.escape(emp.snils) + '</b>'
+        _snils_form_extra = ''
+    else:
+        if emp.snils_appointment_date:
+            _proc = {"new": "первичное получение", "merge": "объединение дублей"}.get(emp.snils_procedure or "", "получение")
+            _appt_passed = emp.snils_appointment_date < date.today()
+            if _appt_passed:
+                _snils_status = ('<b style="color:#b00">СНИЛС: дата записи прошла ('
+                                 + emp.snils_appointment_date.strftime("%d.%m.%Y") + ', ' + _proc
+                                 + '), а номер не внесён — проверьте, получен ли СНИЛС</b>')
+            else:
+                _snils_status = ('<b style="color:#c47f00">СНИЛС оформляется</b> — запись в СФР на '
+                                 + emp.snils_appointment_date.strftime("%d.%m.%Y") + ' (' + _proc + ')')
+        else:
+            _snils_status = '<b style="color:#b00">СНИЛС отсутствует</b> — нужна запись в СФР'
+        _sel_new = ' selected' if emp.snils_procedure == "new" else ''
+        _sel_merge = ' selected' if emp.snils_procedure == "merge" else ''
+        _appt_val = emp.snils_appointment_date.isoformat() if emp.snils_appointment_date else ''
+        _snils_form_extra = (
+            '<label style="font-size:13px" class="muted">Вид процедуры:</label>'
+            '<select name="snils_procedure" style="display:block;margin:4px 0;padding:8px;border:1px solid #d9dde3;border-radius:8px">'
+            '<option value=""></option>'
+            '<option value="new"' + _sel_new + '>Первичное получение</option>'
+            '<option value="merge"' + _sel_merge + '>Объединение дублей (было несколько СНИЛС)</option>'
+            '</select>'
+            '<label style="font-size:13px" class="muted">Дата записи в СФР:</label>'
+            '<input type="date" name="snils_appointment_date" value="' + _appt_val + '" '
+            'style="display:block;margin:4px 0;padding:8px;border:1px solid #d9dde3;border-radius:8px">'
+        )
+    _snils_section = (
+        '<fieldset><legend>СНИЛС</legend>' + _snils_status +
+        '<form method="post" action="' + _snils_action + '" style="margin-top:8px">'
+        '<label style="font-size:13px" class="muted">Номер СНИЛС (если есть):</label>'
+        '<input type="text" name="snils" value="' + html.escape(emp.snils or "") + '" placeholder="XXX-XXX-XXX YY" '
+        'style="display:block;margin:4px 0;padding:8px;border:1px solid #d9dde3;border-radius:8px">'
+        + _snils_form_extra +
+        '<button type="submit" class="btn-full">Сохранить СНИЛС</button></form>'
+        '<p class="muted" style="font-size:13px">Нужен для ЕФС-1. Форму подавайте в срок '
+        '(1 раб. день от договора) даже без СНИЛС, при получении — корректировка.</p></fieldset>'
+    )
+
+    body = f"""
+{_warn_banner}
+<h1>{emp.full_name}</h1>
+<section class="card-form">
+<div class="card-cols">
+<div class="card-col">
+{left_col}
+</div>
+<div class="card-col">
+<fieldset>
+<legend>Согласие на обработку ПД</legend>
+{consent_block}
+</fieldset>
+
+<fieldset>
+<legend>Статус миграционного учёта</legend>
+{status_block}
+</fieldset>
+
+<fieldset>
+<legend>Трудовой договор ({EMPLOYER_NAME_SHORT})</legend>
+{contract_block}
+</fieldset>
+
+<fieldset>
+<legend>Госпошлина</legend>
+<p class="muted">Квитанция ПД-4сб. Введите ФИО плательщика (кто вносит деньги — необязательно
+сам работник). В назначение платежа автоматически попадёт ФИО работника, за кого платёж.</p>
+<form method="post" action="/employees/{emp.id}/duty_receipt">
+<label>Ф.И.О. плательщика (инициалы)</label>
+<input type="text" name="payer_name" placeholder="Иванов И. И." value="{_last_payer}">
+<button type="submit" name="kind" value="registration" class="btn-full">Квитанция: постановка на учёт (500 ₽) — .docx</button>
+<button type="submit" name="kind" value="renewal" class="btn-full">Квитанция: продление пребывания (1000 ₽) — .docx</button>
+</form>
+</fieldset>
+</div>
+</div>
+{_medzone_section}
+{_snils_section}
+{_obligations_section}
+{_scans_section}
+<a class="btn secondary" href="/employees">← Ко всем сотрудникам</a>
+</section>"""
+    # Кнопка «вниз к сканам» — только на карточке (там есть секция #scans-section). Скроллит к
+    # секции пакета/сканов; видна, пока секция ниже экрана. Стиль как у глобальной «вверх».
+    _down_btn = """
+<button id="scrollDownBtn" onclick="document.getElementById('scans-section') && document.getElementById('scans-section').scrollIntoView({behavior:'smooth'})"
+  style="display:none;position:fixed !important;right:12px;bottom:calc(70px + env(safe-area-inset-bottom,0px));
+  z-index:999;width:46px !important;height:46px !important;min-height:0 !important;min-width:0 !important;
+  padding:0 !important;margin:0 !important;border:none;border-radius:50% !important;
+  background:rgba(74,144,226,.9);color:#fff;font-size:22px;line-height:46px !important;text-align:center;
+  box-shadow:0 3px 10px rgba(20,24,30,.28);cursor:pointer" aria-label="К сканам">&#8595;</button>
+<script>
+(function(){
+  var btn = document.getElementById('scrollDownBtn');
+  var sec = document.getElementById('scans-section');
+  if(!btn || !sec) return;
+  function upd(){
+    var r = sec.getBoundingClientRect();
+    // видна, пока верх секции ниже нижней границы экрана (ещё не доскроллили)
+    btn.style.display = (r.top > window.innerHeight - 60) ? 'block' : 'none';
+  }
+  window.addEventListener('scroll', upd);
+  window.addEventListener('resize', upd);
+  upd();
+})();
+</script>"""
+    return _render(emp.full_name, body + SAVE_FORM_JS + _down_btn, active="employees", role=request.session.get("role",""))
+
+
+@app.post("/employees/{employee_id}/entry_date")
+def employee_entry_date_submit(
+    employee_id: str,
+    request: Request,
+    entry_date: date = Form(...),
+    db: Session = Depends(get_db),
+):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    emp.entry_date = entry_date
+    db.commit()
+    db.refresh(emp)
+
+    # Симметрично _apply_entry_date() в bot.py: если согласие уже подтверждено раньше
+    # (маловероятно на практике, но на будущее — дозаполнение может случиться уже после
+    # подтверждения), досоздаём obligations сейчас же, а не оставляем их несозданными молча.
+    if emp.consent_status == ConsentStatus.CONFIRMED:
+        create_obligations_for_employee(db, emp)
+
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+
+@app.post("/employees/{employee_id}/entry_country")
+def employee_entry_country_submit(
+    employee_id: str,
+    request: Request,
+    entry_country: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    # Справочное поле — не участвует в deadlines.py (DEADLINE_RULES), obligations не пересчитываются.
+    emp.entry_country = entry_country.strip()
+    db.commit()
+
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+
+@app.post("/employees/{employee_id}/address")
+def employee_address_submit(
+    employee_id: str,
+    request: Request,
+    address: str = Form(...),
+    address_since: date = Form(...),
+    registration_valid_until: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    # Дата окончания регистрации — справочная, из уведомления Госуслуг. Пустая строка -> None.
+    if registration_valid_until.strip():
+        try:
+            emp.registration_valid_until = date.fromisoformat(registration_valid_until.strip())
+        except ValueError:
+            raise HTTPException(400, "Некорректная дата окончания регистрации.")
+    else:
+        emp.registration_valid_until = None
+
+    previous_address = (emp.address or "").strip()
+    new_address = address.strip()
+    previous_since = emp.address_since
+    first_address_ever = previous_address == ""
+
+    # Дата теперь сохраняется ВСЕГДА (вариант Б), а не только при смене адреса — раньше правка
+    # только даты (адрес тот же) игнорировалась, дата "не сохранялась". Исключение: самый первый
+    # ввод адреса не создаёт обязательство регистрации (это не переезд), но дату всё равно пишем.
+    emp.address = new_address
+    emp.address_since = address_since
+
+    # Пересоздать обязательство регистрации нужно, если это НЕ первый ввод адреса И реально
+    # изменилось то, от чего считается дедлайн: адрес или дата начала пребывания.
+    address_changed = (not first_address_ever) and previous_address != new_address
+    since_changed = (not first_address_ever) and previous_since != address_since
+    need_reobligate = address_changed or since_changed
+
+    db.commit()
+    db.refresh(emp)
+
+    if need_reobligate and emp.consent_status == ConsentStatus.CONFIRMED:
+        # Удаляем незакрытое обязательство регистрации-ПЕРЕЕЗДА по СТАРОЙ дате и создаём по новой,
+        # чтобы дедлайн соответствовал текущей address_since (вариант Б). Различаем от первичной
+        # регистрации (та привязана к entry_date) по trigger_date == старая address_since:
+        # сносим только обязательство, чей триггер совпадал с прежним address_since.
+        from models import Obligation, ObligationStatus
+        if previous_since is not None:
+            db.query(Obligation).filter(
+                Obligation.employee_id == emp.id,
+                Obligation.type == ObligationType.REGISTRATION,
+                Obligation.trigger_date == previous_since,
+                Obligation.status != ObligationStatus.DONE,
+            ).delete(synchronize_session=False)
+            db.commit()
+        create_obligations_for_employee(db, emp)
+
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+
+@app.post("/employees/{employee_id}/contract_date")
+def employee_contract_date_submit(
+    employee_id: str,
+    request: Request,
+    contract_date: date = Form(...),
+    db: Session = Depends(get_db),
+):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    emp.contract_date = contract_date
+    db.commit()
+    db.refresh(emp)
+
+    # Симметрично _apply_contract_date() в bot.py: обязательства, зависящие от даты договора
+    # (contract_notice, efs1_report), досоздаются сразу, если согласие уже подтверждено.
+    if emp.consent_status == ConsentStatus.CONFIRMED:
+        create_obligations_for_employee(db, emp)
+
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+
+@app.post("/employees/{employee_id}/consent_confirm")
+def employee_consent_confirm_submit(employee_id: str, request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    # Зеркалит _execute_consent_confirm_by_button в bot.py: тот же метод ConsentMethod.BOT_BUTTON,
+    # тот же дисклеймер про юридическую слабость такого способа по сравнению со сканом (ст.9 152-ФЗ).
+    # proof здесь — логин кадровика, а не user_id из MAX (кадровик авторизован логином/паролем,
+    # не MAX-аккаунтом), чтобы след в аудите оставался осмысленным.
+    consent = Consent(
+        employee_id=emp.id,
+        method=ConsentMethod.BOT_BUTTON,
+        proof=f"button_click:webforms:{_actor_name(request, db)}:{datetime.now(MSK).isoformat()}",
+        consent_text_version=CONSENT_TEXT_VERSION,
+    )
+    db.add(consent)
+
+    emp.consent_status = ConsentStatus.CONFIRMED
+    db.add(emp)
+    db.commit()
+    db.refresh(emp)
+
+    create_obligations_for_employee(db, emp)
+
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+
+@app.post("/employees/{employee_id}/snils")
+def employee_snils_submit(
+    employee_id: str,
+    request: Request,
+    snils: str = Form(""),
+    snils_procedure: str = Form(""),
+    snils_appointment_date: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    """Сохраняет СНИЛС и/или данные записи в СФР на его получение/объединение. Если введён номер
+    СНИЛС — данные записи очищаются (СНИЛС уже получен)."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+    _snils_clean = snils.strip()
+    emp.snils = _snils_clean or None
+    if _snils_clean:
+        # СНИЛС получен — данные записи больше не нужны
+        emp.snils_procedure = None
+        emp.snils_appointment_date = None
+    else:
+        emp.snils_procedure = (snils_procedure.strip() or None)
+        emp.snils_appointment_date = _pdate(snils_appointment_date)
+    db.commit()
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+
+@app.post("/employees/{employee_id}/dactyloscopy_date")
+def employee_dactyloscopy_date_submit(
+    employee_id: str,
+    request: Request,
+    dactyloscopy_date: date = Form(...),
+    db: Session = Depends(get_db),
+):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    emp.dactyloscopy_date = dactyloscopy_date
+
+    # Заполнение даты = дактилоскопия пройдена: закрываем текущую обязанность в DONE.
+    # Симметрично тому, как медосмотр закрывается результатом. Если обязанности ещё нет
+    # (согласие не подтверждено), просто сохраняем дату — при последующем создании
+    # obligations гейт в obligations.py сделает её сразу DONE.
+    dact = db.scalars(
+        select(Obligation)
+        .where(Obligation.employee_id == emp.id)
+        .where(Obligation.type == ObligationType.DACTYLOSCOPY)
+        .where(Obligation.is_current == True)  # noqa: E712
+    ).first()
+    if dact is not None:
+        dact.status = ObligationStatus.DONE
+        db.add(dact)
+
+    db.commit()
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+
+@app.post("/employees/{employee_id}/save")
+def employee_save(
+    employee_id: str,
+    request: Request,
+    entry_date: str = Form(""),
+    entry_country: str = Form(""),
+    contract_date: str = Form(""),
+    address: str = Form(""),
+    address_since: str = Form(""),
+    registration_valid_until: str = Form(""),
+    dactyloscopy_date: str = Form(""),
+    position: str = Form(""),
+    subdivision: str = Form(""),
+    confirmed: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    """Единое сохранение карточки. Диф по каждому полю относительно БД: применяются только
+    реально изменившиеся поля (пустое = не трогаем, не затираем). Опасные изменения — смена
+    адреса (создаёт обязательство регистрации) и дата дактилоскопии (закрывает обязательство)
+    — требуют подтверждения: JS-confirm() ставит confirmed=1 до отправки, а без JS срабатывает
+    серверный второй шаг ниже. Старые пять роутов полей оставлены рабочими рядом."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    def _pdate(s):
+        s = (s or "").strip()
+        return date.fromisoformat(s) if s else None
+
+    ed = _pdate(entry_date)
+    ec = (entry_country or "").strip()
+    cd = _pdate(contract_date)
+    dd = _pdate(dactyloscopy_date)
+    prev_addr = (emp.address or "").strip()
+    new_addr = (address or "").strip()
+
+    # что изменилось (сравнение до мутации)
+    entry_changed = ed is not None and ed != emp.entry_date
+    country_changed = ec != "" and ec != (emp.entry_country or "")
+    contract_changed = cd is not None and cd != emp.contract_date
+    dact_change = dd is not None and dd != emp.dactyloscopy_date
+    addr_real_change = prev_addr != "" and new_addr != "" and prev_addr != new_addr
+    addr_first_fill = prev_addr == "" and new_addr != ""
+
+    # опасные изменения -> подтверждение
+    dangerous = []
+    if addr_real_change:
+        dangerous.append("смена адреса места пребывания — создаст обязательство регистрации")
+    if dact_change:
+        dangerous.append("дата дактилоскопии — закроет обязательство как пройденное")
+
+    if dangerous and confirmed != "1":
+        def _hid(name, val):
+            return f'<input type="hidden" name="{name}" value="{html.escape(val or "", quote=True)}">'
+        items = "".join(f"<li>{html.escape(d)}</li>" for d in dangerous)
+        body = f"""
+<h1>Подтвердите изменения</h1>
+<section class="card-form">
+<div class="warning-banner">Эти изменения затронут обязательства сотрудника {html.escape(emp.full_name)}:</div>
+<ul>{items}</ul>
+<form method="post" action="/employees/{emp.id}/save">
+{_hid("entry_date", entry_date)}
+{_hid("entry_country", entry_country)}
+{_hid("contract_date", contract_date)}
+{_hid("address", address)}
+{_hid("address_since", address_since)}
+{_hid("dactyloscopy_date", dactyloscopy_date)}
+{_hid("position", position)}
+{_hid("subdivision", subdivision)}
+<input type="hidden" name="confirmed" value="1">
+<button type="submit">Подтвердить и сохранить</button>
+</form>
+<a class="btn secondary" href="/employees/{emp.id}">Отмена</a>
+</section>"""
+        return HTMLResponse(_render("Подтверждение", body, role=request.session.get("role","")))
+
+    # --- применяем только изменившееся ---
+    if entry_changed:
+        emp.entry_date = ed
+    if country_changed:
+        emp.entry_country = ec
+    if contract_changed:
+        emp.contract_date = cd
+    if dd is not None:
+        emp.dactyloscopy_date = dd  # до create_obligations, чтобы гейт увидел
+    if addr_real_change:
+        emp.address = new_addr
+        asd = _pdate(address_since)
+        if asd is not None:
+            emp.address_since = asd
+    elif addr_first_fill:
+        emp.address = new_addr  # первый ввод — address_since не трогаем (нет смены)
+
+    # Должность/подразделение — простые справочные поля, без побочных эффектов на
+    # обязательства (в отличие от адреса/дактилоскопии выше), пишем всегда как есть.
+    if position.strip():
+        emp.position = position.strip()
+    if subdivision.strip():
+        emp.subdivision = subdivision.strip()
+
+    # Срок регистрации до — справочное поле из уведомления Госуслуг, пишется всегда
+    # (пустое -> None). Не привязано к смене адреса, не влияет на обязательства.
+    emp.registration_valid_until = _pdate(registration_valid_until)
+
+    db.commit()
+    db.refresh(emp)
+
+    # пересоздание обязательств: изменились триггерные поля И согласие подтверждено
+    if (entry_changed or contract_changed or addr_real_change) and emp.consent_status == ConsentStatus.CONFIRMED:
+        create_obligations_for_employee(db, emp)
+
+    # закрытие дактилоскопии: заполнение даты = пройдено
+    if dact_change:
+        dact = db.scalars(
+            select(Obligation)
+            .where(Obligation.employee_id == emp.id)
+            .where(Obligation.type == ObligationType.DACTYLOSCOPY)
+            .where(Obligation.is_current == True)  # noqa: E712
+        ).first()
+        if dact is not None and dact.status != ObligationStatus.DONE:
+            dact.status = ObligationStatus.DONE
+            db.add(dact)
+            db.commit()
+
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+
+@app.post("/admin/recompute-dactyloscopy")
+def admin_recompute_dactyloscopy(request: Request, db: Session = Depends(get_db)):
+    """Разовый прогон: создаёт недостающие обязанности (в т.ч. дактилоскопию) для уже
+    заведённых ПОДТВЕРЖДЁННЫХ сотрудников — иначе новое правило оживёт только у тех, чью
+    карточку тронут после деплоя. Защищён флагом system_flags: повторный запуск ничего не
+    делает (плюс идемпотентность самой create_obligations_for_employee).
+    TODO удалить этот эндпоинт и таблицу SystemFlag после успешного прогона."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    if db.get(SystemFlag, "dactyloscopy_backfill_done") is not None:
+        return RedirectResponse("/", status_code=303)
+
+    confirmed = db.scalars(
+        select(Employee).where(Employee.consent_status == ConsentStatus.CONFIRMED)
+    ).all()
+    for emp in confirmed:
+        create_obligations_for_employee(db, emp)  # сама коммитит и идемпотентна
+
+    db.add(
+        SystemFlag(
+            key="dactyloscopy_backfill_done",
+            value=f"{len(confirmed)} сотрудников; {datetime.now(MSK).isoformat()}",
+            updated_at=datetime.now(MSK),
+        )
+    )
+    db.commit()
+    return RedirectResponse("/", status_code=303)
+
+
+# --- Медкомиссия ---------------------------------------------------------
+# Зеркалит две команды бота: /send_medical_referral и /medical_exam_result.
+# Не тронуто консолидацией — отдельный раздел, не привязан к общей карточке сотрудника,
+# потому что список "кому нужно направление" естественно общий на всех, а не per-employee.
+
+@app.get("/medical", response_class=HTMLResponse)
+def medical_list(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    referred_obligation_ids = {r.obligation_id for r in db.scalars(select(Referral)).all()}
+    need_referral = [
+        o for o in db.scalars(
+            select(Obligation)
+            .where(Obligation.is_current == True)  # noqa: E712
+            .where(Obligation.type == ObligationType.MEDICAL_EXAM)
+            .where(Obligation.status == ObligationStatus.PENDING)
+            .order_by(Obligation.deadline_date)
+        ).all()
+        if o.id not in referred_obligation_ids
+    ]
+    awaiting_result = db.scalars(
+        select(Referral).where(Referral.exam_status == ExamStatus.REFERRED)
+    ).all()
+
+    def referral_row(o: Obligation) -> str:
+        emp = o.employee
+        name = emp.full_name if emp else "?"
+        missing = check_medical_referral_fields(emp) if emp else []
+        missing_line = (
+            f'<span class="badge red">нет: {", ".join(missing)}</span><br>' if missing else ""
+        )
+        return (
+            f'<div class="card">{name}<br>'
+            f'<span class="badge orange">дедлайн {o.deadline_date.isoformat()}</span><br>'
+            f'{missing_line}'
+            f'<form class="inline" method="post" action="/medical/{o.employee_id}/refer">'
+            f'<input type="hidden" name="obligation_id" value="{o.id}">'
+            f'<button type="submit">Выписать направление</button>'
+            f'</form></div>'
+        )
+
+    def awaiting_row(r: Referral) -> str:
+        emp = r.employee if hasattr(r, "employee") else None
+        name = emp.full_name if emp else db.get(Employee, r.employee_id).full_name
+        # Внутренний дедлайн 14 дней от направления: 10 дней на врачей + 4 на справку.
+        _days = (date.today() - r.referral_date).days
+        _left = 14 - _days
+        if _days > 14:
+            _status = f'<b style="color:#b00">⚠ Справка просрочена (прошло {_days} дн., внутренний срок 14)</b>'
+        elif _days >= 10:
+            _status = f'<b style="color:#c47f00">Ждём справку — прошло {_days} дн. из 14 (осталось {_left})</b>'
+        else:
+            _status = f'<span class="muted">идёт: прошло {_days} дн. из 14 (комиссию пройти к 10-му дню)</span>'
+        return (
+            f'<div class="card">{name}<br>'
+            f'<span class="muted">направлен {r.referral_date.isoformat()}</span><br>'
+            f'{_status}<br>'
+            f'<span class="muted" style="font-size:13px">Завершение — загрузка скана справки '
+            f'(кнопка в карточке работника). Отметка «пройдено» без скана убрана.</span><br>'
+            f'<a class="btn secondary" href="/employees/{r.employee_id}">Открыть карточку → загрузить справку</a><br>'
+            f'<form class="inline" method="post" action="/medical/{r.employee_id}/result" onsubmit="return confirm(&#39;Удалить направление и вернуть сотрудника в очередь на выписку? Действие необратимо.&#39;)">'
+            f'<input type="hidden" name="result" value="failed">'
+            f'<button type="submit" class="secondary">❌ Не пройдено (отменить направление)</button></form>'
+            f'</div>'
+        )
+
+    test_banner = (
+        '<div class="warning-banner">⚠ Тестовый режим включён (TEST_ALLOW_MISSING_FIELDS): '
+        'направления с незаполненными полями всё равно выписываются, с прочерками и '
+        'предупреждением внутри документа. Выключите флаг перед реальной работой.</div>'
+        if TEST_ALLOW_MISSING_FIELDS else ""
+    )
+
+    body = f"""
+{test_banner}
+<h1>Медкомиссия</h1>
+
+<section class="grid wide">
+<h2>Нужно направление ({len(need_referral)})</h2>
+{''.join(referral_row(o) for o in need_referral) or '<p class="muted">Все, у кого активно обязательство, уже направлены.</p>'}
+</section>
+
+<section class="grid wide">
+<h2>Направлены, ждут результата ({len(awaiting_result)})</h2>
+{''.join(awaiting_row(r) for r in awaiting_result) or '<p class="muted">Нет ожидающих результата.</p>'}
+</section>
+"""
+    return _render("Медкомиссия", body, active="medical", role=request.session.get("role",""))
+
+
+@app.post("/medical/{employee_id}/refer")
+def medical_refer(
+    employee_id: str,
+    request: Request,
+    obligation_id: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    """Выписывает направление: заводит запись Referral, привязанную к обязательству
+    MEDICAL_EXAM (bot.py сам Referral не создаёт — это новая часть учёта, добавленная
+    здесь), затем показывает HTML-предпросмотр документа с кнопками "Печать" и
+    "Скачать .docx". Сам docx (та же генерация, что /send_medical_referral в bot.py)
+    не отдаётся принудительно как download — на экране браузера его не отрисовать
+    напрямую (нет нативного просмотра .docx), поэтому печать идёт через HTML-версию
+    того же содержания (window.print()), а .docx доступен отдельной кнопкой на скачивание.
+
+    2026-07: список отсутствующих полей запрашивается ЗАРАНЕЕ через
+    check_medical_referral_fields — не только чтобы решить, кидать ли 400, но и чтобы
+    показать баннер в HTML-превью независимо от того, кинул генератор исключение или
+    сработал тестовый обход (TEST_ALLOW_MISSING_FIELDS)."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    obligation = db.get(Obligation, obligation_id)
+    if obligation is None or obligation.employee_id != employee_id:
+        raise HTTPException(404, "Обязательство не найдено или не принадлежит этому сотруднику")
+
+    missing = check_medical_referral_fields(emp)
+    if missing and not TEST_ALLOW_MISSING_FIELDS:
+        raise HTTPException(
+            400,
+            f"Нельзя сгенерировать документ для {emp.full_name} — "
+            f"не заполнены поля: {', '.join(missing)}. "
+            f"Заполните их в карточке сотрудника перед генерацией.",
+        )
+
+    try:
+        # Генерируем один раз здесь ТОЛЬКО ради проверки обязательных полей
+        # (_require_fields в document_templates.py) — если чего-то не хватает,
+        # ValueError всплывёт до создания записи Referral, а не после. В тестовом
+        # режиме это не бросит исключение даже при missing — документ сгенерируется
+        # с прочерками, missing уже посчитан выше для баннера.
+        generate_medical_referral_docx(emp)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception:
+        raise HTTPException(500, "Не удалось сгенерировать направление. Проверьте логи сервиса.")
+
+    referral = Referral(
+        employee_id=emp.id,
+        obligation_id=obligation.id,
+        clinic_id=CLINIC_ID,
+        referral_date=date.today(),
+        exam_status=ExamStatus.REFERRED,
+    )
+    db.add(referral)
+    db.commit()
+
+    return HTMLResponse(_render_referral_preview(emp, obligation_id, missing_fields=missing))
+
+
+@app.get("/medical/{employee_id}/referral/{obligation_id}/download")
+def medical_referral_download(
+    employee_id: str,
+    obligation_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Отдельный маршрут на скачивание — регенерирует docx по текущим данным сотрудника.
+    Не хранит путь к файлу между запросами (файловая система Railway эфемерна между
+    процессами), поэтому пересоздаёт документ заново при каждом скачивании. Единственный
+    практический нюанс: поле "10. Дата выдачи направления" в документе — дата генерации
+    файла, а не дата исходного нажатия "Выписать направление"; если скачать на следующий
+    день после того, как направление уже выписано, дата в файле сдвинется на сегодня."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    try:
+        path = generate_medical_referral_docx(emp)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception:
+        raise HTTPException(500, "Не удалось сгенерировать направление. Проверьте логи сервиса.")
+
+    filename = f"Направление_{emp.full_name.replace(' ', '_')}.docx"
+    return FileResponse(path, filename=filename)
+
+
+@app.post("/employees/{employee_id}/labor_contract")
+def employee_labor_contract(
+    employee_id: str,
+    request: Request,
+    position: str = Form("Монтажник"),
+    salary: str = Form("30000"),
+    contract_date: date = Form(...),
+    db: Session = Depends(get_db),
+):
+    """Заключение договора: пишет contract_date (создаёт обязательства МВД/ЕФС-1 при согласии),
+    возвращает в карточку. Docx скачивается ОТДЕЛЬНО после заключения (роут /download).
+    Блокируется при пустом статусе учёта и пустом табельном. Должность/оклад из формы как есть."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    if emp.registration_status is None:
+        raise HTTPException(400, "Не задан статус миграционного учёта — сначала выберите статус.")
+    if not (emp.tab_number or "").strip():
+        raise HTTPException(400, "У сотрудника нет табельного номера — номер договора собрать нельзя.")
+
+    # Заключение: фиксируем дату договора (создаёт обязательства МВД/ЕФС-1 при согласии) и
+    # возвращаем в карточку. Скачивание .docx — отдельной кнопкой ПОСЛЕ заключения (роут
+    # /download). Так «Заключить» — это акт фиксации, а не выдача файла: кадровик сперва
+    # смотрит предпросмотр, заключает, потом скачивает.
+    emp.contract_date = contract_date
+    db.commit()
+    db.refresh(emp)
+    if emp.consent_status == ConsentStatus.CONFIRMED:
+        create_obligations_for_employee(db, emp)
+
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+
+def _render_labor_contract_preview(emp, position, salary, contract_date_str, tab):
+    """HTML-предпросмотр трудового договора. Зеркалит текст generate_labor_contract_docx
+    в document_templates.py. Меняешь текст там — поменяй и здесь, иначе предпросмотр
+    разойдётся с .docx. Вид «похожий», не пиксель-в-пиксель (решение пользователя)."""
+    import html as _h
+    contract_no = f"{CONTRACT_NUMBER_PREFIX}{tab}" if tab else "—"
+    s = (salary or "").strip().replace(" ", "")
+    salary_fmt = f"{int(s):,}".replace(",", " ") if s.isdigit() else (salary or "—")
+    pos = _h.escape((position or "").strip() or "—")
+    body = f"""
+<div style="max-width:760px">
+<h1 style="text-align:center;font-size:18px">ТРУДОВОЙ ДОГОВОР № {_h.escape(contract_no)}</h1>
+<p style="display:flex;justify-content:space-between"><span>г. Москва</span><span>{_h.escape(contract_date_str)}</span></p>
+<p>{_h.escape(EMPLOYER_NAME_FULL)}, именуемое «Работодатель», в лице Генерального директора
+{_h.escape(EMPLOYER_DIRECTOR_FULL)}, действующего на основании Устава, с одной стороны, и
+{_h.escape(emp.full_name)}, именуемый «Работник», с другой стороны, заключили настоящий договор:</p>
+<h3>1. Предмет и срок</h3>
+<p>1.1. Работник принимается в {_h.escape(EMPLOYER_SUBDIVISION)} {_h.escape(EMPLOYER_NAME_SHORT)}
+на должность {pos} с {_h.escape(contract_date_str)}.</p>
+<p>1.3. Место работы: {_h.escape(WORKPLACE_ADDRESS)}</p>
+<p>1.5. Срок — неопределённый.</p>
+<h3>3. Оплата труда</h3>
+<p>3.1. Оклад: {_h.escape(salary_fmt)} руб.; Районный коэффициент: {_h.escape(DISTRICT_COEFFICIENT)}.</p>
+<h3>8. Адреса и подписи</h3>
+<table style="width:100%;border-collapse:collapse"><tr>
+<td style="width:50%;vertical-align:top;padding-right:12px">
+<b>Работник:</b><br>
+{_h.escape(emp.full_name)}, {emp.birth_date.strftime("%d.%m.%Y") if emp.birth_date else "—"} г.р.<br>
+Паспорт: {_h.escape((emp.passport_series or "") + " " + (emp.passport_number or ""))}, выдан: —<br>
+Адрес: {_h.escape(CONTRACT_SITE_ADDRESS)}<br><br>
+Подпись: _______________
+</td>
+<td style="width:50%;vertical-align:top;padding-left:12px">
+<b>Работодатель:</b><br>
+{_h.escape(EMPLOYER_NAME_FULL)}<br>
+ИНН {_h.escape(str(EMPLOYER_INN))} КПП {_h.escape(str(EMPLOYER_KPP))}<br>
+{_h.escape(EMPLOYER_LEGAL_ADDRESS)}<br>
+Телефон: {_h.escape(EMPLOYER_PHONE)}<br><br>
+Ген. директор _______________<br>{_h.escape(EMPLOYER_DIRECTOR_SHORT)}<br>м.п.
+</td>
+</tr></table>
+</div>
+<p class="muted">Это предпросмотр (упрощённый вид). Полный документ — в скачанном .docx после заключения.</p>
+<div style="display:flex;gap:8px;flex-wrap:wrap">
+<a class="btn secondary" href="/employees/{emp.id}">← Назад к карточке</a>
+<button class="btn" onclick="window.print()">Печать</button>
+</div>"""
+    return _render("Предпросмотр договора", body, active="employees", role=request.session.get("role",""))
+
+
+@app.post("/employees/{employee_id}/labor_contract/preview")
+def employee_labor_contract_preview(
+    employee_id: str,
+    request: Request,
+    position: str = Form("Монтажник"),
+    salary: str = Form("30000"),
+    contract_date: date = Form(...),
+    db: Session = Depends(get_db),
+):
+    """Предпросмотр договора. НИЧЕГО не пишет в БД (не заключает). Показывает HTML по данным
+    формы. Доступен до заключения — иначе кадровик не смог бы проверить документ глазами."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+    tab = (emp.tab_number or "").strip()
+    return HTMLResponse(_render_labor_contract_preview(
+        emp, position, salary, contract_date.strftime("%d.%m.%Y"), tab))
+
+
+def _find_soffice() -> str | None:
+    """Ищет бинарь soffice. На Railway/Nixpacks LibreOffice ставится в Nix store и НЕ попадает
+    в PATH — поэтому недостаточно вызвать 'soffice'. Проверяем PATH, затем типовые пути и Nix
+    store. Возвращает путь к бинарю или None."""
+    import shutil, glob
+    # 1) в PATH
+    found = shutil.which("soffice") or shutil.which("libreoffice")
+    if found:
+        return found
+    # 2) типовые пути
+    for p in ("/usr/bin/soffice", "/usr/local/bin/soffice",
+              "/usr/lib/libreoffice/program/soffice", "/opt/libreoffice/program/soffice"):
+        if os.path.exists(p):
+            return p
+    # 3) Nix store (Railway) — ищем soffice в /nix/store/*/bin и program-каталогах
+    for pattern in ("/nix/store/*/bin/soffice",
+                    "/nix/store/*libreoffice*/lib/libreoffice/program/soffice",
+                    "/nix/store/*libreoffice*/program/soffice"):
+        hits = glob.glob(pattern)
+        if hits:
+            return hits[0]
+    return None
+
+
+def _docx_to_pdf(docx_path: str) -> str:
+    """Конвертирует docx в pdf через LibreOffice (soffice --headless). Возвращает путь к pdf.
+    Требует libreoffice в контейнере (nixpacks.toml). Ищет soffice не только в PATH, но и в
+    Nix store — на Railway бинарь туда и попадает, минуя PATH (частая причина 'soffice not found').
+    Для пакета Госуслуг: договор и квитанция генерируются из одного docx — расхождения нет."""
+    import subprocess
+    soffice = _find_soffice()
+    if soffice is None:
+        raise RuntimeError(
+            "LibreOffice (soffice) не найден в контейнере. Проверьте, что nixpacks.toml с "
+            "'libreoffice' в nixPkgs задеплоен и в build-логе есть его установка."
+        )
+    out_dir = os.path.dirname(docx_path)
+    # HOME нужен soffice для профиля; в некоторых контейнерах он не задан -> падение.
+    env = dict(os.environ)
+    env.setdefault("HOME", out_dir)
+    try:
+        subprocess.run(
+            [soffice, "--headless", "--convert-to", "pdf", "--outdir", out_dir, docx_path],
+            check=True, capture_output=True, timeout=90, env=env,
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Конвертация docx->pdf не удалась: {e.stderr.decode(errors='ignore')[:200]}")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Конвертация docx->pdf превысила таймаут")
+    pdf_path = os.path.splitext(docx_path)[0] + ".pdf"
+    if not os.path.exists(pdf_path):
+        raise RuntimeError("PDF не создан после конвертации")
+    return pdf_path
+
+
+@app.post("/employees/{employee_id}/labor_contract/download")
+def employee_labor_contract_download(
+    employee_id: str,
+    request: Request,
+    position: str = Form("Монтажник"),
+    salary: str = Form("30000"),
+    db: Session = Depends(get_db),
+):
+    """Скачивание .docx. Доступно ТОЛЬКО после заключения (contract_date стоит) — иначе 400.
+    Не пишет в БД, только генерирует файл по уже зафиксированной дате договора."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+    if emp.contract_date is None:
+        raise HTTPException(400, "Договор не заключён — сначала нажмите «Заключить».")
+    try:
+        path = generate_labor_contract_docx(emp, position=position, salary=salary,
+                                            contract_date=emp.contract_date)
+    except Exception:
+        raise HTTPException(500, "Не удалось сгенерировать договор. Проверьте логи сервиса.")
+    filename = f"Трудовой_договор_{emp.full_name.replace(' ', '_')}.docx"
+    return FileResponse(path, filename=filename)
+
+
+@app.post("/employees/{employee_id}/labor_contract/download_pdf")
+def employee_labor_contract_download_pdf(
+    employee_id: str,
+    request: Request,
+    position: str = Form("Монтажник"),
+    salary: str = Form("30000"),
+    db: Session = Depends(get_db),
+):
+    """PDF-версия договора для пакета Госуслуг. Генерирует docx и конвертирует в PDF через
+    LibreOffice — один источник (docx), PDF всегда совпадает. Требует libreoffice в контейнере."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+    if emp.contract_date is None:
+        raise HTTPException(400, "Договор не заключён — сначала нажмите «Заключить».")
+    try:
+        docx_path = generate_labor_contract_docx(emp, position=position, salary=salary,
+                                                 contract_date=emp.contract_date)
+        pdf_path = _docx_to_pdf(docx_path)
+    except RuntimeError as e:
+        raise HTTPException(500, f"PDF недоступен: {e}")
+    except Exception:
+        raise HTTPException(500, "Не удалось сгенерировать PDF договора. Проверьте логи.")
+    filename = f"Трудовой_договор_{emp.full_name.replace(' ', '_')}.pdf"
+    return FileResponse(pdf_path, filename=filename, media_type="application/pdf")
+
+
+@app.post("/employees/{employee_id}/duty_receipt")
+def employee_duty_receipt(
+    employee_id: str,
+    request: Request,
+    kind: str = Form(...),
+    payer_name: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    """Генерация квитанции госпошлины (ПД-4сб) и отдача docx. kind — из нажатой кнопки
+    (registration/renewal). payer_name — ФИО плательщика из формы (плательщик не обязательно
+    работник). ФИО работника уходит в назначение платежа автоматически внутри генератора."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+    if kind not in ("registration", "renewal"):
+        raise HTTPException(400, "Неизвестный тип пошлины")
+    # Запомнить плательщика на сессию (prefill в следующих карточках). Пустой ввод не затирает.
+    if (payer_name or "").strip():
+        request.session["last_payer"] = payer_name.strip()
+    try:
+        path = generate_duty_receipt_docx(kind, employee=emp, payer_name=payer_name)
+    except Exception:
+        raise HTTPException(500, "Не удалось сгенерировать квитанцию. Проверьте логи сервиса.")
+    kind_ru = "постановка" if kind == "registration" else "продление"
+    filename = f"Квитанция_{kind_ru}_{emp.full_name.replace(' ', '_')}.docx"
+    return FileResponse(path, filename=filename)
+
+
+@app.post("/employees/{employee_id}/registration_status")
+def employee_registration_status(
+    employee_id: str,
+    request: Request,
+    registration_status: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    """Смена статуса учёта. Пишет статус и ПЕРЕСОЗДАЁТ обязательства под него:
+    - create_obligations_for_employee создаёт недостающие по новому статусу (если согласие есть);
+    - лишние НЕ выполненные (PENDING) обязательства, которые новый статус делает ненужными,
+      удаляются. Выполненные (DONE) НЕ трогаются — след исполнения.
+    PRIMARY->PRIOR: сносятся PENDING медосмотр, дактилоскопия, регистрация-от-въезда.
+    PRIOR->PRIMARY: create_obligations досоздаёт медосмотр/дактилоскопию (ничего не сносим).
+    Пустой статус: обязательства не создаются (гейт в obligations), существующие PENDING
+    не трогаем — просто перестаёт быть валидным для новых расчётов."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    raw = (registration_status or "").strip()
+    if raw == "":
+        emp.registration_status = None
+    elif raw == RegistrationStatus.PRIMARY.value:
+        emp.registration_status = RegistrationStatus.PRIMARY
+    elif raw == RegistrationStatus.PRIOR.value:
+        emp.registration_status = RegistrationStatus.PRIOR
+    else:
+        raise HTTPException(400, "Недопустимый статус учёта")
+    db.commit()
+    db.refresh(emp)
+
+    # PRIOR делает лишними обязательства, привязанные к факту въезда — снять их PENDING.
+    if emp.registration_status == RegistrationStatus.PRIOR:
+        entry_bound = (
+            ObligationType.MEDICAL_EXAM,
+            ObligationType.DACTYLOSCOPY,
+        )
+        obs = db.scalars(
+            select(Obligation)
+            .where(Obligation.employee_id == emp.id)
+            .where(Obligation.type.in_(entry_bound))
+            .where(Obligation.is_current == True)  # noqa: E712
+            .where(Obligation.status == ObligationStatus.PENDING)
+        ).all()
+        for o in obs:
+            db.delete(o)
+        # регистрация-от-въезда (trigger_date == entry_date) тоже лишняя при PRIOR
+        if emp.entry_date is not None:
+            reg_entry = db.scalars(
+                select(Obligation)
+                .where(Obligation.employee_id == emp.id)
+                .where(Obligation.type == ObligationType.REGISTRATION)
+                .where(Obligation.trigger_date == emp.entry_date)
+                .where(Obligation.is_current == True)  # noqa: E712
+                .where(Obligation.status == ObligationStatus.PENDING)
+            ).all()
+            for o in reg_entry:
+                db.delete(o)
+        db.commit()
+
+    # создать недостающие по новому статусу (сама функция гейтит по статусу и согласию)
+    if emp.registration_status is not None and emp.consent_status == ConsentStatus.CONFIRMED:
+        create_obligations_for_employee(db, emp)
+
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+
+@app.post("/employees/{employee_id}/termination")
+def employee_termination(
+    employee_id: str,
+    request: Request,
+    termination_date: str = Form(...),
+    basis: str = Form(""),
+    basis_note: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    """Оформление увольнения: пишет contract_end_date, создаёт обязательства (расторжение +
+    убытие) через create_obligations_for_employee. Будущая дата разрешена — обязательства
+    отложатся до наступления (логика в obligations.py). Валидация: дата не раньше договора."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+    if emp.contract_date is None:
+        raise HTTPException(400, "Нельзя оформить увольнение: договор не заключён.")
+    try:
+        term_date = date.fromisoformat(termination_date)
+    except ValueError:
+        raise HTTPException(400, "Некорректная дата увольнения.")
+    # Валидация: дата увольнения не раньше даты договора.
+    if term_date < emp.contract_date:
+        raise HTTPException(400, "Дата увольнения не может быть раньше даты договора.")
+    # основание: если "иное" — берём примечание
+    final_basis = basis_note.strip() if basis == "иное" and basis_note.strip() else basis
+    emp.contract_end_date = term_date
+    db.commit()
+    # создаём обязательства увольнения (расторжение + убытие; будущая дата -> отложатся внутри)
+    create_obligations_for_employee(db, emp)
+    db.commit()
+
+    # Гасим СТАРЫЕ обязательства (от приёма): работник уволен и убывает, они неактуальны и не
+    # должны висеть в просроченных. НЕ трогаем обязательства САМОГО увольнения (расторжение,
+    # снятие с учёта) — их надо подать. Не трогаем уже DONE. Помечаем CANCELLED (след остаётся).
+    _stale_types = [
+        ObligationType.REGISTRATION,
+        ObligationType.MEDICAL_EXAM,
+        ObligationType.DACTYLOSCOPY,
+        ObligationType.EFS1_REPORT,
+        ObligationType.CONTRACT_NOTICE,
+        ObligationType.REGISTRATION_RENEWAL,
+    ]
+    db.query(Obligation).filter(
+        Obligation.employee_id == emp.id,
+        Obligation.type.in_(_stale_types),
+        Obligation.status.in_([ObligationStatus.PENDING, ObligationStatus.OVERDUE]),
+    ).update({Obligation.status: ObligationStatus.CANCELLED}, synchronize_session=False)
+    db.commit()
+
+    # сохраним основание в сессию для генерации уведомления (в модели поля нет — не плодим ALTER)
+    request.session[f"term_basis_{emp.id}"] = final_basis
+    return RedirectResponse(f"/employees/{emp.id}", status_code=303)
+
+
+@app.post("/employees/{employee_id}/termination_notice")
+def employee_termination_notice(employee_id: str, request: Request, db: Session = Depends(get_db)):
+    """Скачать уведомление о расторжении договора (форма №8, приказ №536). Доступно всем
+    вошедшим (прораб тоже может скачать документ)."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+    if emp.contract_end_date is None:
+        raise HTTPException(400, "Увольнение не оформлено — нет даты расторжения.")
+    basis = request.session.get(f"term_basis_{emp.id}", "")
+    try:
+        path = generate_termination_notice_docx(emp, basis=basis)
+    except Exception:
+        raise HTTPException(500, "Не удалось сгенерировать уведомление о расторжении.")
+    fn = f"Уведомление_расторжение_{emp.full_name.replace(' ', '_')}.docx"
+    return FileResponse(path, filename=fn)
+
+
+@app.post("/employees/{employee_id}/departure_notice")
+def employee_departure_notice(employee_id: str, request: Request, db: Session = Depends(get_db)):
+    """Скачать уведомление об убытии (снятие с миграционного учёта). Доступно всем вошедшим."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+    if emp.contract_end_date is None:
+        raise HTTPException(400, "Увольнение не оформлено — нет даты убытия.")
+    try:
+        path = generate_departure_notice_docx(emp)
+    except Exception:
+        raise HTTPException(500, "Не удалось сгенерировать уведомление об убытии.")
+    fn = f"Уведомление_убытие_{emp.full_name.replace(' ', '_')}.docx"
+    return FileResponse(path, filename=fn)
+
+
+@app.post("/employees/{employee_id}/obligation/mark_done")
+def employee_obligation_mark_done(
+    employee_id: str,
+    request: Request,
+    obligation_id: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    """Ручная отметка обязательства как поданного (ЕФС-1, уведомление МВД, регистрация и др.,
+    что подаётся вовне и не имеет своего закрывателя). Пишет DONE + дату + автора. Кадровик/админ."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    ob = db.get(Obligation, obligation_id)
+    if ob is None or ob.employee_id != employee_id:
+        raise HTTPException(404, "Обязательство не найдено")
+    if ob.status == ObligationStatus.DONE:
+        return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+    ob.status = ObligationStatus.DONE
+    ob.done_date = date.today()
+    ob.done_by = _actor_name(request, db)
+    db.add(ob)
+    db.commit()
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+
+@app.post("/employees/{employee_id}/obligation/reopen")
+def employee_obligation_reopen(
+    employee_id: str,
+    request: Request,
+    obligation_id: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    """Отмена ошибочной отметки: возвращает обязательство в работу. Пересчёт статуса
+    (PENDING/OVERDUE) сделает cron при следующем прогоне; ставим PENDING, снимаем дату/автора."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    ob = db.get(Obligation, obligation_id)
+    if ob is None or ob.employee_id != employee_id:
+        raise HTTPException(404, "Обязательство не найдено")
+    ob.status = ObligationStatus.PENDING
+    ob.done_date = None
+    ob.done_by = None
+    db.add(ob)
+    db.commit()
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+
+# Ожидаемая сумма (руб.) по типу слота платёжки. Постановка 500, продление 1000.
+PAYMENT_EXPECTED_AMOUNT = {"payment_registration": 500, "payment_renewal": 1000}
+
+
+def _extract_payment_amounts(text: str) -> set:
+    """Извлекает суммы платежа по МАРКЕРАМ «Сумма платежа» / «Итого» / «Сумма», а не по всему
+    тексту — иначе числа в реквизитах (ОКТМО, КБК, счета, УИН) дают ложные совпадения.
+    Возвращает набор целых рублей, найденных рядом с маркерами."""
+    import re
+    t = text.replace("\xa0", " ")
+    amounts = set()
+    for marker in ["Сумма платежа", "Итого", "Сумма"]:
+        for m in re.finditer(marker, t, re.IGNORECASE):
+            tail = t[m.end():m.end() + 40]
+            num = re.search(r"([\d\s]{1,12}),?\d{0,2}\s*(?:руб|₽|р\.)", tail)
+            if num:
+                val = num.group(1).replace(" ", "").strip()
+                if val.isdigit():
+                    amounts.add(int(val))
+    return amounts
+
+
+def _payment_amount_check(pdf_bytes: bytes, scan_type: str) -> bool | None:
+    """Проверяет сумму платёжки по маркеру «Сумма платежа»/«Итого» (надёжнее, чем поиск числа
+    по всему тексту — реквизиты не мешают). Сравнивает с ожидаемой суммой слота (500/1000).
+    True — ожидаемая сумма найдена и чужой нет; False — найдена чужая сумма (метка);
+    None — текст не прочитан (скан) или маркер суммы не найден (другой формат чека)."""
+    expected = PAYMENT_EXPECTED_AMOUNT.get(scan_type)
+    if expected is None:
+        return None
+    other = 1000 if expected == 500 else 500
+    try:
+        import io
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        text = "".join((p.extract_text() or "") for p in reader.pages)
+        if not text.strip():
+            return None
+        amounts = _extract_payment_amounts(text)
+        if not amounts:
+            return None  # маркер суммы не найден — не проверяем (не блокируем зря)
+        if other in amounts and expected not in amounts:
+            return False  # найдена ТОЛЬКО чужая сумма -> точно не тот слот
+        if expected in amounts:
+            return True   # ожидаемая сумма есть
+        return False      # ожидаемой нет, но какая-то сумма есть -> подозрительно
+    except Exception:
+        return None
+
+
+def _payment_surname_check(pdf_bytes: bytes, full_name: str) -> bool | None:
+    """Проверяет, встречается ли фамилия работника в тексте PDF-платёжки (назначение платежа).
+    True — нашли; False — не нашли (повод предупредить); None — не смогли прочитать (скан без
+    текста/не PDF). Ищем по ФАМИЛИИ как подстроке — устойчиво к падежам/инициалам.
+    ЭТО ХЕЛПЕР, НЕ РОУТ — декоратор @app.post должен стоять над employee_scan_upload ниже."""
+    if not full_name or not full_name.strip():
+        return None
+    surname = full_name.strip().split()[0].lower()
+    if len(surname) < 3:
+        return None
+    try:
+        import io
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        text = "".join((p.extract_text() or "") for p in reader.pages).lower()
+        if not text.strip():
+            return None
+        return surname in text
+    except Exception:
+        return None
+
+
+@app.post("/employees/{employee_id}/passport_pages")
+def employee_passport_pages(
+    employee_id: str,
+    request: Request,
+    all_pages: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    """Сохраняет чекбокс «все страницы паспорта загружены» (подтверждение кадровика)."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+    emp.passport_all_pages = bool(all_pages)  # чекбокс отмечен -> "on", иначе пусто
+    db.commit()
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+
+def _translit_iso(s: str) -> str:
+    """Обратный транслит латиница->кириллица для ЧЕРНОВИКА ФИО. Неоднозначен — только подсказка
+    под ручную сверку с кириллицей на карте. Эвристика: казахское -AYEV/-AYEVA -> -аев/-аева."""
+    if not s:
+        return ""
+    s = s.upper().strip()
+    suffix = ""
+    for lat, cyr in [("AYEVA", "аева"), ("AYEV", "аев"), ("EEVA", "еева"), ("EEV", "еев")]:
+        if s.endswith(lat):
+            suffix = cyr
+            s = s[:-len(lat)]
+            break
+    for lat, cyr in [("SHCH","Щ"),("KH","Х"),("ZH","Ж"),("CH","Ч"),("SH","Ш"),
+                     ("YU","Ю"),("YA","Я"),("YO","Ё"),("TS","Ц")]:
+        s = s.replace(lat, cyr)
+    single = {"A":"А","B":"Б","V":"В","G":"Г","D":"Д","E":"Е","Z":"З","I":"И","Y":"Й",
+              "K":"К","L":"Л","M":"М","N":"Н","O":"О","P":"П","R":"Р","S":"С","T":"Т",
+              "U":"У","F":"Ф","H":"Х","C":"К","J":"Ж","Q":"К","W":"В","X":"КС"}
+    out = "".join(single.get(ch, ch) for ch in s) + suffix
+    return out.capitalize()
+
+
+def _ocr_id_card(image_bytes: bytes) -> dict:
+    """Распознаёт MRZ удостоверения (passporteye) с перебором поворотов. Возвращает dict полей
+    для формы: full_name_translit, birth_date(ISO), passport_number, iin, citizenship. Пустой
+    dict, если MRZ не распознана или passporteye не установлен. ФИО — черновик под сверку."""
+    try:
+        import io
+        from passporteye import read_mrz
+        from PIL import Image, ImageOps
+    except ImportError:
+        return {}
+    try:
+        base = Image.open(io.BytesIO(image_bytes))
+        base = ImageOps.exif_transpose(base)
+        if base.mode != "RGB":
+            base = base.convert("RGB")
+    except Exception:
+        return {}
+    best, best_score = None, -1
+    for angle in (0, 90, 180, 270):
+        try:
+            rot = base.rotate(angle, expand=True)
+            buf = io.BytesIO(); rot.save(buf, format="PNG"); buf.seek(0)
+            m = read_mrz(buf)
+            if m is not None:
+                sc = m.to_dict().get("valid_score", 0)
+                if sc > best_score:
+                    best, best_score = m, sc
+        except Exception:
+            continue
+    if best is None:
+        return {}
+    d = best.to_dict()
+    res = {}
+
+    def _clean_mrz_name(raw):
+        # MRZ-имя: разделители '<' -> пробел, оставляем только части длиной >1 (одиночные буквы —
+        # артефакты распознавания, как хвост 'K' от <<K<<). Возвращаем очищенную строку.
+        parts = [p for p in (raw or "").replace("<", " ").split() if len(p) > 1]
+        return " ".join(parts)
+
+    surname = _clean_mrz_name(d.get("surname"))
+    names = _clean_mrz_name(d.get("names"))
+    res["full_name_translit"] = " ".join(p for p in [_translit_iso(surname), _translit_iso(names)] if p)
+    res["passport_number"] = (d.get("number") or "").replace("<", "").strip()
+    dob = (d.get("date_of_birth") or "").strip()
+    res["birth_date"] = ""
+    if len(dob) == 6 and dob.isdigit():
+        import datetime as _dt
+        yy, mm, dd = int(dob[:2]), dob[2:4], dob[4:6]
+        cur_yy = _dt.date.today().year % 100
+        year = 1900 + yy if yy > cur_yy else 2000 + yy
+        try:
+            _dt.date(year, int(mm), int(dd))
+            res["birth_date"] = f"{year:04d}-{mm}-{dd}"
+        except Exception:
+            res["birth_date"] = ""
+    # ИИН (12 цифр) — ищем в OPTIONAL-поле MRZ по СТРУКТУРЕ формата (не regex по всей строке,
+    # иначе цепляются невыровненные окна из соседних полей). ID-карта (TD1, 3 строки ~30):
+    # optional в конце 1-й строки. Загранпаспорт (TD3, 2 строки ~44): optional в 2-й строке
+    # (позиции 28-42). Подтверждаем: первые 6 цифр ИИН = дата рождения.
+    iin = ""
+    try:
+        import re as _re
+        raw = (d.get("raw_text", "") or "")
+        dob6 = (d.get("date_of_birth") or "").strip()  # ГГММДД
+        lines = [ln.replace(" ", "") for ln in raw.splitlines() if ln.strip()]
+        optionals = []
+        if len(lines) >= 3 and len(lines[0]) <= 32:      # TD1 — ID-карта
+            optionals.append(lines[0][15:])
+        if len(lines) >= 2 and len(lines[1]) >= 40:      # TD3 — загранпаспорт
+            optionals.append(lines[1][28:42])
+        for opt in optionals:
+            digits = opt.replace("<", "")
+            matched = False
+            for m in _re.finditer(r"\d{12}", digits):
+                if dob6 and m.group()[:6] == dob6:
+                    iin = m.group()
+                    matched = True
+                    break
+            if matched:
+                break
+            if len(digits) == 12 and digits.isdigit():
+                iin = digits
+                break
+    except Exception:
+        pass
+    res["iin"] = iin
+    # Вид документа по формату MRZ: TD1 (3 строки ~30) — ID-карта; TD3 (2 строки ~44) — паспорт.
+    # Плюс тип из первой буквы MRZ: "P" = паспорт, "I"/"A"/"C" = ID/удостоверение.
+    _lines = [ln.replace(" ", "") for ln in (d.get("raw_text", "") or "").splitlines() if ln.strip()]
+    _doc_letter = (d.get("type") or "").upper()[:1]
+    if _doc_letter == "P" or (len(_lines) == 2 and len(_lines[0]) >= 40):
+        res["doc_type"] = "passport"
+    else:
+        res["doc_type"] = "id"
+    nat = (d.get("nationality") or "").strip()
+    res["citizenship"] = "Казахстан" if nat[:2] == "KA" else nat
+    return res
+
+
+def _process_image(data: bytes) -> bytes:
+    """Обработка фото перед сохранением: автоповорот по EXIF (чтобы документ не был боком),
+    ужатие разрешения (не больше 2000px по длинной стороне — качество документа не страдает) и
+    сжатие в JPG качества 85. Уменьшает вес телефонных снимков в разы. Возвращает JPG-байты.
+    Если это не изображение — возвращает исходные байты без изменений."""
+    try:
+        import io
+        from PIL import Image, ImageOps
+        im = Image.open(io.BytesIO(data))
+        im = ImageOps.exif_transpose(im)  # поворот по EXIF
+        if im.mode != "RGB":
+            im = im.convert("RGB")
+        # ужать, если больше 2000px по длинной стороне
+        maxside = 2000
+        if max(im.size) > maxside:
+            ratio = maxside / max(im.size)
+            im = im.resize((int(im.width * ratio), int(im.height * ratio)))
+        out = io.BytesIO()
+        im.save(out, format="JPEG", quality=85, optimize=True)
+        return out.getvalue()
+    except Exception:
+        return data  # не изображение или ошибка — как есть
+
+
+def _close_medical_on_cert(db, employee_id: str) -> None:
+    """Скан справки загружен -> медкомиссия пройдена: Referral=COMPLETED (+result_date),
+    связанное Obligation(MEDICAL_EXAM)=DONE. Останавливает отсчёт 14 дней."""
+    from models import Referral, ExamStatus, Obligation, ObligationType, ObligationStatus
+    refs = db.scalars(
+        select(Referral).where(Referral.employee_id == employee_id)
+        .where(Referral.exam_status != ExamStatus.COMPLETED)
+    ).all()
+    for r in refs:
+        r.exam_status = ExamStatus.COMPLETED
+        if not r.result_date:
+            r.result_date = date.today()
+        ob = db.get(Obligation, r.obligation_id)
+        if ob is not None and ob.status != ObligationStatus.DONE:
+            ob.status = ObligationStatus.DONE
+    db.commit()
+
+
+def _reopen_medical_on_cert_delete(db, employee_id: str) -> None:
+    """Скан справки удалён -> откат медкомиссии: Referral обратно REFERRED, Obligation в PENDING.
+    Возобновляет отсчёт (скан — единственный критерий завершения)."""
+    from models import Referral, ExamStatus, Obligation, ObligationStatus
+    refs = db.scalars(
+        select(Referral).where(Referral.employee_id == employee_id)
+        .where(Referral.exam_status == ExamStatus.COMPLETED)
+    ).all()
+    for r in refs:
+        r.exam_status = ExamStatus.REFERRED
+        r.result_date = None
+        ob = db.get(Obligation, r.obligation_id)
+        if ob is not None and ob.status == ObligationStatus.DONE:
+            ob.status = ObligationStatus.PENDING
+    db.commit()
+
+
+@app.post("/employees/{employee_id}/scan/upload")
+async def employee_scan_upload(
+    employee_id: str,
+    request: Request,
+    scan_type: str = Form(...),
+    files: list[UploadFile] = File(default=[]),
+    db: Session = Depends(get_db),
+):
+    """Загрузка скана в хранилище. Доступ — кадровик/админ. Можно выбрать НЕСКОЛЬКО файлов
+    (напр. паспорт на 2 страницах — два PDF): они склеиваются в один PDF под одним ключом,
+    чтобы вторая загрузка не затирала первую. Один файл — сохраняется как есть.
+    files необязателен на уровне FastAPI (default=[]), пустоту проверяем ниже — иначе строгий
+    File(...) даёт 422 на некоторых браузерах (десктоп по-разному шлёт multiple file input)."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    if scan_type not in SCAN_TYPES:
+        raise HTTPException(400, "Неизвестный тип скана.")
+    if not files:
+        raise HTTPException(400, "Файл не выбран. Выберите PDF или фото и нажмите «Загрузить».")
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    # Читаем все выбранные файлы.
+    parts = []
+    for f in files:
+        b = await f.read()
+        if b:
+            parts.append((b, f.content_type or "application/octet-stream"))
+    if not parts:
+        raise HTTPException(400, "Пустой файл.")
+
+    if len(parts) == 1:
+        data, ct = parts[0]
+        # одиночное фото — обрабатываем (поворот/сжатие), PDF — оставляем как есть
+        if "pdf" not in (ct or "").lower() and "image" in (ct or "").lower():
+            data = _process_image(data)
+            ct = "image/jpeg"
+    else:
+        # Несколько файлов — склеиваем в один PDF. Поддерживаем PDF И изображения (PNG/JPG):
+        # фото страниц удостоверения конвертируются в страницы PDF, PDF-части добавляются как есть.
+        # Итог — один многостраничный PDF под одним ключом (вторая страница не затирает первую).
+        try:
+            import io
+            from pypdf import PdfWriter, PdfReader
+            from PIL import Image
+            writer = PdfWriter()
+            for b, pct in parts:
+                low = (pct or "").lower()
+                if "pdf" in low:
+                    reader = PdfReader(io.BytesIO(b))
+                    for page in reader.pages:
+                        writer.add_page(page)
+                else:
+                    # изображение -> обработка (поворот/сжатие) -> одностраничный PDF -> страница
+                    pb = _process_image(b)
+                    im = Image.open(io.BytesIO(pb))
+                    if im.mode != "RGB":
+                        im = im.convert("RGB")
+                    tmp = io.BytesIO()
+                    im.save(tmp, format="PDF")
+                    tmp.seek(0)
+                    for page in PdfReader(tmp).pages:
+                        writer.add_page(page)
+            out = io.BytesIO()
+            writer.write(out)
+            data = out.getvalue()
+            ct = "application/pdf"
+        except Exception:
+            raise HTTPException(400, "Не удалось объединить файлы. Загрузите страницы как PDF "
+                                     "или фото (PNG/JPG) — они склеятся в один PDF.")
+
+    if len(data) > 15 * 1024 * 1024:
+        raise HTTPException(400, "Итоговый файл больше 15 МБ — сожмите страницы.")
+
+    # Для платёжек: проверяем фамилию И сумму. Если хоть что-то не сошлось (или чужая сумма) —
+    # помечаем скан «требует проверки» (метка check=1 в метаданных S3), но НЕ блокируем загрузку.
+    # Проверки обёрнуты — они не должны ронять загрузку ни при каких условиях.
+    _meta = None
+    warn = ""
+    if scan_type in PAYMENT_SCAN_TYPES:
+        need_check = False
+        try:
+            if _payment_surname_check(data, emp.full_name or "") is False:
+                need_check = True
+        except Exception:
+            pass
+        try:
+            if _payment_amount_check(data, scan_type) is False:
+                need_check = True
+        except Exception:
+            pass
+        if need_check:
+            _meta = {"check": "1"}
+            warn = "?warn=payment"
+
+    eid = None if scan_type in SCAN_COMMON_TYPES else employee_id
+    try:
+        _s3_upload(scan_type, eid, data, ct, metadata=_meta)
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+    # Скан справки медкомиссии -> закрываем медобязательство (COMPLETED/DONE).
+    if scan_type == "medical_certificate":
+        _close_medical_on_cert(db, employee_id)
+    return RedirectResponse(f"/employees/{employee_id}{warn}", status_code=303)
+
+
+@app.post("/employees/{employee_id}/scan/download")
+def employee_scan_download(
+    employee_id: str,
+    request: Request,
+    scan_type: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    """Скачивание скана. Доступ — кадровик/админ (паспортные данные прорабу недоступны)."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK, UserRole.PRORAB)
+    if scan_type not in SCAN_TYPES:
+        raise HTTPException(400, "Неизвестный тип скана.")
+    emp = db.get(Employee, employee_id)
+    _fio = (emp.full_name if emp else "").strip().replace(" ", "_")
+    eid = None if scan_type in SCAN_COMMON_TYPES else employee_id
+    try:
+        data, ct = _s3_download(scan_type, eid)
+    except RuntimeError as e:
+        raise HTTPException(404, str(e))
+    ext = "pdf" if "pdf" in ct else ("jpg" if "jpeg" in ct or "jpg" in ct else "bin")
+    _type_name = SCAN_TYPES[scan_type].split('(')[0].strip().replace(' ', '_')
+    # ФИО впереди, затем тип — чтобы в загрузках не путать файлы разных работников.
+    fn = f"{_fio}_{_type_name}.{ext}" if _fio else f"{_type_name}.{ext}"
+    return Response(content=data, media_type=ct,
+                    headers={"Content-Disposition": _content_disposition(fn)})
+
+
+@app.get("/employees/{employee_id}/scan/view")
+def employee_scan_view(
+    employee_id: str,
+    request: Request,
+    scan_type: str,
+    db: Session = Depends(get_db),
+):
+    """Просмотр скана в браузере (inline, открывается в новой вкладке — ссылка target=_blank
+    в карточке). Отличие от скачивания: Content-Disposition inline, а не attachment. GET —
+    чтобы работала обычная ссылка. Доступ — кадровик/админ."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK, UserRole.PRORAB)
+    if scan_type not in SCAN_TYPES:
+        raise HTTPException(400, "Неизвестный тип скана.")
+    eid = None if scan_type in SCAN_COMMON_TYPES else employee_id
+    try:
+        data, ct = _s3_download(scan_type, eid)
+    except RuntimeError as e:
+        raise HTTPException(404, str(e))
+    return Response(content=data, media_type=ct,
+                    headers={"Content-Disposition": "inline"})
+
+
+@app.post("/employees/{employee_id}/scan/delete")
+def employee_scan_delete(
+    employee_id: str,
+    request: Request,
+    scan_type: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    """Удаление скана. Доступ — кадровик/админ."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    if scan_type not in SCAN_TYPES:
+        raise HTTPException(400, "Неизвестный тип скана.")
+    eid = None if scan_type in SCAN_COMMON_TYPES else employee_id
+    try:
+        _s3_delete(scan_type, eid)
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+    # Удалён скан справки -> откат медкомиссии в ожидание.
+    if scan_type == "medical_certificate":
+        _reopen_medical_on_cert_delete(db, employee_id)
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+
+@app.post("/employees/{employee_id}/scan/confirm")
+def employee_scan_confirm(
+    employee_id: str,
+    request: Request,
+    scan_type: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    """Подтверждение платёжки «требует проверки»: кадровик сверил вручную, снимаем метку check."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    if scan_type not in SCAN_TYPES:
+        raise HTTPException(400, "Неизвестный тип скана.")
+    eid = None if scan_type in SCAN_COMMON_TYPES else employee_id
+    try:
+        _s3_clear_check(scan_type, eid)
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+
+# --- Общие документы (страница кадровика/админа) --------------------------------------------
+@app.get("/common-docs", response_class=HTMLResponse)
+def common_docs_page(request: Request, db: Session = Depends(get_db)):
+    """Страница общих документов: паспорт директора, документ-основание на адрес подразделения.
+    Один файл на всех работников. Доступ — кадровик/админ, не прораб (паспортные данные)."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    present = _s3_list_common()
+    rows = ""
+    for dt, label in COMMON_DOC_TYPES.items():
+        has = present.get(dt, False)
+        status = '<span style="color:#1a7f37">загружен ✓</span>' if has else '<span class="muted">нет</span>'
+        actions = ""
+        if has:
+            actions = f'''<form method="post" action="/common-docs/download" style="display:inline">
+<input type="hidden" name="doc_type" value="{dt}">
+<button type="submit" class="secondary">Скачать</button></form>
+<form method="post" action="/common-docs/delete" style="display:inline"
+onsubmit="return confirm(&#39;Удалить документ?&#39;)">
+<input type="hidden" name="doc_type" value="{dt}">
+<button type="submit" class="secondary">Удалить</button></form>'''
+        rows += f'''<div style="margin:12px 0;padding:12px;border:1px solid #e6e9ee;border-radius:8px">
+<b>{label}</b> — {status}
+<form method="post" action="/common-docs/upload" enctype="multipart/form-data" style="margin-top:8px">
+<input type="hidden" name="doc_type" value="{dt}">
+<input type="file" name="file" accept="application/pdf,image/*" required style="display:block;width:100%;margin:8px 0;padding:10px;border:1px solid #d9dde3;border-radius:8px;background:#fff;font-size:16px">
+<button type="submit" class="btn-full btn-upload">Загрузить</button></form>
+<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">{actions}</div>
+</div>'''
+    body = f'''<section class="card">
+<h1>Общие документы</h1>
+<p class="muted">Документы, единые для всех работников: паспорт директора (принимающая сторона)
+и документ-основание на адрес подразделения. Входят в каждый пакет Госуслуг. PDF или фото, до 15 МБ.</p>
+{rows}
+<a class="btn secondary" href="/employees">← К сотрудникам</a>
+</section>'''
+    return _render("Общие документы", body, active="common", role=request.session.get("role", ""))
+
+
+@app.post("/common-docs/upload")
+async def common_docs_upload(request: Request, doc_type: str = Form(...),
+                             file: UploadFile = File(...), db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    if doc_type not in COMMON_DOC_TYPES:
+        raise HTTPException(400, "Неизвестный тип документа.")
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "Пустой файл.")
+    if len(data) > 15 * 1024 * 1024:
+        raise HTTPException(400, "Файл больше 15 МБ.")
+    try:
+        _s3_upload_common(doc_type, data, file.content_type or "application/octet-stream")
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+    return RedirectResponse("/common-docs", status_code=303)
+
+
+@app.post("/common-docs/download")
+def common_docs_download(request: Request, doc_type: str = Form(...), db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    if doc_type not in COMMON_DOC_TYPES:
+        raise HTTPException(400, "Неизвестный тип документа.")
+    try:
+        data, ct = _s3_download_common(doc_type)
+    except RuntimeError as e:
+        raise HTTPException(404, str(e))
+    fn = f"{COMMON_DOC_TYPES[doc_type].split('(')[0].strip().replace(' ', '_')}.{_ext_for(ct)}"
+    return Response(content=data, media_type=ct,
+                    headers={"Content-Disposition": _content_disposition(fn)})
+
+
+@app.post("/common-docs/delete")
+def common_docs_delete(request: Request, doc_type: str = Form(...), db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    if doc_type not in COMMON_DOC_TYPES:
+        raise HTTPException(400, "Неизвестный тип документа.")
+    try:
+        _s3_delete_common(doc_type)
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+    return RedirectResponse("/common-docs", status_code=303)
+
+
+@app.post("/employees/{employee_id}/package")
+def employee_package(employee_id: str, request: Request, db: Session = Depends(get_db)):
+    """Пакет для Госуслуг одним ZIP: персональные сканы (паспорт, миграционная карта, платёжка)
+    + общие документы (паспорт директора, основание на адрес) + договор PDF (без печати —
+    подписывается ЭЦП). Неполный пакет — отказ с перечнем недостающего."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+    missing = _package_missing(emp)
+    if missing:
+        raise HTTPException(400, "Пакет неполный, не хватает: " + "; ".join(missing))
+
+    import io, zipfile
+    safe_name = (emp.full_name or "работник").replace(" ", "_")
+    buf = io.BytesIO()
+    try:
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            for st, label in SCAN_TYPES.items():
+                data, ct = _s3_download(st, employee_id)
+                _tn = label.split('(')[0].strip().replace(' ', '_')
+                z.writestr(f"{safe_name}_{_tn}.{_ext_for(ct)}", data)
+            for dt, label in COMMON_DOC_TYPES.items():
+                data, ct = _s3_download_common(dt)
+                z.writestr(f"{label.split('(')[0].strip()}.{_ext_for(ct)}", data)
+            docx_path = generate_labor_contract_docx(
+                emp, position="Монтажник", salary="30000", contract_date=emp.contract_date,
+            )
+            pdf_path = _docx_to_pdf(docx_path)
+            with open(pdf_path, "rb") as f:
+                z.writestr("Трудовой_договор.pdf", f.read())
+    except RuntimeError as e:
+        raise HTTPException(500, f"Не удалось собрать пакет: {e}")
+    except Exception:
+        raise HTTPException(500, "Ошибка сборки пакета. Проверьте логи.")
+    buf.seek(0)
+    return Response(content=buf.read(), media_type="application/zip",
+                    headers={"Content-Disposition": _content_disposition(f"Пакет_Госуслуги_{safe_name}.zip")})
+
+
+@app.post("/employees/{employee_id}/termination/cancel")
+def employee_termination_cancel(employee_id: str, request: Request, db: Session = Depends(get_db)):
+    """Отмена оформления увольнения: снимает contract_end_date, удаляет связанные незакрытые
+    обязательства (расторжение/убытие). Кадровик/админ."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+    from models import Obligation, ObligationType, ObligationStatus
+    # удалить незакрытые обязательства увольнения (расторжение/убытие)
+    db.query(Obligation).filter(
+        Obligation.employee_id == emp.id,
+        Obligation.type.in_([ObligationType.CONTRACT_TERMINATION_NOTICE, ObligationType.DEPARTURE_NOTICE]),
+        Obligation.status != ObligationStatus.DONE,
+    ).delete(synchronize_session=False)
+    # вернуть в работу старые обязательства, снятые при оформлении увольнения (CANCELLED -> PENDING).
+    # Cron при следующем прогоне пересчитает просрочку по дедлайну. Так отмена увольнения
+    # полностью откатывает и гашение старых обязательств.
+    db.query(Obligation).filter(
+        Obligation.employee_id == emp.id,
+        Obligation.status == ObligationStatus.CANCELLED,
+    ).update({Obligation.status: ObligationStatus.PENDING}, synchronize_session=False)
+    emp.contract_end_date = None
+    db.commit()
+    request.session.pop(f"term_basis_{emp.id}", None)
+    return RedirectResponse(f"/employees/{emp.id}", status_code=303)
+
+
+@app.post("/employees/{employee_id}/labor_contract/cancel")
+def employee_labor_contract_cancel(
+    employee_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Отмена договора: откатывает contract_date в NULL и снимает НЕ выполненные обязательства,
+    порождённые договором (CONTRACT_NOTICE — уведомление МВД, EFS1_REPORT — ЕФС-1). Выполненные
+    (DONE) НЕ трогаются — они след того, что документы подавались в срок, стирать нельзя.
+    Само поле contract_date общее с ручным вводом в карточке, отмена его тоже обнулит."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _cu = _current_user(request, db)
+    if _cu is None:
+        raise HTTPException(401, "Требуется вход")
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    # Отмена договора: админ — всегда; кадровик — только в день заключения (свежая ошибка ввода).
+    # Позже кадровику нельзя (заметание следов/поздний откат обязательств) — только админ.
+    if _cu.role != UserRole.ADMIN:
+        if _cu.role != UserRole.KADROVIK:
+            raise HTTPException(403, "Недостаточно прав")
+        if emp.contract_date != date.today():
+            raise HTTPException(
+                403, "Отмена договора доступна кадровику только в день заключения. Обратитесь к администратору."
+            )
+
+    emp.contract_date = None
+
+    # снять только PENDING обязательства от договора; DONE оставить
+    contract_types = (ObligationType.CONTRACT_NOTICE, ObligationType.EFS1_REPORT)
+    obs = db.scalars(
+        select(Obligation)
+        .where(Obligation.employee_id == emp.id)
+        .where(Obligation.type.in_(contract_types))
+        .where(Obligation.is_current == True)  # noqa: E712
+        .where(Obligation.status == ObligationStatus.PENDING)
+    ).all()
+    for o in obs:
+        db.delete(o)
+
+    db.commit()
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+
+def _render_referral_preview(emp: Employee, obligation_id: str, missing_fields: list[str] | None = None) -> str:
+    """HTML-версия направления для экрана/печати — содержание зеркалит
+    generate_medical_referral_docx в document_templates.py. Если меняешь текст/поля
+    там — поменяй и здесь, иначе предпросмотр разойдётся с реальным .docx.
+
+    missing_fields: если непусто (только в тестовом режиме), показывает баннер над
+    документом — то же предупреждение, что вставлено в сам docx."""
+    birth = emp.birth_date.strftime("%d.%m.%Y") if emp.birth_date else "—"
+    name_parts = emp.full_name.split()
+    surname = name_parts[0] if name_parts else "—"
+    first_name = name_parts[1] if len(name_parts) > 1 else "—"
+    patronymic = name_parts[2] if len(name_parts) > 2 else "—"
+
+    download_url = f"/medical/{emp.id}/referral/{obligation_id}/download"
+
+    warning_banner = ""
+    if missing_fields:
+        warning_banner = (
+            '<div class="warning-banner">⚠ ТЕСТОВЫЙ ЧЕРНОВИК — не заполнены поля: '
+            + ", ".join(missing_fields)
+            + '. Документ не имеет юридической силы, пока эти поля не указаны в карточке '
+            "сотрудника и документ не перегенерирован.</div>"
+        )
+
+    body = f"""
+<style>
+@media print {{
+  nav, .no-print {{ display: none !important; }}
+  body {{ background: #fff !important; }}
+  section {{ box-shadow: none !important; border: none !important; }}
+}}
+.referral-doc p {{ margin: 4px 0; }}
+</style>
+
+<h1>Направление на медосмотр</h1>
+
+{warning_banner}
+
+<div class="no-print" style="margin-bottom:14px">
+<button onclick="window.print()">🖨 Печать</button>
+<a class="btn secondary" href="{download_url}">⬇ Скачать .docx</a>
+<a class="btn secondary" href="/medical">← К медкомиссии</a>
+</div>
+
+<section class="narrow referral-doc">
+<p style="text-align:right">к Договору № {CLINIC_CONTRACT_NUMBER} от «{CLINIC_CONTRACT_DATE}»<br>Приложение № 1</p>
+<p style="text-align:center"><strong>НАПРАВЛЕНИЕ НА МЕДИЦИНСКОЕ ОСВИДЕТЕЛЬСТВОВАНИЕ</strong></p>
+<p>В {REFERRAL_CLINIC_NAME}</p>
+<p class="muted">наименование медицинской организации (МО)</p>
+<p>1. Фамилия {surname}</p>
+<p>Имя {first_name}</p>
+<p>Отчество {patronymic}</p>
+<p>2. Дата рождения (число, месяц, год) {birth}</p>
+<p>3. Адрес (по месту проживания) {emp.address or "—"}</p>
+<p>4. Серия паспорта {emp.passport_series or "—"} Номер паспорта {emp.passport_number or "—"}</p>
+<p>5. Место работы {REFERRAL_PAYER_NAME}</p>
+<p>6. Наименование медицинской услуги (медицинского освидетельствования)</p>
+<p>{MEDICAL_SERVICE_TEXT}</p>
+<p>7. Дата проведения услуги _____________ кабинет N _____ время _____</p>
+<p>8. Полное наименование организации, направившей иностранного гражданина, телефон {PAYER_PHONE}</p>
+<p>{REFERRAL_PAYER_NAME}</p>
+<p>подпись, печать _____________________</p>
+<p>10. Дата выдачи направления {date.today().strftime('%d.%m.%Y')}</p>
+<br>
+<table style="width:100%">
+<tr><td><strong>От Исполнителя:</strong></td><td><strong>От Заказчика:</strong></td></tr>
+<tr><td>{REFERRAL_CLINIC_SHORT_NAME}</td><td>Индивидуальный предприниматель</td></tr>
+<tr><td>Главный врач</td><td>&nbsp;</td></tr>
+<tr><td>_____________________ {CLINIC_CHIEF_DOCTOR_NAME}<br>м.п.</td>
+<td>_____________________ {PAYER_SIGNATORY_NAME}<br>м.п.</td></tr>
+</table>
+</section>
+"""
+    return _render("Направление на медосмотр", body, active="medical", role=request.session.get("role",""))
+
+
+@app.post("/medical/{employee_id}/result")
+def medical_result(
+    employee_id: str,
+    request: Request,
+    result: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    """result='done': медосмотр пройден — направление -> COMPLETED, обязательство -> DONE.
+    result='failed': ВРЕМЕННОЕ тестовое поведение — направление УДАЛЯЕТСЯ, сотрудник
+    возвращается в очередь на выписку, обязательство остаётся PENDING (дедлайн жив).
+    ВНИМАНИЕ: это РАСХОДИТСЯ с bot.py (_handle_medical_exam_result, где 'failed' лишь
+    оставляет статус без изменений). Расхождение осознанное и временное — позже 'failed'
+    заменяется на статус ExamStatus.CANCELLED с сохранением истории, и обе точки (bot.py и
+    webforms.py) снова синхронизируются. См. отложенную задачу по полноценной истории."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+
+    if result not in ("done", "failed"):
+        raise HTTPException(400, "result должен быть 'done' или 'failed'")
+
+    referral = db.scalars(
+        select(Referral)
+        .where(Referral.employee_id == employee_id)
+        .where(Referral.exam_status == ExamStatus.REFERRED)
+        .order_by(Referral.referral_date.desc())
+    ).first()
+    if referral is None:
+        raise HTTPException(404, "Нет направления, ожидающего результата, для этого сотрудника")
+
+    if result == "failed":
+        # ВРЕМЕННО (тест): "не пройдено/не явился" = удаляем текущее направление, чтобы
+        # сотрудник вернулся в список "Выписать направление" (фильтр need_referral —
+        # "нет связанного Referral"). Обязательство медосмотра остаётся PENDING, дедлайн жив.
+        # ВНИМАНИЕ: cascade="all, delete-orphan" на Referral.invoices — удаление сносит и
+        # связанные Invoice. Для теста приемлемо (счетов ещё нет). Позже заменить на статус
+        # ExamStatus.CANCELLED с сохранением истории и счёта — отложенная задача.
+        db.delete(referral)
+        db.commit()
+        return RedirectResponse("/medical", status_code=303)
+
+    # result == "done": медосмотр пройден — направление завершается, обязательство закрывается.
+    referral.exam_status = ExamStatus.COMPLETED
+    referral.result_date = date.today()
+    db.add(referral)
+
+    obligation = db.get(Obligation, referral.obligation_id)
+    if obligation is not None:
+        obligation.status = ObligationStatus.DONE
+        db.add(obligation)
+
+    db.commit()
+    return RedirectResponse("/medical", status_code=303)
+
+
+# --- ВРЕМЕННО: тестовый роут OCR (/ocr-test). Убрать после проверки passporteye ---------------
+# Изолированный тест распознавания MRZ с фото удостоверения. Требует passporteye в requirements
+# и tesseract-ocr в RAILPACK_DEPLOY_APT_PACKAGES. После теста удалить: эти 4 строки, файл
+# ocr_test.py, passporteye из requirements, tesseract из apt-переменной.
+try:
+    import ocr_test
+    ocr_test.register(app)
+except Exception:
+    pass  # если ocr_test.py не подключён/удалён — рабочая система не падает
+
+
+# --- Деплой на Railway (кратко) ---------------------------------------------
+# 1. Файл лежит в том же репозитории, что bot.py и models.py — просто закоммить
+#    через GitHub web (Add file → Create new file → webforms.py).
+# 2. В requirements.txt добавить строки:
+#      fastapi
+#      uvicorn[standard]
+#      itsdangerous
+#      python-multipart
+# 3. В Railway: New Service → Deploy from GitHub repo (тот же репозиторий),
+#    в Settings → Deploy → Start Command указать:
+#      uvicorn webforms:app --host 0.0.0.0 --port $PORT
+# 4. В Variables этого нового сервиса добавить:
+#      DATABASE_URL          — Reference на существующий Postgres-плагин
+#      WEBFORMS_USER          — логин кадровика
+#      WEBFORMS_PASSWORD      — пароль кадровика
+#      WEBFORMS_SECRET_KEY    — любая случайная длинная строка (для сессий)
+#      TEST_ALLOW_MISSING_FIELDS — "true", ЧТОБЫ ВРЕМЕННО разрешить генерацию направлений
+#                                   с прочерками при незаполненных полях (см. document_templates.py).
+#                                   Убрать/поставить "false" перед реальной работой с сотрудниками.
+# 5. Railway выдаст публичный URL сервиса (Settings → Networking → Generate Domain).
