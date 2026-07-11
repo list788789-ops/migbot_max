@@ -85,6 +85,9 @@ from models import (
     Certificate,
     InternalOrder,
     OrderCategory,
+    Brigade,
+    BrigadeMember,
+    Instruction,
 )
 from obligations import create_obligations_for_employee
 from auth_binding import get_role_label, find_user_by_max_id
@@ -1443,6 +1446,9 @@ def production_page(request: Request):
 <div class="card"><h3 style="margin:0 0 6px">📑 Приказы</h3>
 <p class="muted" style="margin:0 0 10px">Реестр внутренних приказов — сканы, номера, используется в футерах печатных бланков.</p>
 <a class="btn" href="/production/orders">Открыть</a></div>
+<div class="card"><h3 style="margin:0 0 6px">👷 Бригады</h3>
+<p class="muted" style="margin:0 0 10px">Сохранённые составы — выбор бригадой целиком при создании наряда, без ручной отметки каждого.</p>
+<a class="btn" href="/production/brigades">Открыть</a></div>
 </section>
 """
     return _render("Производство", body, active="production", role=request.session.get("role", ""))
@@ -1461,9 +1467,15 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
     emp_options = "".join(f'<option value="{e.id}">{e.full_name}</option>' for e in employees)
     emp_checkboxes = "".join(
         f'<label style="display:block;margin:2px 0"><input type="checkbox" name="member_ids" '
-        f'value="{e.id}"> {e.full_name}</label>'
+        f'id="memberCb_{e.id}" value="{e.id}"> {e.full_name}</label>'
         for e in employees
     )
+    brigades = prod.get_brigades(db)
+    brigade_options = "".join(f'<option value="{b.id}">{b.name}</option>' for b in brigades)
+    import json as _json
+    brigades_js_map = _json.dumps({
+        b.id: prod.get_brigade_member_ids(db, b.id) for b in brigades
+    })
 
     def order_row(o) -> str:
         members = db.query(WorkOrderMember).filter_by(work_order_id=o.id).all()
@@ -1496,6 +1508,9 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
 <select name="responsible_executor_id" required>{emp_options}</select></label>
 <label>Действует с: <input type="date" name="valid_from" required></label>
 <label>Действует по: <input type="date" name="valid_to" required></label>
+<label>Выбрать готовую бригаду (необязательно):
+<select id="brigadeSelect"><option value="">— вручную —</option>{brigade_options}</select></label>
+<button type="button" class="secondary" onclick="_applyBrigade()">Применить состав</button>
 <fieldset><legend>Члены бригады</legend>{emp_checkboxes}</fieldset>
 <fieldset><legend>Дополнительно (необязательно)</legend>
 <textarea name="materials" placeholder="Материалы" rows="2"></textarea>
@@ -1510,6 +1525,20 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
 </form>
 </section>
 <p><a class="btn secondary" href="/production">← Производство</a></p>
+<script>
+var _brigadesData = {brigades_js_map};
+function _applyBrigade(){{
+  var sel = document.getElementById('brigadeSelect');
+  var brigadeId = sel.value;
+  document.querySelectorAll('input[name=member_ids]').forEach(function(cb){{ cb.checked = false; }});
+  if (!brigadeId) return;
+  var ids = _brigadesData[brigadeId] || [];
+  ids.forEach(function(id){{
+    var cb = document.getElementById('memberCb_' + id);
+    if (cb) cb.checked = true;
+  }});
+}}
+</script>
 """
     return _render("Наряды-допуски", body, active="production", role=request.session.get("role", ""))
 
@@ -1602,11 +1631,44 @@ def instructions_page(request: Request, db: Session = Depends(get_db)):
         f'<a class="btn" href="/employees/{d["employee_id"]}">Открыть карточку</a></div>'
         for d in due
     )
+
+    # Автозаполнение вводного всем + допечатка журнала партиями по каждому типу —
+    # см. договорённость: журналы заполняются ВСЕМИ сотрудниками (не по одному
+    # вручную), печать — только новых непечатанных записей, отдельная нумерация
+    # на каждый InstructionType.
+    need_intro = len(prod.get_employees_needing_introductory(db))
+    journal_rows = ""
+    for t, label in prod.INSTRUCTION_LABELS.items():
+        unprinted = len(prod.get_unprinted_instructions(db, t))
+        journal_rows += (
+            f'<div class="card">{label}<br>'
+            f'<span class="badge {"orange" if unprinted else "neutral"}">Ждут печати: {unprinted}</span><br>'
+            f'<form method="post" action="/production/instructions/print" style="display:inline">'
+            f'<input type="hidden" name="instruction_type" value="{t.value}">'
+            f'<button type="submit" class="btn secondary">Допечатать новые записи</button></form></div>'
+        )
+
     body = f"""
 <h1>🎓 Инструктажи</h1>
 {f'<section class="grid"><h2>⏰ Требуют повторного проведения ({len(due)})</h2>{due_rows}</section>' if due else ''}
+
+<section class="grid">
+<h2>Журналы — допечатка партиями</h2>
+{journal_rows}
+</section>
+
+{f'''<section>
+<h2>Вводный инструктаж — автозаполнение</h2>
+<p class="muted">Сотрудников без вводного инструктажа: {need_intro}. Заводит запись каждому
+датой начала работы (дата договора, а если её нет — дата въезда) — не сегодняшним числом,
+чтобы порядок строк в журнале при печати совпадал с реальной хронологией приёма.</p>
+<form method="post" action="/production/instructions/auto-introductory">
+<button type="submit">Заполнить вводный всем ({need_intro})</button>
+</form>
+</section>''' if need_intro else ''}
+
 <section>
-<h2>Провести инструктаж</h2>
+<h2>Провести инструктаж (по одному)</h2>
 <form method="post" action="/production/instructions/new">
 <label>Сотрудник: <select name="employee_id" required>{emp_options}</select></label>
 <label>Вид: <select name="instruction_type" required>{type_options}</select></label>
@@ -1618,6 +1680,43 @@ def instructions_page(request: Request, db: Session = Depends(get_db)):
 <p><a class="btn secondary" href="/production">← Производство</a></p>
 """
     return _render("Инструктажи", body, active="production", role=request.session.get("role", ""))
+
+
+@app.post("/production/instructions/auto-introductory")
+def instruction_auto_introductory(request: Request, db: Session = Depends(get_db)):
+    """Вводный инструктаж всем сотрудникам, у кого его ещё нет — датой начала работы,
+    не сегодняшним числом (см. договорённость в чате)."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    actor = _actor_name(request, db)
+    prod.auto_create_introductory_instructions(db, actor)
+    return RedirectResponse("/production/instructions", status_code=303)
+
+
+@app.post("/production/instructions/print")
+def instruction_print_journal(
+    request: Request, instruction_type: str = Form(...), db: Session = Depends(get_db),
+):
+    """Допечатать новые записи журнала — присваивает номера строк, отдаёт docx с
+    прочерками до конца страницы (см. production.print_new_journal_entries /
+    generate_instruction_journal_docx)."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    t = InstructionType(instruction_type)
+    printed = prod.print_new_journal_entries(db, t)
+    if not printed:
+        return RedirectResponse("/production/instructions", status_code=303)
+    order_ref = prod.get_latest_order_ref(db)
+    path = prod.generate_instruction_journal_docx(printed, t, org_name=ORG_NAME, order_ref=order_ref)
+    with open(path, "rb") as f:
+        data = f.read()
+    label = prod.INSTRUCTION_LABELS.get(t, t.value)
+    fn = f"Журнал_{label.replace(' ', '_')}_{datetime.now(MSK):%d.%m.%Y}.docx"
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": _content_disposition(fn)},
+    )
 
 
 @app.post("/production/instructions/new")
@@ -1895,6 +1994,69 @@ def order_download(order_id: str, request: Request, db: Session = Depends(get_db
     fn = f"Приказ_{order.number.replace('/', '-')}.{ext}"
     return Response(content=data, media_type=ct,
                     headers={"Content-Disposition": _content_disposition(fn)})
+
+
+# --- Бригады (2026-07) ---------------------------------------------------------
+
+@app.get("/production/brigades", response_class=HTMLResponse)
+def brigades_page(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    brigades = prod.get_brigades(db)
+    employees = db.scalars(
+        select(Employee).where(Employee.contract_end_date.is_(None)).order_by(Employee.full_name)
+    ).all()
+    emp_checkboxes = "".join(
+        f'<label style="display:block;margin:2px 0"><input type="checkbox" name="member_ids" '
+        f'value="{e.id}"> {e.full_name}</label>'
+        for e in employees
+    )
+
+    def brigade_row(b) -> str:
+        member_ids = set(prod.get_brigade_member_ids(db, b.id))
+        names = [e.full_name for e in employees if e.id in member_ids]
+        return (
+            f'<div class="card">{b.name}<br>'
+            f'<span class="muted">{", ".join(names) or "пусто"}</span><br>'
+            f'<form method="post" action="/production/brigades/{b.id}/delete" style="display:inline"'
+            f' onsubmit="return confirm(\'Удалить бригаду?\')">'
+            f'<button type="submit" class="btn secondary">Удалить</button></form></div>'
+        )
+
+    rows = "".join(brigade_row(b) for b in brigades)
+    body = f"""
+<h1>👷 Бригады</h1>
+<section class="grid"><h2>Сохранённые ({len(brigades)})</h2>{rows or '<p class="muted">Пока нет ни одной.</p>'}</section>
+<section>
+<h2>Новая бригада</h2>
+<form method="post" action="/production/brigades/new">
+<input type="text" name="name" placeholder="Название (например: Бригада бетонщиков №1)" required>
+<fieldset><legend>Состав</legend>{emp_checkboxes}</fieldset>
+<button type="submit">Сохранить</button>
+</form>
+</section>
+<p><a class="btn secondary" href="/production">← Производство</a></p>
+"""
+    return _render("Бригады", body, active="production", role=request.session.get("role", ""))
+
+
+@app.post("/production/brigades/new")
+def brigade_create(
+    request: Request, name: str = Form(...),
+    member_ids: list[str] = Form(default=[]), db: Session = Depends(get_db),
+):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    prod.create_brigade(db, name, member_ids)
+    return RedirectResponse("/production/brigades", status_code=303)
+
+
+@app.post("/production/brigades/{brigade_id}/delete")
+def brigade_delete(brigade_id: str, request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    prod.delete_brigade(db, brigade_id)
+    return RedirectResponse("/production/brigades", status_code=303)
 
 
 # --- Сотрудники: список + единая карточка ------------------------------------
