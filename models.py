@@ -267,6 +267,118 @@ class Employee(Base):
     )
 
 
+class WorkOrderStatus(str, enum.Enum):
+    DRAFT = "draft"
+    ACTIVE = "active"
+    CLOSED = "closed"
+    CANCELLED = "cancelled"
+
+
+class InstructionType(str, enum.Enum):
+    """Виды инструктажей по охране труда — все нужны и учитываются отдельно
+    (2026-07, модуль «Производство»)."""
+    INTRODUCTORY = "introductory"              # вводный — один раз при приёме
+    PRIMARY_WORKPLACE = "primary_workplace"    # первичный на рабочем месте
+    REPEATED = "repeated"                      # повторный, регулярный
+    UNSCHEDULED = "unscheduled"                # внеплановый
+    TARGETED = "targeted"                      # целевой (под конкретную задачу)
+
+
+class WorkOrder(Base):
+    """
+    Наряд-допуск (2026-07, модуль «Производство», отдельный от миграционного
+    учёта — своя доменная область, охрана труда). Официальный документ на
+    производство работ, не просто список задач на смену: ответственный
+    производитель работ + бригада (см. WorkOrderMember), срок действия,
+    подписи/подтверждения членов бригады.
+
+    Реализовано в отдельном файле production.py — из bot.py/webforms.py только
+    пункты меню/ссылки, минимальная связанность с основной системой (по
+    договорённости — "тестовый режим в отдельных файлах").
+    """
+
+    __tablename__ = "work_orders"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    number: Mapped[str] = mapped_column(String, nullable=False)  # номер наряда для документа
+    work_description: Mapped[str] = mapped_column(Text, nullable=False)
+    location: Mapped[str] = mapped_column(String, nullable=False)
+    responsible_employee_id: Mapped[str] = mapped_column(ForeignKey("employees.id"), nullable=False)
+    issued_by: Mapped[str] = mapped_column(String, nullable=False)  # User.id кадровика/мастера
+
+    valid_from: Mapped[date] = mapped_column(Date, nullable=False)
+    valid_to: Mapped[date] = mapped_column(Date, nullable=False)
+    status: Mapped[WorkOrderStatus] = mapped_column(
+        Enum(WorkOrderStatus), default=WorkOrderStatus.DRAFT, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    responsible: Mapped["Employee"] = relationship()
+    members: Mapped[list["WorkOrderMember"]] = relationship(
+        back_populates="work_order", cascade="all, delete-orphan"
+    )
+
+
+class WorkOrderMember(Base):
+    """Член бригады по наряду-допуску + подтверждение ознакомления (подпись).
+    signed_at=NULL — ещё не подтвердил, что ознакомлен с условиями работ."""
+
+    __tablename__ = "work_order_members"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    work_order_id: Mapped[str] = mapped_column(ForeignKey("work_orders.id"), nullable=False)
+    employee_id: Mapped[str] = mapped_column(ForeignKey("employees.id"), nullable=False)
+    signed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    work_order: Mapped["WorkOrder"] = relationship(back_populates="members")
+    employee: Mapped["Employee"] = relationship()
+
+
+class Instruction(Base):
+    """Инструктаж по охране труда (2026-07, модуль «Производство»). Все виды
+    учитываются — см. InstructionType. next_due_date — для повторных, когда
+    ждать следующий (используется для напоминаний по аналогии с обязательствами
+    миграционного учёта, см. production.get_due_instructions)."""
+
+    __tablename__ = "instructions"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    employee_id: Mapped[str] = mapped_column(ForeignKey("employees.id"), nullable=False)
+    type: Mapped[InstructionType] = mapped_column(Enum(InstructionType), nullable=False)
+    topic: Mapped[str | None] = mapped_column(String, nullable=True)  # тема — особенно для целевого/внепланового
+    conducted_by: Mapped[str] = mapped_column(String, nullable=False)  # кто провёл (ФИО или User.id)
+    conducted_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    employee_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    next_due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+
+    employee: Mapped["Employee"] = relationship()
+
+
+class Certificate(Base):
+    """
+    Удостоверение по профессии (2026-07, модуль «Производство») — "корочки":
+    электробезопасность, стропальщик, верхолазные работы и т.д. Срок действия +
+    скан отслеживаются (по договорённости — оба нужны, не только факт наличия).
+
+    scan_key — ключ файла в S3 (тот же механизм, что уже использует s3_storage.py
+    для сканов паспорта/документов сотрудника, только другой префикс, см.
+    production.py).
+    """
+
+    __tablename__ = "certificates"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    employee_id: Mapped[str] = mapped_column(ForeignKey("employees.id"), nullable=False)
+    profession: Mapped[str] = mapped_column(String, nullable=False)  # "Электробезопасность IV группа" и т.п.
+    issued_by_org: Mapped[str | None] = mapped_column(String, nullable=True)  # орган выдачи
+    issue_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    expiry_date: Mapped[date | None] = mapped_column(Date, nullable=True)  # NULL = бессрочное
+    scan_key: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    employee: Mapped["Employee"] = relationship()
+
+
 class RotationReturn(Base):
     """
     Ожидаемая дата возврата с межвахты + флаг "требует внимания кадровика".
