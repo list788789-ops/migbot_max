@@ -33,6 +33,7 @@ from models import (
     WorkOrderDailyAdmission,
     WorkOrderMember,
     WorkOrderStatus,
+    WorkType,
 )
 
 # Порог "скоро истекает" для удостоверений — по аналогии с обязательствами
@@ -116,7 +117,7 @@ def create_work_order(
     subdivision: str | None = None, materials: str | None = None, tools: str | None = None,
     equipment: str | None = None, special_machinery: str | None = None,
     technological_card_ref: str | None = None, safety_systems: str | None = None,
-    special_conditions: str | None = None,
+    special_conditions: str | None = None, work_type_id: str | None = None,
 ) -> WorkOrder:
     order = WorkOrder(
         number=number,
@@ -136,6 +137,7 @@ def create_work_order(
         technological_card_ref=technological_card_ref,
         safety_systems=safety_systems,
         special_conditions=special_conditions,
+        work_type_id=work_type_id,
     )
     session.add(order)
     session.flush()  # получить order.id до commit
@@ -1114,6 +1116,321 @@ def generate_work_order_docx(work_order: WorkOrder, members: list[WorkOrderMembe
     doc.add_paragraph("Ответственный исполнитель работ: _________________________  (подпись, расшифровка)")
 
     path = f"{output_dir}/naryad_{work_order.number}_{work_order.id[:8]}.docx"
+    doc.save(path)
+    return path
+
+
+# ================= Наряд-допуск на работы на ВЫСОТЕ (782н, Приложение № 2) =================
+# Отдельный бланк под регламентированную форму (см. замечание перед общим генератором выше).
+# Наполняется из справочника типовых работ (WorkType) через WorkOrder.work_type_id.
+# Общий generate_work_order_docx остаётся для нерегламентированных работ; печать ветвится
+# по наличию work_type_id (см. webforms.py).
+
+_HWO_DASH = "—"
+_HWO_START_TIME = "08:00"
+_HWO_END_TIME = "19:00"
+_HWO_MAX_DAYS = 15  # 782н п. 65: срок действия ≤ 15 календарных дней (+1 продление ≤15)
+
+_HWO_PREP_MEASURES = [
+    "Оформить наряд-допуск на работы повышенной опасности с обязательным указанием: "
+    "ответственного исполнителя работ; ответственного руководителя работ; место выполнения "
+    "работ на высоте находится в зоне прямой видимости ответственного исполнителя и/или "
+    "ответственного руководителя работ.",
+    "Ознакомление и обсуждение Плана производства работ (технологической карты) с "
+    "ответственным руководителем работ, ответственным исполнителем работ, исполнителями работ.",
+    "Разъяснение ответственным руководителем работ специфических обязанностей и процедур всем "
+    "работникам, соблюдение правил безопасности.",
+    "Работники, впервые допускаемые к работам на высоте, должны обладать практическими "
+    "навыками применения оборудования и оказания первой помощи, применения СИЗ, их осмотром "
+    "до и после использования.",
+    "Средства коллективной и индивидуальной защиты должны использоваться по назначению в "
+    "соответствии с требованиями инструкций изготовителя и нормативной технической документации.",
+]
+
+
+def _hwo_group_num(value):
+    """Из строки группы («2-я гр. по безопасности работ на высоте») достаёт число 2."""
+    if not value:
+        return None
+    digits = ""
+    for ch in str(value):
+        if ch.isdigit():
+            digits += ch
+        elif digits:
+            break
+    return int(digits) if digits else None
+
+
+def _hwo_split_systems(raw):
+    """safety_systems (одно текстовое поле) -> 3 значения строк таблицы систем.
+    < 3 строк -> недостающие прочерком; > 3 -> лишние склеиваются в последнюю."""
+    lines = [ln.strip() for ln in (raw or "").splitlines() if ln.strip()]
+    vals = []
+    for i in range(3):
+        if i < len(lines):
+            vals.append(" ".join(lines[2:]) if (i == 2 and len(lines) > 3) else lines[i])
+        else:
+            vals.append(_HWO_DASH)
+    return vals
+
+
+def check_work_order_problems(work_order: WorkOrder, members=None) -> list[str]:
+    """Нарушения наряда-допуска на высоте (782н + правила проекта). Пустой список = ок.
+    members можно передать явно (как их видит вызывающий код); иначе берутся из work_order.
+    Документ строится всегда (черновик); блокировать выпуск по этому списку — задача
+    вызывающего кода (webforms.py)."""
+    problems: list[str] = []
+    sup = getattr(work_order, "responsible_supervisor", None)
+    ex = getattr(work_order, "responsible_executor", None)
+
+    if _hwo_group_num(getattr(sup, "height_safety_group", None)) != 3:
+        problems.append(
+            "Ответственный руководитель работ должен быть 3-й группы по безопасности работ на "
+            f"высоте (сейчас: {getattr(sup, 'height_safety_group', None) or _HWO_DASH})."
+        )
+    ex_g = _hwo_group_num(getattr(ex, "height_safety_group", None))
+    if ex_g is None or ex_g < 2:
+        problems.append(
+            "Ответственный исполнитель работ должен быть не ниже 2-й группы "
+            f"(сейчас: {getattr(ex, 'height_safety_group', None) or _HWO_DASH})."
+        )
+
+    members = list(members if members is not None else (getattr(work_order, "members", None) or []))
+    if not members:
+        problems.append("Состав бригады пуст — нельзя выпустить наряд без исполнителей.")
+    for m in members:
+        emp = getattr(m, "employee", None)
+        name = getattr(emp, "full_name", None)
+        if not emp or not name:
+            problems.append("В бригаде есть член без привязанного сотрудника (пустая строка).")
+            continue
+        g = _hwo_group_num(getattr(emp, "height_safety_group", None))
+        if g is None or g < 2:
+            problems.append(f"У члена бригады «{name}» не указана группа по высоте (нужна ≥2-й).")
+
+    try:
+        span = (work_order.valid_to - work_order.valid_from).days + 1
+        if span > _HWO_MAX_DAYS:
+            problems.append(f"Срок действия наряда {span} дн. превышает 15 календарных дней (782н).")
+        if span < 1:
+            problems.append("Дата окончания раньше даты начала.")
+    except Exception:
+        problems.append("Не заданы корректные даты периода.")
+
+    rescue = _hwo_split_systems(getattr(work_order, "safety_systems", None))[2].lower()
+    wt = getattr(work_order, "work_type", None)
+    if not (work_order.safety_systems or "").strip() and wt is not None:
+        rescue = (getattr(wt, "sys_rescue", None) or "").lower()
+    if rescue and rescue != _HWO_DASH and ("привяз" in rescue or "строп" in rescue or "фал" in rescue):
+        problems.append(
+            "Строка «Эвакуационные и спасательные системы» указывает страховочную привязь/строп/"
+            "фал — нужно реальное средство спасения (например, автогидроподъёмник)."
+        )
+    return problems
+
+
+def generate_height_work_order_docx(work_order: WorkOrder, members: list[WorkOrderMember],
+                                     org_name: str, output_dir: str = "/tmp") -> str:
+    """Полный бланк наряда-допуска на работы на высоте (Приложение № 2 к Правилам 782н).
+    Тексты, зависящие от вида работ (содержание, условия, ОВПФ, 3 системы, раздел 3, нормы),
+    берутся из связанного WorkType; собственное поле наряда — в приоритете, справочник —
+    запасной источник. Время 08:00/19:00 константами (v1). Возвращает путь к docx."""
+    doc = Document()
+    _set_a4(doc)
+
+    def _p(text="", *, bold=False, italic=False, center=False, size=11):
+        p = doc.add_paragraph()
+        if center:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        r = p.add_run(text)
+        r.bold = bold
+        r.italic = italic
+        r.font.size = Pt(size)
+        return p
+
+    def _label(label, value):
+        p = doc.add_paragraph()
+        r = p.add_run(label); r.bold = True; r.font.size = Pt(11)
+        r2 = p.add_run(value if value not in (None, "") else _HWO_DASH); r2.font.size = Pt(11)
+        return p
+
+    def _cell(cell, text, *, bold=False, size=9, center=False):
+        cell.text = ""
+        para = cell.paragraphs[0]
+        if center:
+            para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        r = para.add_run("" if text in (None, "") else str(text))
+        r.bold = bold; r.font.size = Pt(size)
+
+    def _grid(headers, rows):
+        t = doc.add_table(rows=1, cols=len(headers))
+        t.style = "Table Grid"
+        for i, h in enumerate(headers):
+            _cell(t.rows[0].cells[i], h, bold=True, size=9, center=True)
+        for row in rows:
+            cells = t.add_row().cells
+            for i, val in enumerate(row):
+                _cell(cells[i], val, size=9)
+        return t
+
+    sup = getattr(work_order, "responsible_supervisor", None)
+    ex = getattr(work_order, "responsible_executor", None)
+    sup_name = getattr(sup, "full_name", None) or "____________"
+    ex_name = getattr(ex, "full_name", None) or "____________"
+    subdivision = work_order.subdivision or "Мурманск"
+
+    wt = getattr(work_order, "work_type", None)
+    work_name = work_order.work_description or getattr(wt, "name", None)
+    content_val = getattr(wt, "content", None) or work_order.work_description
+    conditions_val = work_order.special_conditions or getattr(wt, "conditions", None)
+    hazards_val = getattr(work_order, "hazards", None) or getattr(wt, "hazards", None)
+    norms_val = getattr(wt, "norms", None)
+
+    _p("Приложение № 2 к Правилам по охране труда при работе на высоте", italic=True, size=9)
+    _p("(Приказ Минтруда России от 16.11.2020 № 782н)", italic=True, size=9)
+    _p()
+    _p("УТВЕРЖДАЮ:", bold=True)
+    _p(org_name)
+    _p("_________________ / ____________")
+    _p("«____» _____________ 20___ г.", italic=True)
+    _p()
+    _p(f"НАРЯД-ДОПУСК № {work_order.number or _HWO_DASH}", bold=True, center=True, size=13)
+    _p("НА ПРОИЗВОДСТВО РАБОТ НА ВЫСОТЕ", bold=True, center=True)
+    _p()
+
+    _label("Организация: ", org_name)
+    _label("Подразделение: ", subdivision)
+    _label("Выдан ", f"{work_order.valid_from.strftime('%d.%m.%Y') if work_order.valid_from else _HWO_DASH} года")
+    _label("Действителен до ", f"{work_order.valid_to.strftime('%d.%m.%Y') if work_order.valid_to else _HWO_DASH} года")
+    _label("Ответственному руководителю работ: ", getattr(sup, "full_name", None))
+    _label("Ответственному исполнителю (производителю) работ: ", getattr(ex, "full_name", None))
+    _label("На выполнение работ: ", work_name)
+
+    _p()
+    _p("Состав исполнителей работ (члены бригады):")
+    member_rows = []
+    for i, m in enumerate(members or [], 1):
+        emp = getattr(m, "employee", None)
+        nm = getattr(emp, "full_name", None) or _HWO_DASH
+        pos = getattr(emp, "position", None) or ""
+        grp = getattr(emp, "height_safety_group", None) or ""
+        pos_grp = ", ".join([x for x in (pos, grp) if x]) or _HWO_DASH
+        member_rows.append([str(i), nm, pos_grp, "", ""])
+    if not member_rows:
+        member_rows = [["", _HWO_DASH, _HWO_DASH, "", ""]]
+    _grid(["№", "Фамилия, имя, отчество", "Должность (разряд)",
+           "Инструктаж провёл (подпись)", "Ознакомлен (подпись)"], member_rows)
+
+    _p()
+    _label("Место выполнения работ: ", work_order.location)
+    _label("Содержание работ: ", content_val)
+    _label("Условия проведения работ: ", conditions_val)
+    _label("Опасные и вредные производственные факторы, которые действуют или могут возникнуть "
+           "в местах выполнения работ: ", hazards_val)
+    _label("Начало работ: ", f"{_HWO_START_TIME} {work_order.valid_from.strftime('%d.%m.%Y') if work_order.valid_from else _HWO_DASH}")
+    _label("Окончание работ: ", f"{_HWO_END_TIME} {work_order.valid_to.strftime('%d.%m.%Y') if work_order.valid_to else _HWO_DASH}")
+    if norms_val:
+        _label("Нормативные основания: ", norms_val)
+
+    _p()
+    _p("Системы обеспечения безопасности работ на высоте:", bold=True)
+    if (work_order.safety_systems or "").strip():
+        ss = _hwo_split_systems(work_order.safety_systems)
+    elif wt is not None:
+        ss = [getattr(wt, "sys_restraint", None) or _HWO_DASH,
+              getattr(wt, "sys_fall_arrest", None) or _HWO_DASH,
+              getattr(wt, "sys_rescue", None) or _HWO_DASH]
+    else:
+        ss = [_HWO_DASH, _HWO_DASH, _HWO_DASH]
+    _grid(["Системы обеспечения безопасности", "Состав системы"],
+          [["Удерживающие системы", ss[0]],
+           ["Страховочные системы", ss[1]],
+           ["Эвакуационные и спасательные системы", ss[2]]])
+
+    _p()
+    _p("1. Необходимые для производства работ:", bold=True)
+    for lbl, val in [("Материалы: ", work_order.materials), ("Инструмент: ", work_order.tools),
+                     ("Приспособления: ", work_order.equipment),
+                     ("Спецтехника: ", work_order.special_machinery),
+                     ("Шифр ТК: ", work_order.technological_card_ref)]:
+        if val:
+            _label(lbl, val)
+
+    _p()
+    _p("2. До начала работ следует выполнить следующие мероприятия:", bold=True)
+    _grid(["Наименование мероприятия", "Срок выполнения", "Ответственный исполнитель"],
+          [[m, "До начала работ", ""] for m in _HWO_PREP_MEASURES])
+
+    _p()
+    _p("3. В процессе производства работ необходимо выполнить следующие мероприятия:", bold=True)
+    proc_lines = [ln.strip() for ln in (getattr(wt, "process_measures", None) or "").splitlines() if ln.strip()]
+    proc_rows = ([[m, "Постоянно в процессе работ", ex_name] for m in proc_lines]
+                 if proc_lines else [["", "", ""] for _ in range(3)])
+    _grid(["Наименование мероприятия", "Срок выполнения", "Ответственный исполнитель"], proc_rows)
+
+    _p()
+    _p("4. Особые условия проведения работ:", bold=True)
+    _grid(["Наименование условий", "Срок выполнения", "Ответственный исполнитель"],
+          [["", "", ""] for _ in range(2)])
+
+    _p()
+    _p("Отдельные указания: _______________________________________________")
+    _p(f"Наряд выдал: ______________ (дата, время)   Подпись: ____________ / {org_name}")
+    _p("Наряд продлил: ____________ (дата, время)   Подпись: ____________ / ____________")
+
+    _p()
+    _p("5. Разрешение на подготовку рабочих мест и на допуск к выполнению работ:", bold=True)
+    _grid(["Разрешение на подготовку и допуск получил", "Дата, время", "Подпись"], [["", "", ""]])
+    _p("Рабочие места подготовлены. Ответственный руководитель работ: ____________ / " + sup_name)
+
+    _p()
+    _p("6. Ежедневный допуск к работе и время её окончания:", bold=True)
+    day_rows = []
+    try:
+        d = work_order.valid_from
+        while d <= work_order.valid_to:
+            day_rows.append([d.strftime("%d.%m.%Y"), "", ""])
+            d += timedelta(days=1)
+    except Exception:
+        pass
+    if not day_rows:
+        day_rows = [["", "", ""]]
+    _grid(["Дата", "Бригада получила целевой инструктаж и допущена (дата, время, подпись)",
+           "Работа закончена, бригада удалена (дата, время, подпись)"], day_rows)
+
+    _p()
+    _p("7. Изменения в составе бригады:", bold=True)
+    _grid(["Введён в состав (ФИО)", "Выведен из состава (ФИО)", "Дата, время", "Разрешил (ФИО, подпись)"],
+          [["", "", "", ""] for _ in range(3)])
+
+    _p()
+    _p("8. Регистрация целевого инструктажа при первичном допуске:", bold=True)
+    _p("Инструктаж провёл: ____________ / " + sup_name)
+    _p("Инструктаж прошёл: ____________ / ____________")
+    _p("Лицо, выдавшее наряд: ____________ / " + org_name)
+    _p("Ответственный руководитель работ: ____________ / " + sup_name)
+    _p("Ответственный исполнитель: ____________ / " + ex_name)
+
+    _p()
+    _p("9. Письменное разрешение (акт-допуск) действующего предприятия на производство работ "
+       "имеется. Мероприятия по безопасности согласованы:", bold=True)
+    _p("__________________________________________ (должность, ФИО, подпись)")
+
+    _p()
+    _p("10. Рабочее место и условия труда проверены. Мероприятия по безопасности выполнены. "
+       "Разрешаю приступить к выполнению работ:", bold=True)
+    _p("_______________________ (дата, подпись) ____________________ (ФИО)")
+    _p("Наряд-допуск продлён до: ______________ (дата, подпись) ____________ (ФИО)")
+
+    _p()
+    _p("11. Работа выполнена в полном объёме. Материалы, инструмент, приспособления убраны. "
+       "Члены бригады выведены.", bold=True)
+    _p("Ответственный исполнитель (производитель) работ: ____________ (дата, подпись)")
+    _p("Наряд-допуск закрыт.")
+    _p("Ответственный руководитель работ: ____________ (дата, подпись)     "
+       "Лицо, выдавшее наряд-допуск: ____________ (дата, подпись)")
+
+    path = f"{output_dir}/naryad_vysota_{work_order.number}_{work_order.id[:8]}.docx"
     doc.save(path)
     return path
 
