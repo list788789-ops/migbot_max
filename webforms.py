@@ -79,6 +79,9 @@ from models import (
     RegistrationStatus,
     RotationReturn,
     SystemFlag,
+    WorkOrderMember,
+    InstructionType,
+    Certificate,
 )
 from obligations import create_obligations_for_employee
 from auth_binding import get_role_label, find_user_by_max_id
@@ -473,6 +476,7 @@ def _nav(active: str = "", role: str = "") -> str:
         ("tabel", "/tabel", "Табель"),
         ("employees", "/employees", "Сотрудники"),
         ("medical", "/medical", "Медкомиссия"),
+        ("production", "/production", "Производство"),
         ("reports", "/reports", "Отчёты"),
     ]
     # Общие документы (паспорт директора, основание на адрес) — кадровику и админу, не прорабу.
@@ -1408,6 +1412,293 @@ def report_activity(request: Request, db: Session = Depends(get_db)):
 <p><a class="btn secondary" href="/reports">← Все отчёты</a></p>
 """
     return _render("Активность", body, active="reports", role=request.session.get("role", ""))
+
+
+# --- Производство (2026-07) --------------------------------------------------
+# Наряды-допуски, инструктажи, удостоверения — отдельный модуль (production.py),
+# минимально связанный с остальной системой. См. docstring в production.py.
+
+import production as prod
+
+
+@app.get("/production", response_class=HTMLResponse)
+def production_page(request: Request):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    body = """
+<h1>Производство</h1>
+<section class="grid">
+<div class="card"><h3 style="margin:0 0 6px">📋 Наряды-допуски</h3>
+<p class="muted" style="margin:0 0 10px">Официальные документы на производство работ — ответственный, бригада, срок действия.</p>
+<a class="btn" href="/production/work-orders">Открыть</a></div>
+<div class="card"><h3 style="margin:0 0 6px">🎓 Инструктажи</h3>
+<p class="muted" style="margin:0 0 10px">Вводный, первичный, повторный, внеплановый, целевой — учёт по каждому сотруднику.</p>
+<a class="btn" href="/production/instructions">Открыть</a></div>
+<div class="card"><h3 style="margin:0 0 6px">🪪 Удостоверения</h3>
+<p class="muted" style="margin:0 0 10px">Удостоверения по профессиям — сроки действия, сканы, напоминания об истечении.</p>
+<a class="btn" href="/production/certificates">Открыть</a></div>
+</section>
+"""
+    return _render("Производство", body, active="production", role=request.session.get("role", ""))
+
+
+# --- Наряды-допуски -----------------------------------------------------------
+
+@app.get("/production/work-orders", response_class=HTMLResponse)
+def work_orders_page(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    orders = prod.get_active_work_orders(db)
+    employees = db.scalars(
+        select(Employee).where(Employee.contract_end_date.is_(None)).order_by(Employee.full_name)
+    ).all()
+    emp_options = "".join(f'<option value="{e.id}">{e.full_name}</option>' for e in employees)
+    emp_checkboxes = "".join(
+        f'<label style="display:block;margin:2px 0"><input type="checkbox" name="member_ids" '
+        f'value="{e.id}"> {e.full_name}</label>'
+        for e in employees
+    )
+
+    def order_row(o) -> str:
+        members = db.query(WorkOrderMember).filter_by(work_order_id=o.id).all()
+        signed = sum(1 for m in members if m.signed_at is not None)
+        return (
+            f'<div class="card">№{o.number} — {o.work_description}<br>'
+            f'<span class="muted">{o.location} · {o.valid_from:%d.%m}–{o.valid_to:%d.%m.%Y} · '
+            f'ответственный: {o.responsible.full_name if o.responsible else "?"}</span><br>'
+            f'<span class="badge neutral">Подписали: {signed}/{len(members)}</span> '
+            f'<form method="post" action="/production/work-orders/{o.id}/close" style="display:inline">'
+            f'<button type="submit" class="btn secondary">Закрыть наряд</button></form></div>'
+        )
+
+    rows = "".join(order_row(o) for o in orders)
+    body = f"""
+<h1>📋 Наряды-допуски</h1>
+<section class="grid"><h2>Активные ({len(orders)})</h2>{rows or '<p class="muted">Нет активных нарядов.</p>'}</section>
+<section>
+<h2>Новый наряд</h2>
+<form method="post" action="/production/work-orders/new">
+<input type="text" name="number" placeholder="Номер наряда" required>
+<textarea name="work_description" placeholder="Описание работ" required rows="3"></textarea>
+<input type="text" name="location" placeholder="Место проведения" required>
+<label>Ответственный производитель работ:
+<select name="responsible_employee_id" required>{emp_options}</select></label>
+<label>Действует с: <input type="date" name="valid_from" required></label>
+<label>Действует по: <input type="date" name="valid_to" required></label>
+<fieldset><legend>Члены бригады</legend>{emp_checkboxes}</fieldset>
+<button type="submit">Создать наряд</button>
+</form>
+</section>
+<p><a class="btn secondary" href="/production">← Производство</a></p>
+"""
+    return _render("Наряды-допуски", body, active="production", role=request.session.get("role", ""))
+
+
+@app.post("/production/work-orders/new")
+def work_order_create(
+    request: Request,
+    number: str = Form(...),
+    work_description: str = Form(...),
+    location: str = Form(...),
+    responsible_employee_id: str = Form(...),
+    valid_from: str = Form(...),
+    valid_to: str = Form(...),
+    member_ids: list[str] = Form(default=[]),
+    db: Session = Depends(get_db),
+):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    actor = _actor_name(request, db)
+    prod.create_work_order(
+        db, number, work_description, location, responsible_employee_id, actor,
+        datetime.strptime(valid_from, "%Y-%m-%d").date(),
+        datetime.strptime(valid_to, "%Y-%m-%d").date(),
+        member_ids,
+    )
+    return RedirectResponse("/production/work-orders", status_code=303)
+
+
+@app.post("/production/work-orders/{work_order_id}/close")
+def work_order_close(work_order_id: str, request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    prod.close_work_order(db, work_order_id)
+    return RedirectResponse("/production/work-orders", status_code=303)
+
+
+# --- Инструктажи ---------------------------------------------------------------
+
+@app.get("/production/instructions", response_class=HTMLResponse)
+def instructions_page(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    due = prod.get_due_instructions(db)
+    employees = db.scalars(
+        select(Employee).where(Employee.contract_end_date.is_(None)).order_by(Employee.full_name)
+    ).all()
+    emp_options = "".join(f'<option value="{e.id}">{e.full_name}</option>' for e in employees)
+    type_options = "".join(f'<option value="{t.value}">{label}</option>' for t, label in prod.INSTRUCTION_LABELS.items())
+
+    due_rows = "".join(
+        f'<div class="card">{d["name"]} — {"просрочен" if d["overdue"] else "срок"} '
+        f'{d["due_date"]:%d.%m.%Y}<br>'
+        f'<a class="btn" href="/employees/{d["employee_id"]}">Открыть карточку</a></div>'
+        for d in due
+    )
+    body = f"""
+<h1>🎓 Инструктажи</h1>
+{f'<section class="grid"><h2>⏰ Требуют повторного проведения ({len(due)})</h2>{due_rows}</section>' if due else ''}
+<section>
+<h2>Провести инструктаж</h2>
+<form method="post" action="/production/instructions/new">
+<label>Сотрудник: <select name="employee_id" required>{emp_options}</select></label>
+<label>Вид: <select name="instruction_type" required>{type_options}</select></label>
+<input type="text" name="topic" placeholder="Тема (для целевого/внепланового)">
+<label>Следующий срок (для повторного, необязательно): <input type="date" name="next_due_date"></label>
+<button type="submit">Зафиксировать проведение</button>
+</form>
+</section>
+<p><a class="btn secondary" href="/production">← Производство</a></p>
+"""
+    return _render("Инструктажи", body, active="production", role=request.session.get("role", ""))
+
+
+@app.post("/production/instructions/new")
+def instruction_create(
+    request: Request,
+    employee_id: str = Form(...),
+    instruction_type: str = Form(...),
+    topic: str = Form(""),
+    next_due_date: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    actor = _actor_name(request, db)
+    due = datetime.strptime(next_due_date, "%Y-%m-%d").date() if next_due_date else None
+    prod.create_instruction(
+        db, employee_id, InstructionType(instruction_type), actor,
+        topic=topic or None, next_due_date=due,
+    )
+    return RedirectResponse("/production/instructions", status_code=303)
+
+
+# --- Удостоверения (корочки) ---------------------------------------------------
+
+@app.get("/production/certificates", response_class=HTMLResponse)
+def certificates_page(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    expiring = prod.get_expiring_certificates(db)
+    employees = db.scalars(
+        select(Employee).where(Employee.contract_end_date.is_(None)).order_by(Employee.full_name)
+    ).all()
+    emp_options = "".join(f'<option value="{e.id}">{e.full_name}</option>' for e in employees)
+
+    expiring_rows = "".join(
+        f'<div class="card">{item["name"]} — {item["profession"]}<br>'
+        f'<span class="badge {"red" if item["overdue"] else "orange"}">'
+        f'{"Просрочено" if item["overdue"] else "Истекает"} {item["expiry_date"]:%d.%m.%Y}</span><br>'
+        f'<a class="btn" href="/employees/{item["employee_id"]}">Открыть карточку</a></div>'
+        for item in expiring
+    )
+
+    all_certs = db.query(Certificate).order_by(Certificate.created_at.desc()).all()
+
+    def cert_row(c) -> str:
+        status = prod.certificate_status(c)
+        badge_class = {"expired": "red", "expiring_soon": "orange", "active": "green", "no_expiry": "neutral"}[status]
+        badge_text = {"expired": "Просрочено", "expiring_soon": "Истекает", "active": "Действует", "no_expiry": "Бессрочное"}[status]
+        exp = f' до {c.expiry_date:%d.%m.%Y}' if c.expiry_date else ''
+        scan_link = (f'<a class="btn secondary" href="/production/certificates/{c.id}/download">Скачать скан</a>'
+                     if c.scan_key else '<span class="muted">без скана</span>')
+        return (
+            f'<div class="card">{c.employee.full_name if c.employee else "?"} — {c.profession}<br>'
+            f'<span class="badge {badge_class}">{badge_text}{exp}</span><br>{scan_link}</div>'
+        )
+
+    all_rows = "".join(cert_row(c) for c in all_certs)
+    body = f"""
+<h1>🪪 Удостоверения по профессиям</h1>
+{f'<section class="grid"><h2>⏰ Истекают/просрочены ({len(expiring)})</h2>{expiring_rows}</section>' if expiring else ''}
+<section class="grid"><h2>Все удостоверения ({len(all_certs)})</h2>{all_rows or '<p class="muted">Пока нет ни одного.</p>'}</section>
+<section>
+<h2>Добавить удостоверение</h2>
+<form method="post" action="/production/certificates/new" enctype="multipart/form-data">
+<label>Сотрудник: <select name="employee_id" required>{emp_options}</select></label>
+<input type="text" name="profession" placeholder="Профессия / вид допуска (например «Электробезопасность IV группа»)" required>
+<input type="text" name="issued_by_org" placeholder="Кем выдано">
+<label>Дата выдачи: <input type="date" name="issue_date"></label>
+<label>Действует до (пусто — бессрочное): <input type="date" name="expiry_date"></label>
+<label>Скан: <input type="file" name="scan_file"></label>
+<button type="submit">Добавить</button>
+</form>
+</section>
+<p><a class="btn secondary" href="/production">← Производство</a></p>
+"""
+    return _render("Удостоверения", body, active="production", role=request.session.get("role", ""))
+
+
+@app.post("/production/certificates/new")
+async def certificate_create(
+    request: Request,
+    employee_id: str = Form(...),
+    profession: str = Form(...),
+    issued_by_org: str = Form(""),
+    issue_date: str = Form(""),
+    expiry_date: str = Form(""),
+    scan_file: UploadFile = File(None),
+    db: Session = Depends(get_db),
+):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    cert = prod.create_certificate(
+        db, employee_id, profession,
+        issued_by_org=issued_by_org or None,
+        issue_date=datetime.strptime(issue_date, "%Y-%m-%d").date() if issue_date else None,
+        expiry_date=datetime.strptime(expiry_date, "%Y-%m-%d").date() if expiry_date else None,
+    )
+
+    if scan_file is not None and scan_file.filename:
+        # Свой scan_type на каждый сертификат (сотрудник может иметь несколько
+        # удостоверений разных профессий) — _s3_upload/_scan_key строят ключ
+        # как employee_{id}/{scan_type}, поэтому тип должен быть уникальным
+        # в рамках сотрудника, не фиксированным "certificate".
+        from s3_storage import _s3_upload, _scan_key
+        scan_type = f"certificate_{cert.id}"
+        content = await scan_file.read()
+        content_type = scan_file.content_type or "application/octet-stream"
+        try:
+            _s3_upload(scan_type, employee_id, content, content_type)
+            prod.set_certificate_scan_key(db, cert.id, _scan_key(scan_type, employee_id))
+        except RuntimeError as e:
+            log.warning("certificate_create: загрузка скана не удалась: %s", e)
+            # Удостоверение уже создано без скана — не откатываем, просто без файла.
+
+    return RedirectResponse("/production/certificates", status_code=303)
+
+
+@app.get("/production/certificates/{certificate_id}/download")
+def certificate_download(certificate_id: str, request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    cert = db.get(Certificate, certificate_id)
+    if cert is None or not cert.scan_key:
+        raise HTTPException(404, "Скан не найден.")
+    from s3_storage import _s3_download
+    # scan_key хранится как employee_{id}/certificate_{cert.id} — scan_type для
+    # _s3_download нужен без префикса "employee_{id}/", восстанавливаем.
+    scan_type = f"certificate_{cert.id}"
+    try:
+        data, ct = _s3_download(scan_type, cert.employee_id)
+    except RuntimeError as e:
+        raise HTTPException(404, str(e))
+    ext = "pdf" if "pdf" in ct else ("jpg" if "jpeg" in ct or "jpg" in ct else "bin")
+    fio = (cert.employee.full_name if cert.employee else "").strip().replace(" ", "_")
+    fn = f"{fio}_{cert.profession.replace(' ', '_')}.{ext}" if fio else f"certificate.{ext}"
+    return Response(content=data, media_type=ct,
+                    headers={"Content-Disposition": _content_disposition(fn)})
 
 
 # --- Сотрудники: список + единая карточка ------------------------------------
