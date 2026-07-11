@@ -310,29 +310,31 @@ def get_instruction_compliance_gaps(session: Session) -> list[dict]:
     return gaps
 
 
-def auto_create_introductory_instructions(session: Session, conducted_by: str) -> list[Instruction]:
-    """Заводит вводный инструктаж для ВСЕХ сотрудников разом — по договорённости
-    "заполнять всеми сотрудниками с разделением по дате начала работы". Дата
-    самого инструктажа = дата начала работы конкретного человека (дата договора,
-    а если пусто — дата въезда), НЕ сегодняшняя дата — так порядок строк в
-    журнале при печати совпадёт с реальной хронологией приёма, а не с датой,
-    когда кто-то нажал кнопку в системе.
+def auto_create_instructions(
+    session: Session, instruction_type: InstructionType, conducted_by: str
+) -> list[Instruction]:
+    """Заводит инструктаж ЗАДАННОГО типа для ВСЕХ сотрудников, у кого его ещё нет —
+    разом, датой начала работы каждого (дата договора, если пусто — дата въезда),
+    НЕ сегодняшней датой (чтобы порядок строк в журнале совпал с хронологией приёма).
 
-    2026-07: защита от гонки (двойное нажатие кнопки создавало дубли — нашли по
-    факту на первой же реальной распечатке, см. журнал патчей). Коммит ПО ОДНОМУ
-    сотруднику, а не одним общим commit() в конце — если где-то между чтением
-    списка и записью появился дубль (например, из-за параллельного запроса),
-    unique-индекс в БД (employee_id WHERE type='introductory') отклонит именно
-    эту одну вставку, не обрушив всю пачку остальных."""
+    Используется для вводного и первичного на рабочем месте — оба разовые, оба
+    проводятся в день начала работы (по факту вместе, но регистрируются в РАЗНЫХ
+    журналах со своей сквозной нумерацией на каждый тип).
+
+    Защита от гонки: коммит ПО ОДНОМУ сотруднику. Если двойное нажатие/параллельный
+    запрос создаёт дубль — unique-индекс в БД отклонит именно эту вставку
+    (uq_intro_once для вводного, uq_primary_workplace_once для первичного), не
+    обрушив пачку остальных. ВАЖНО: для новых типов, требующих уникальности
+    "один на сотрудника", такой индекс должен существовать в БД — иначе защиты нет."""
     from sqlalchemy.exc import IntegrityError
 
-    employees = get_employees_needing_introductory(session)
+    employees = get_employees_needing_instruction(session, instruction_type)
     created = []
     for e in employees:
         start_date = e.contract_date or e.entry_date
         instr = Instruction(
             employee_id=e.id,
-            type=InstructionType.INTRODUCTORY,
+            type=instruction_type,
             conducted_by=conducted_by,
             conducted_at=datetime.combine(start_date, datetime.min.time()),
         )
@@ -343,6 +345,12 @@ def auto_create_introductory_instructions(session: Session, conducted_by: str) -
         except IntegrityError:
             session.rollback()  # уже есть (гонка/повторное нажатие) — пропускаем, не падаем
     return created
+
+
+def auto_create_introductory_instructions(session: Session, conducted_by: str) -> list[Instruction]:
+    """Обёртка над auto_create_instructions для вводного — сохранена, чтобы не
+    менять существующий вызов в webforms.py (кнопка «Заполнить вводный всем»)."""
+    return auto_create_instructions(session, InstructionType.INTRODUCTORY, conducted_by)
 
 
 def get_unprinted_instructions(session: Session, instruction_type: InstructionType) -> list[Instruction]:
@@ -651,35 +659,40 @@ def generate_instruction_journal_xlsx(
     output_dir: str = "/tmp",
 ) -> str:
     """
-    Excel-версия печати журнала инструктажей (2026-07, замена docx). Тот же
-    официальный скелет таблицы 1:1, что и в generate_instruction_journal_docx:
-    те же 10 столбцов, двухуровневая шапка с объединением ячеек, обложка
-    Начат/Окончен/Кол-во листов/Лист, профессия/подразделение из карточки.
+    Excel-версия печати журнала инструктажей. Тот же официальный скелет таблицы
+    (10 столбцов, двухуровневая шапка, обложка Начат/Окончен), печатается для
+    любого типа (вводный, первичный на рабочем месте) — заголовок берётся из
+    INSTRUCTION_LABELS по instruction_type, отдельный шаблон под каждый тип не нужен.
 
-    Отличия от docx — осознанные, продиктованы природой Excel (обсуждено с
-    заказчиком):
-    - НЕТ довеска пустыми строками "до конца страницы". В Excel разбивку на
-      печатные листы делает драйвер принтера, а не код, поэтому "погасить лист
-      прочерками до низа" технически невозможно и не нужно: каждая партия
-      печатается заново целым файлом из БД (print_new_journal_entries), а не
-      дописывается ручкой в старую распечатку. Журнал заканчивается на последней
-      реальной записи.
-    - Под таблицей — итоговая строка "Внесено записей: N (строки M–K)", где N —
-      сколько записей в ЭТОМ файле (эта партия печати), M–K — диапазон их
-      сквозных номеров. Снимает путаницу при подшивке партий в одну книгу.
-    - Печать: альбомная A4, повтор двухуровневой шапки таблицы на КАЖДОМ листе
-      (print_title_rows), запрет разрыва строки между листами по высоте (каждый
-      работник целиком на одном листе), вписывание по ширине (10 колонок не
-      уезжают за правый край).
+    2026-07 (переработка разбивки): шапка и разбивка на листы делаются ФИЗИЧЕСКИ,
+    а не через print_title_rows. Причина — print_title_rows это инструкция для
+    драйвера печати, её НЕ рендерят мобильные просмотрщики (в т.ч. просмотр вложения
+    в MAX): при работе с телефона пользователь видел один сплошной лист без повтора
+    шапки. Теперь блок шапки вставляется реальными строками заново на каждом листе
+    + жёсткий разрыв страницы (row_breaks) — шапка видна и в просмотре, и в печати,
+    а число строк на лист фиксировано (не зависит от драйвера и от того, есть ли
+    сверху блок обложки).
 
-    sheet_number/total_sheets — для граф "Лист"/"Количество листов" обложки,
-    та же семантика-приближение, что в docx-версии.
+    Разбивка: обложка (название/организация/Начат-Окончен) — ТОЛЬКО на первом листе,
+    поэтому на нём строк данных меньше (ROWS_FIRST_PAGE), на последующих больше
+    (ROWS_OTHER_PAGES) — так на альбомном A4 каждый лист заполнен без переполнения.
+    Двухуровневая шапка таблицы повторяется на КАЖДОМ листе.
+
+    Под таблицей — итог "Внесено записей: N (строки M–K)": N в этом файле (партия
+    печати), M–K — диапазон сквозных номеров. Между блоком заголовка и таблицей —
+    пустая строка-разделитель, чтобы обложка визуально не сливалась с данными.
     """
+    # Сколько строк ДАННЫХ помещается на альбомном A4:
+    # первый лист несёт блок обложки сверху (название+организация+Начат/Окончен+
+    # разделитель), поэтому данных на нём меньше; последующие — только шапка таблицы.
+    ROWS_FIRST_PAGE = 17
+    ROWS_OTHER_PAGES = 21
+
     wb = Workbook()
     ws = wb.active
     ws.title = "Журнал"
 
-    # --- Печать: альбомная A4, впис по ширине, поля ---
+    # --- Печать: альбомная A4, впис по ширине ---
     ws.page_setup.orientation = "landscape"
     ws.page_setup.paperSize = 9  # A4
     ws.page_setup.fitToWidth = 1
@@ -687,151 +700,146 @@ def generate_instruction_journal_xlsx(
     ws.sheet_properties.pageSetUpPr.fitToPage = True
 
     NCOLS = 10  # столбцы A..J
-
     label = INSTRUCTION_LABELS.get(instruction_type, instruction_type.value)
 
-    # --- Строка 1: заголовок журнала (объединён на всю ширину) ---
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=NCOLS)
-    c = ws.cell(row=1, column=1, value=f"ЖУРНАЛ РЕГИСТРАЦИИ ИНСТРУКТАЖА ({label.upper()})")
-    c.font = Font(name="Times New Roman", size=14, bold=True)
-    c.alignment = Alignment(horizontal="center", vertical="center")
+    page_break_rows: list[int] = []
 
-    # --- Строка 2: организация + номер журнала ---
-    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=NCOLS)
-    c = ws.cell(row=2, column=1, value=f"Организация: {org_name}          Журнал № {journal_number}")
-    c.font = _XL_FONT
-    c.alignment = Alignment(horizontal="left", vertical="center")
+    def _write_cover(r: int) -> int:
+        """Блок обложки (только лист 1): название журнала, организация, Начат/Окончен,
+        затем пустая строка-разделитель. Возвращает следующую свободную строку."""
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=NCOLS)
+        c = ws.cell(row=r, column=1, value=f"ЖУРНАЛ РЕГИСТРАЦИИ ИНСТРУКТАЖА ({label.upper()})")
+        c.font = Font(name="Times New Roman", size=14, bold=True)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        ws.merge_cells(start_row=r + 1, start_column=1, end_row=r + 1, end_column=NCOLS)
+        c = ws.cell(row=r + 1, column=1,
+                    value=f"Организация: {org_name}          Журнал № {journal_number}")
+        c.font = _XL_FONT
+        c.alignment = Alignment(horizontal="left", vertical="center")
+        started_str = started_at.strftime("%d.%m.%Y") if started_at else "—"
+        cover = [
+            ("Начат", started_str), ("Окончен", "—"),
+            ("Количество листов", str(total_sheets)), ("Лист", str(sheet_number)),
+        ]
+        col = 1
+        for lbl, val in cover:
+            _xl_cell(ws, r + 2, col, lbl, bold=True, small=True)
+            _xl_cell(ws, r + 2, col + 1, val, small=True)
+            col += 2
+        _xl_cell(ws, r + 2, 9, "", small=True)
+        _xl_cell(ws, r + 2, 10, "", small=True)
+        return r + 4  # r, r+1, r+2 заняты + r+3 пустой разделитель → следующая r+4
 
-    # --- Строка 3: обложка Начат|Окончен|Кол-во листов|Лист (8 ячеек: label/value ×4) ---
-    started_str = started_at.strftime("%d.%m.%Y") if started_at else "—"
-    cover = [
-        ("Начат", started_str), ("Окончен", "—"),
-        ("Количество листов", str(total_sheets)), ("Лист", str(sheet_number)),
-    ]
-    col = 1
-    for lbl, val in cover:
-        _xl_cell(ws, 3, col, lbl, bold=True, small=True)
-        _xl_cell(ws, 3, col + 1, val, small=True)
-        col += 2
-    # столбцы 9,10 в строке обложки оставляем пустыми, но с границей — ровный низ
-    _xl_cell(ws, 3, 9, "", small=True)
-    _xl_cell(ws, 3, 10, "", small=True)
+    def _write_table_header(r: int) -> int:
+        """Двухуровневая шапка таблицы (2 строки). Вставляется на КАЖДОМ листе.
+        Возвращает первую строку данных (r + 2)."""
+        h1, h2 = r, r + 1
+        single = {
+            1: "№ сквозной",
+            2: "№ на листе",
+            3: "Дата проведения",
+            7: "Наименование структурного подразделения, в которое направлен инструктируемый",
+            8: "Фамилия, имя, отчество, должность инструктирующего",
+        }
+        for col_idx, text in single.items():
+            ws.merge_cells(start_row=h1, start_column=col_idx, end_row=h2, end_column=col_idx)
+            _xl_cell(ws, h1, col_idx, text, bold=True, small=True)
+            _xl_border_range(ws, h1, col_idx, h2, col_idx)
+        ws.merge_cells(start_row=h1, start_column=4, end_row=h1, end_column=6)
+        _xl_cell(ws, h1, 4, "Сведения об инструктируемом", bold=True, small=True)
+        _xl_border_range(ws, h1, 4, h1, 6)
+        _xl_cell(ws, h2, 4, "Фамилия, имя, отчество", bold=True, small=True)
+        _xl_cell(ws, h2, 5, "Дата рождения", bold=True, small=True)
+        _xl_cell(ws, h2, 6, "Профессия, должность", bold=True, small=True)
+        ws.merge_cells(start_row=h1, start_column=9, end_row=h1, end_column=10)
+        _xl_cell(ws, h1, 9, "Подпись", bold=True, small=True)
+        _xl_border_range(ws, h1, 9, h1, 10)
+        _xl_cell(ws, h2, 9, "Инструктирующего", bold=True, small=True)
+        _xl_cell(ws, h2, 10, "Инструктируемого", bold=True, small=True)
+        ws.row_dimensions[h1].height = 30
+        ws.row_dimensions[h2].height = 42
+        return r + 2
 
-    # --- Строки 4–5: двухуровневая шапка таблицы ---
-    HDR1, HDR2 = 4, 5
-    # Вертикальное объединение (шапка на 2 строки) для одиночных столбцов:
-    # 1 № сквозной | 2 № на листе | 3 Дата проведения | 7 Подразделение | 8 Инструктирующий
-    single = {
-        1: "№ сквозной",
-        2: "№ на листе",
-        3: "Дата проведения",
-        7: "Наименование структурного подразделения, в которое направлен инструктируемый",
-        8: "Фамилия, имя, отчество, должность инструктирующего",
-    }
-    for col_idx, text in single.items():
-        ws.merge_cells(start_row=HDR1, start_column=col_idx, end_row=HDR2, end_column=col_idx)
-        _xl_cell(ws, HDR1, col_idx, text, bold=True, small=True)
-        _xl_border_range(ws, HDR1, col_idx, HDR2, col_idx)  # обрамить обе строки объединения
-
-    # "Сведения об инструктируемом" — горизонтальное объединение колонок 4–6 в верхней строке,
-    # подстолбцы во второй.
-    ws.merge_cells(start_row=HDR1, start_column=4, end_row=HDR1, end_column=6)
-    _xl_cell(ws, HDR1, 4, "Сведения об инструктируемом", bold=True, small=True)
-    _xl_border_range(ws, HDR1, 4, HDR1, 6)  # обрамить всю верхнюю объединённую ячейку
-    _xl_cell(ws, HDR2, 4, "Фамилия, имя, отчество", bold=True, small=True)
-    _xl_cell(ws, HDR2, 5, "Дата рождения", bold=True, small=True)
-    _xl_cell(ws, HDR2, 6, "Профессия, должность", bold=True, small=True)
-
-    # "Подпись" — объединение колонок 9–10 в верхней строке, подстолбцы во второй.
-    ws.merge_cells(start_row=HDR1, start_column=9, end_row=HDR1, end_column=10)
-    _xl_cell(ws, HDR1, 9, "Подпись", bold=True, small=True)
-    _xl_border_range(ws, HDR1, 9, HDR1, 10)  # обрамить всю верхнюю объединённую ячейку
-    _xl_cell(ws, HDR2, 9, "Инструктирующего", bold=True, small=True)
-    _xl_cell(ws, HDR2, 10, "Инструктируемого", bold=True, small=True)
-
-    # Повтор шапки (строки 4–5) на каждом печатном листе.
-    ws.print_title_rows = f"{HDR1}:{HDR2}"
-
-    # --- Строки данных ---
-    # № на листе — позиция внутри текущей партии (1..JOURNAL_ROWS_PER_PAGE),
-    # та же семантика, что в docx-версии (см. комментарий там).
-    row_ptr = HDR2 + 1
-    for i, instr in enumerate(instructions):
+    def _write_data_row(r: int, pos_on_page: int, instr) -> None:
         emp = instr.employee
         birth_str = emp.birth_date.strftime("%d.%m.%Y") if emp and emp.birth_date else ""
-        sheet_pos = (i % JOURNAL_ROWS_PER_PAGE) + 1
-        _xl_cell(ws, row_ptr, 1, str(instr.journal_row_number))
-        _xl_cell(ws, row_ptr, 2, str(sheet_pos))
-        _xl_cell(ws, row_ptr, 3, instr.conducted_at.strftime("%d.%m.%Y"))
-        _xl_cell(ws, row_ptr, 4, emp.full_name if emp else "?", left=True)
-        _xl_cell(ws, row_ptr, 5, birth_str)
-        _xl_cell(ws, row_ptr, 6, (emp.position or "") if emp else "", left=True)
-        _xl_cell(ws, row_ptr, 7, (emp.subdivision or "") if emp else "", left=True)
-        _xl_cell(ws, row_ptr, 8, instr.conducted_by, left=True)
-        _xl_cell(ws, row_ptr, 9, "")   # подпись инструктирующего — от руки
-        _xl_cell(ws, row_ptr, 10, "")  # подпись инструктируемого — от руки
-        row_ptr += 1
+        _xl_cell(ws, r, 1, str(instr.journal_row_number))
+        _xl_cell(ws, r, 2, str(pos_on_page + 1))  # № на листе (позиция на текущем листе)
+        _xl_cell(ws, r, 3, instr.conducted_at.strftime("%d.%m.%Y"))
+        _xl_cell(ws, r, 4, emp.full_name if emp else "?", left=True)
+        _xl_cell(ws, r, 5, birth_str)
+        _xl_cell(ws, r, 6, (emp.position or "") if emp else "", left=True)
+        _xl_cell(ws, r, 7, (emp.subdivision or "") if emp else "", left=True)
+        _xl_cell(ws, r, 8, instr.conducted_by, left=True)
+        _xl_cell(ws, r, 9, "")
+        _xl_cell(ws, r, 10, "")
+        ws.row_dimensions[r].height = 22
 
-    # --- Итоговая строка под таблицей: сколько внесено + диапазон сквозных номеров ---
-    # Ноль довеска пустыми строками (вариант заказчика): журнал кончается на
-    # последней реальной записи, сразу под ней — итог и футер.
-    if instructions:
-        nums = [instr.journal_row_number for instr in instructions
-                if instr.journal_row_number is not None]
-        if nums:
-            summary = f"Внесено записей: {len(instructions)} (строки {min(nums)}–{max(nums)})"
+    def _write_page_summary(r: int, cumulative: int, last_seq) -> None:
+        """Итоговая строка В КОНЦЕ ЛИСТА (смысл 1): накопительный счётчик записей
+        ТЕКУЩЕЙ ПАРТИИ на конец этого листа + реальный последний сквозной номер из
+        БД. При допечатке партиями эти числа расходятся (партия из 8 записей может
+        нести сквозные 48–55), поэтому пишем оба — "в этой партии" отвечает на
+        "сколько внесла распечатка", сквозной — на "с какого номера продолжать"."""
+        seq_part = f" · по строку {last_seq}" if last_seq is not None else ""
+        text = f"Внесено в этой партии: {cumulative}{seq_part}"
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=NCOLS)
+        c = ws.cell(row=r, column=1, value=text)
+        c.font = _XL_FONT_BOLD
+        c.alignment = Alignment(horizontal="left", vertical="center")
+
+    # --- Раскладка по листам ---
+    row = 1
+    idx = 0
+    n = len(instructions)
+    page_num = 0
+    while idx < n or page_num == 0:
+        page_num += 1
+        if page_num == 1:
+            row = _write_cover(row)
+            capacity = ROWS_FIRST_PAGE
         else:
-            summary = f"Внесено записей: {len(instructions)}"
-    else:
-        summary = "Внесено записей: 0"
-    ws.merge_cells(start_row=row_ptr, start_column=1, end_row=row_ptr, end_column=NCOLS)
-    c = ws.cell(row=row_ptr, column=1, value=summary)
-    c.font = _XL_FONT_BOLD
-    c.alignment = Alignment(horizontal="left", vertical="center")
-    row_ptr += 1
+            capacity = ROWS_OTHER_PAGES
+        row = _write_table_header(row)
+        pos_on_page = 0
+        last_seq_on_page = None
+        while pos_on_page < capacity and idx < n:
+            _write_data_row(row, pos_on_page, instructions[idx])
+            last_seq_on_page = instructions[idx].journal_row_number
+            row += 1
+            idx += 1
+            pos_on_page += 1
+        # Итог в конце листа: накопительно по партии (idx = сколько уже разложено)
+        # + последний сквозной номер этого листа.
+        if n > 0:
+            _write_page_summary(row, idx, last_seq_on_page)
+            row += 1
+        # Разрыв страницы после строки итога, если впереди ещё есть записи.
+        if idx < n:
+            page_break_rows.append(row - 1)
+        if n == 0:
+            break
 
-    # Пустая разделительная строка
-    row_ptr += 1
+    for br in page_break_rows:
+        ws.row_breaks.append(Break(id=br))
 
-    # --- Футер: ГОСТ / приказ / сроки по закону (объединён на всю ширину) ---
+    # --- Общий футер (только под последним листом) ---
+    row += 1  # пустая строка перед футером
+
     footer_text = (
         f"Журнал ведётся по рекомендуемой форме ГОСТ 12.0.004-2015. Порядок регистрации "
         f"определён работодателем самостоятельно (п. 88 Правил №2464 от 24.12.2021; "
         f"разъяснение Роструда №15-2/В-1677 от 30.05.2022). Порядок и периодичность "
         f"инструктажей установлены {order_ref}. Подписи — собственноручные."
     )
-    ws.merge_cells(start_row=row_ptr, start_column=1, end_row=row_ptr, end_column=NCOLS)
-    c = ws.cell(row=row_ptr, column=1, value=footer_text)
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=NCOLS)
+    c = ws.cell(row=row, column=1, value=footer_text)
     c.font = Font(name="Times New Roman", size=8, italic=True)
     c.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
 
-    # --- Ширины столбцов (символы). ФИО/подразделение/инструктирующий — шире. ---
-    widths = {
-        "A": 8,   # № сквозной
-        "B": 7,   # № на листе
-        "C": 12,  # дата
-        "D": 30,  # ФИО инструктируемого
-        "E": 12,  # дата рождения
-        "F": 20,  # профессия/должность
-        "G": 22,  # подразделение
-        "H": 22,  # инструктирующий
-        "I": 14,  # подпись инструктирующего
-        "J": 14,  # подпись инструктируемого
-    }
+    widths = {"A": 8, "B": 7, "C": 12, "D": 30, "E": 12, "F": 20, "G": 22, "H": 22, "I": 14, "J": 14}
     for col_letter, w in widths.items():
         ws.column_dimensions[col_letter].width = w
-
-    # Запрет разрыва строки данных между печатными листами: openpyxl/Excel не рвёт
-    # содержимое строки, разрыв ложится ТОЛЬКО по границе строк. Дополнительно
-    # задаём разумную высоту строкам данных, чтобы длинные подразделения переносились
-    # внутри ячейки, а не растягивали лист непредсказуемо.
-    for r in range(HDR2 + 1, HDR2 + 1 + len(instructions)):
-        ws.row_dimensions[r].height = 22
-    # Явная высота строк шапки — иначе при повторе print_title_rows на 2-м/3-м
-    # листе объединённые заголовки ("Сведения об инструктируемом", "Подпись",
-    # длинные подписи столбцов) сжимаются и читаются хуже, чем на 1-м листе.
-    ws.row_dimensions[HDR1].height = 30
-    ws.row_dimensions[HDR2].height = 42
 
     path = f"{output_dir}/journal_{instruction_type.value}_{datetime.utcnow():%Y%m%d%H%M%S}.xlsx"
     wb.save(path)
