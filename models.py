@@ -392,6 +392,10 @@ class WorkOrder(Base):
     technological_card_ref: Mapped[str | None] = mapped_column(String, nullable=True)  # "Шифр ТК: НУЛ-ПСМ-ТК-07-24.005.3"
     safety_systems: Mapped[str | None] = mapped_column(Text, nullable=True)  # страховочные/поддерживающие/эвакуационные
     special_conditions: Mapped[str | None] = mapped_column(Text, nullable=True)  # погодные ограничения и т.п.
+    # ОВПФ — опасные и вредные производственные факторы (раздел бланка наряда-допуска).
+    # Добавлено 2026-07 под генератор наряда; в БД заведено:
+    #   ALTER TABLE work_orders ADD COLUMN hazards TEXT;
+    hazards: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     responsible_supervisor: Mapped["Employee"] = relationship(foreign_keys=[responsible_supervisor_id])
     responsible_executor: Mapped["Employee"] = relationship(foreign_keys=[responsible_executor_id])
