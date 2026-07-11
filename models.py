@@ -422,7 +422,11 @@ class User(Base):
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
     phone: Mapped[str] = mapped_column(String, nullable=False, unique=True)  # логин
-    password_hash: Mapped[str] = mapped_column(String, nullable=False)       # bcrypt, не открытый
+    # 2026-07: nullable (было NOT NULL) — регистрация теперь возможна и ТОЛЬКО через
+    # MAX, без пароля вообще (человек никогда не логинится в веб). Пароль обязателен
+    # только тем, кто регистрируется через веб-форму. На боевой БД:
+    #   ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;
+    password_hash: Mapped[str | None] = mapped_column(String, nullable=True)       # bcrypt, не открытый
     full_name: Mapped[str] = mapped_column(String, nullable=False)
     role: Mapped[UserRole | None] = mapped_column(Enum(UserRole), nullable=True)  # назначает админ
     status: Mapped[UserStatus] = mapped_column(
@@ -447,6 +451,18 @@ class User(Base):
     # таблицы):
     #   ALTER TABLE users ADD COLUMN max_user_id VARCHAR UNIQUE;
     max_user_id: Mapped[str | None] = mapped_column(String, nullable=True, unique=True)
+
+    # Код подтверждения привязки MAX при регистрации ЧЕРЕЗ ВЕБ (2026-07). Веб не
+    # знает MAX-аккаунт человека напрямую — форма показывает код, человек шлёт его
+    # боту командой /confirm <код>, бот находит User по коду (не истёкшему) и
+    # привязывает max_user_id. Код одноразовый — очищается сразу после успешной
+    # привязки, expires_at защищает от использования кода, если его кто-то перехватит
+    # (например, скриншот регистрации попал не в те руки).
+    # На боевой БД:
+    #   ALTER TABLE users ADD COLUMN pending_max_code VARCHAR;
+    #   ALTER TABLE users ADD COLUMN pending_max_code_expires TIMESTAMP;
+    pending_max_code: Mapped[str | None] = mapped_column(String, nullable=True)
+    pending_max_code_expires: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class Consent(Base):
