@@ -354,6 +354,44 @@ class Instruction(Base):
     employee: Mapped["Employee"] = relationship()
 
 
+class OrderCategory(str, enum.Enum):
+    """Раздел, к которому относится приказ — для сортировки/фильтрации реестра."""
+    PERSONNEL = "personnel"      # кадровые (приём, увольнение, назначения)
+    PRODUCTION = "production"    # производственные (наряды, инструктажи, ОТ)
+    OTHER = "other"              # прочие
+
+
+class InternalOrder(Base):
+    """
+    Реестр внутренних приказов организации (2026-07, модуль «Производство»).
+    Начат с приказа №20-ПСМ/2026 — более ранние приказы (1-19), если есть,
+    в реестр не заведены (не было этой системы на момент их издания).
+
+    Формат номера — по договорённости: "{порядковый}-{код заказчика}/{год}",
+    например "20-ПСМ/2026". Код заказчика/номер — не автоматизированы жёстко,
+    вводятся текстом при создании записи (не все приказы обязательно будут
+    иметь этот формат — например, кадровые приказы могут нумероваться иначе).
+
+    Используется как ссылка (INTERNAL_ORDER_REF) в футерах печатных бланков
+    наряда-допуска и журналов инструктажа — см. production.get_latest_order_ref.
+    Скан самого приказа хранится в S3 (тот же механизм, что и Certificate.scan_key),
+    scan_type = f"order_{order.id}".
+    """
+
+    __tablename__ = "internal_orders"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    number: Mapped[str] = mapped_column(String, nullable=False)  # "20-ПСМ/2026"
+    order_date: Mapped[date] = mapped_column(Date, nullable=False)
+    topic: Mapped[str] = mapped_column(String, nullable=False)
+    category: Mapped[OrderCategory] = mapped_column(
+        Enum(OrderCategory), default=OrderCategory.OTHER, nullable=False
+    )
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    scan_key: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class Certificate(Base):
     """
     Удостоверение по профессии (2026-07, модуль «Производство») — "корочки":
