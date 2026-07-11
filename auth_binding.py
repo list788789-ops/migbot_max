@@ -9,13 +9,20 @@ User по номеру телефона, дальше бот узнаёт рол
 спрашивая телефон заново при каждом действии.
 
 Требует колонку users.max_user_id (см. models.py, ALTER TABLE на проде).
+
+2026-07 (заявки на регистрацию): добавлено сохранение max_chat_id — chat_id
+личного диалога, нужен для ПРОАКТИВНОЙ отправки админам уведомлений о новых
+заявках (bot.send_message шлёт по chat_id, а не user_id). bind_max_account
+теперь принимает необязательный chat_id; set_max_chat_id обновляет его при
+любом действии пользователя; get_admins_with_chat находит админов, которым
+можно доставить уведомление.
 """
 
 import logging
 
 from sqlalchemy.orm import Session
 
-from models import User, UserStatus
+from models import User, UserRole, UserStatus
 from common_utils import normalize_phone
 
 log = logging.getLogger("auth_binding")
@@ -30,10 +37,45 @@ def find_user_by_max_id(session: Session, max_user_id: str) -> User | None:
     return session.query(User).filter_by(max_user_id=str(max_user_id)).first()
 
 
-def bind_max_account(session: Session, phone: str, max_user_id: str) -> tuple[bool, str]:
+def set_max_chat_id(session: Session, max_user_id: str, chat_id) -> None:
+    """Обновляет chat_id личного диалога у уже привязанного пользователя. Вызывается
+    при ЛЮБОМ действии пользователя в боте (вариант 3, согласовано) — чтобы у
+    активного пользователя chat_id заполнился при первом же обращении, без
+    необходимости специально делать /login. No-op, если пользователь не найден
+    (не привязан) или chat_id уже совпадает — лишних записей в БД не делаем."""
+    if chat_id is None:
+        return
+    user = session.query(User).filter_by(max_user_id=str(max_user_id)).first()
+    if user is None:
+        return
+    if user.max_chat_id == str(chat_id):
+        return
+    user.max_chat_id = str(chat_id)
+    session.add(user)
+    session.commit()
+
+
+def get_admins_with_chat(session: Session) -> list[User]:
+    """Админы с привязанным chat_id — кому реально можно доставить уведомление о
+    новой заявке. Админы без max_chat_id (ещё ни разу не писали боту после
+    введения поля) сюда не попадают — им пуш не уйдёт, заявка видна в вебе."""
+    return (
+        session.query(User)
+        .filter(User.role == UserRole.ADMIN)
+        .filter(User.max_chat_id.isnot(None))
+        .all()
+    )
+
+
+def bind_max_account(session: Session, phone: str, max_user_id: str,
+                     chat_id=None) -> tuple[bool, str]:
     """
     Пытается привязать MAX-аккаунт max_user_id к пользователю с телефоном phone.
     Возвращает (успех, текст_для_пользователя).
+
+    chat_id (необязательный) — если передан, сохраняется вместе с привязкой для
+    последующей проактивной отправки. Старые вызовы без chat_id продолжают
+    работать (default None).
 
     Не привязывает молча, если:
       - телефон не найден,
@@ -58,11 +100,17 @@ def bind_max_account(session: Session, phone: str, max_user_id: str) -> tuple[bo
         )
 
     if user.max_user_id == str(max_user_id):
+        if chat_id is not None and user.max_chat_id != str(chat_id):
+            user.max_chat_id = str(chat_id)
+            session.add(user)
+            session.commit()
         return True, (f"Вы уже вошли как {user.full_name}.\n"
                        f"Рабочее место: Автоматизированная система учёта на производстве. Роль: "
                        f"{user.role.value if user.role else '—'}.")
 
     user.max_user_id = str(max_user_id)
+    if chat_id is not None:
+        user.max_chat_id = str(chat_id)
     session.add(user)
     session.commit()
     return True, (f"Готово, вы вошли как {user.full_name}.\n"
@@ -96,10 +144,13 @@ def generate_max_confirm_code(session: Session, user: User) -> str:
     return code
 
 
-def confirm_max_code(session: Session, code: str, max_user_id: str) -> tuple[bool, str]:
+def confirm_max_code(session: Session, code: str, max_user_id: str,
+                    chat_id=None) -> tuple[bool, str]:
     """Обрабатывает /confirm <код> в боте — находит User по коду, проверяет срок
     действия, привязывает max_user_id. Код одноразовый — очищается сразу после
-    использования, успешного или нет (истёкший код нельзя вводить повторно)."""
+    использования, успешного или нет (истёкший код нельзя вводить повторно).
+
+    chat_id (необязательный) — сохраняется вместе с привязкой, как в bind_max_account."""
     from datetime import datetime
 
     code = code.strip()
@@ -121,6 +172,8 @@ def confirm_max_code(session: Session, code: str, max_user_id: str) -> tuple[boo
         return False, "Этот аккаунт уже привязан к другому MAX. Обратитесь к админу."
 
     user.max_user_id = str(max_user_id)
+    if chat_id is not None:
+        user.max_chat_id = str(chat_id)
     session.add(user)
     session.commit()
 
@@ -134,12 +187,15 @@ def confirm_max_code(session: Session, code: str, max_user_id: str) -> tuple[boo
 # ================= Регистрация ТОЛЬКО через MAX (без веба) =================
 
 def register_via_max(session: Session, full_name: str, phone: str,
-                      max_user_id: str) -> tuple[bool, str]:
+                      max_user_id: str, chat_id=None) -> tuple[bool, str]:
     """
     Регистрация с нуля прямо в боте (человек никогда не заходил в веб).
     Без пароля (password_hash=NULL) — этому человеку он не нужен, пока он
     сам не решит логиниться в веб (тогда сброс пароля сделает админ).
     max_user_id привязывается СРАЗУ — /login потом не нужен.
+
+    chat_id (необязательный) — сохраняется, чтобы админ мог ответить, а система
+    потом слать этому человеку личные уведомления.
 
     Не создаёт дубль, если телефон уже занят существующей записью — вместо
     этого пытается привязать MAX к НЕЙ (тот же путь, что bind_max_account),
@@ -152,7 +208,7 @@ def register_via_max(session: Session, full_name: str, phone: str,
     existing = find_user_by_phone(session, phone_norm)
     if existing is not None:
         # Телефон уже занят — не плодим вторую заявку, пробуем привязать к этой же.
-        return bind_max_account(session, phone_norm, max_user_id)
+        return bind_max_account(session, phone_norm, max_user_id, chat_id=chat_id)
 
     user = User(
         phone=phone_norm,
@@ -160,6 +216,7 @@ def register_via_max(session: Session, full_name: str, phone: str,
         full_name=full_name.strip(),
         status=UserStatus.PENDING,
         max_user_id=str(max_user_id),
+        max_chat_id=str(chat_id) if chat_id is not None else None,
     )
     session.add(user)
     session.commit()
