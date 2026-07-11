@@ -445,7 +445,7 @@ fieldset legend{{font-size:12px;color:var(--accent-ink);text-transform:uppercase
 </style></head><body>
 <header class="org">
 <div class="org-name">{org_name}</div>
-<div class="page-title">Миграционный учёт — {title}</div>
+<div class="page-title">Автоматизированная система — {title}</div>
 </header>
 """
 PAGE_FOOT = """
@@ -523,7 +523,7 @@ body.login-page{margin:0;min-height:100dvh;display:flex;flex-direction:column;ju
 def login_form():
     return LOGIN_HEAD + """
 <form class="auth" method="post" action="/login" autocomplete="on">
-<h1>Миграционный учёт</h1>
+<h1>Автоматизированная система</h1>
 <p class="subtitle">Вход по номеру телефона</p>
 <div class="auth-row">
 <input type="text" name="phone" placeholder="Телефон" autocomplete="username" required>
@@ -539,7 +539,7 @@ def _login_error(msg: str, code: int = 401):
     return HTMLResponse(
         LOGIN_HEAD + f"""
 <div class="auth">
-<h1>Миграционный учёт</h1>
+<h1>Автоматизированная система</h1>
 <p class="err">{msg}</p>
 <a class="btn" href="/login">← Назад</a>
 </div>
@@ -823,6 +823,7 @@ def logout(request: Request):
 def dashboard(request: Request, db: Session = Depends(get_db)):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
+    _current_user_obj = _current_user(request, db)
 
     today = datetime.now(MSK).date()  # МСК, не UTC — иначе граница "сегодня" съезжает у полуночи
 
@@ -1007,6 +1008,9 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
 {f'''<div class="warning-banner" style="background:#fdecec;border-left-color:#c0392b;color:#7a1f1f">
 🚨 СРОЧНО: явка без действующего договора у {len(invalid_contract_marks)} чел. — проверьте ниже.
 </div>''' if invalid_contract_marks else ""}
+<p class="muted" style="margin:0 0 10px">Рабочее место: Автоматизированная система.
+Вы вошли как {html.escape(_current_user_obj.full_name if _current_user_obj else "?")},
+роль: {role or "—"}.</p>
 <h1>Задачи</h1>
 <p><a class="btn" href="/employees/new">+ Добавить сотрудника</a></p>
 
