@@ -14,6 +14,9 @@ from datetime import date, datetime, timedelta
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Mm, Pt
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, Side
+from openpyxl.worksheet.pagebreak import Break
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -404,6 +407,13 @@ def generate_instruction_journal_docx(
     output_dir: str = "/tmp",
 ) -> str:
     """
+    УСТАРЕЛО (2026-07): журнал переведён на Excel — см.
+    generate_instruction_journal_xlsx ниже, роут /production/instructions/print
+    в webforms.py теперь вызывает xlsx-версию. Эта docx-функция ОСТАВЛЕНА
+    НАМЕРЕННО как быстрый откат: если xlsx на реальном принтере ляжет криво,
+    достаточно вернуть вызов *_docx в одном роуте, не переписывая ничего с нуля.
+    УДАЛИТЬ, когда xlsx-версия подтверждена на живой печати.
+    ------------------------------------------------------------------------
     Печать партии журнала инструктажей. 2026-07 (третий заход) — переписано
     под официальный скелет таблицы, который прислал пользователь ("Журнал
     регистрации вводного инструктажа"), а не по собственной реконструкции
@@ -531,6 +541,239 @@ def generate_instruction_journal_docx(
 
     path = f"{output_dir}/journal_{instruction_type.value}_{datetime.utcnow():%Y%m%d%H%M%S}.docx"
     doc.save(path)
+    return path
+
+
+# Границы/шрифт/выравнивание журнала — вынесены в модульные константы, чтобы
+# не пересоздавать объекты openpyxl на каждую ячейку (Border/Font неизменяемы,
+# один экземпляр можно назначать множеству ячеек).
+_XL_THIN = Side(style="thin", color="000000")
+_XL_BORDER = Border(left=_XL_THIN, right=_XL_THIN, top=_XL_THIN, bottom=_XL_THIN)
+_XL_FONT = Font(name="Times New Roman", size=9)
+_XL_FONT_BOLD = Font(name="Times New Roman", size=9, bold=True)
+_XL_FONT_SMALL = Font(name="Times New Roman", size=8)
+_XL_CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
+_XL_LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+
+def _xl_cell(ws, row: int, col: int, value, *, bold: bool = False,
+             small: bool = False, left: bool = False, border: bool = True):
+    """Записать значение в ячейку с единым стилем журнала. Возвращает ячейку,
+    чтобы вызывающий код мог при желании доопределить (например, снять границу).
+
+    ВНИМАНИЕ: не вызывать для НЕ-левых-верхних ячеек объединённого диапазона —
+    у openpyxl они становятся MergedCell с read-only .value. Для обрамления
+    таких ячеек использовать _xl_border_range после merge_cells."""
+    cell = ws.cell(row=row, column=col, value=value)
+    cell.font = _XL_FONT_BOLD if bold else (_XL_FONT_SMALL if small else _XL_FONT)
+    cell.alignment = _XL_LEFT if left else _XL_CENTER
+    if border:
+        cell.border = _XL_BORDER
+    return cell
+
+
+def _xl_border_range(ws, r1: int, c1: int, r2: int, c2: int) -> None:
+    """Проставить границу _XL_BORDER на КАЖДУЮ ячейку прямоугольника r1..r2 × c1..c2,
+    включая MergedCell (им нельзя писать .value, но .border — можно). Нужно, чтобы
+    объединённые ячейки шапки печатались обрамлёнными по всем внутренним линиям."""
+    for r in range(r1, r2 + 1):
+        for c in range(c1, c2 + 1):
+            ws.cell(row=r, column=c).border = _XL_BORDER
+
+
+def generate_instruction_journal_xlsx(
+    instructions: list[Instruction], instruction_type: InstructionType,
+    org_name: str, order_ref: str, journal_number: int = 1,
+    started_at: date | None = None, sheet_number: int = 1, total_sheets: int = 1,
+    output_dir: str = "/tmp",
+) -> str:
+    """
+    Excel-версия печати журнала инструктажей (2026-07, замена docx). Тот же
+    официальный скелет таблицы 1:1, что и в generate_instruction_journal_docx:
+    те же 10 столбцов, двухуровневая шапка с объединением ячеек, обложка
+    Начат/Окончен/Кол-во листов/Лист, профессия/подразделение из карточки.
+
+    Отличия от docx — осознанные, продиктованы природой Excel (обсуждено с
+    заказчиком):
+    - НЕТ довеска пустыми строками "до конца страницы". В Excel разбивку на
+      печатные листы делает драйвер принтера, а не код, поэтому "погасить лист
+      прочерками до низа" технически невозможно и не нужно: каждая партия
+      печатается заново целым файлом из БД (print_new_journal_entries), а не
+      дописывается ручкой в старую распечатку. Журнал заканчивается на последней
+      реальной записи.
+    - Под таблицей — итоговая строка "Внесено записей: N (строки M–K)", где N —
+      сколько записей в ЭТОМ файле (эта партия печати), M–K — диапазон их
+      сквозных номеров. Снимает путаницу при подшивке партий в одну книгу.
+    - Печать: альбомная A4, повтор двухуровневой шапки таблицы на КАЖДОМ листе
+      (print_title_rows), запрет разрыва строки между листами по высоте (каждый
+      работник целиком на одном листе), вписывание по ширине (10 колонок не
+      уезжают за правый край).
+
+    sheet_number/total_sheets — для граф "Лист"/"Количество листов" обложки,
+    та же семантика-приближение, что в docx-версии.
+    """
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Журнал"
+
+    # --- Печать: альбомная A4, впис по ширине, поля ---
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.paperSize = 9  # A4
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0  # по высоте — сколько листов нужно, не сжимать
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+    NCOLS = 10  # столбцы A..J
+
+    label = INSTRUCTION_LABELS.get(instruction_type, instruction_type.value)
+
+    # --- Строка 1: заголовок журнала (объединён на всю ширину) ---
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=NCOLS)
+    c = ws.cell(row=1, column=1, value=f"ЖУРНАЛ РЕГИСТРАЦИИ ИНСТРУКТАЖА ({label.upper()})")
+    c.font = Font(name="Times New Roman", size=14, bold=True)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+
+    # --- Строка 2: организация + номер журнала ---
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=NCOLS)
+    c = ws.cell(row=2, column=1, value=f"Организация: {org_name}          Журнал № {journal_number}")
+    c.font = _XL_FONT
+    c.alignment = Alignment(horizontal="left", vertical="center")
+
+    # --- Строка 3: обложка Начат|Окончен|Кол-во листов|Лист (8 ячеек: label/value ×4) ---
+    started_str = started_at.strftime("%d.%m.%Y") if started_at else "—"
+    cover = [
+        ("Начат", started_str), ("Окончен", "—"),
+        ("Количество листов", str(total_sheets)), ("Лист", str(sheet_number)),
+    ]
+    col = 1
+    for lbl, val in cover:
+        _xl_cell(ws, 3, col, lbl, bold=True, small=True)
+        _xl_cell(ws, 3, col + 1, val, small=True)
+        col += 2
+    # столбцы 9,10 в строке обложки оставляем пустыми, но с границей — ровный низ
+    _xl_cell(ws, 3, 9, "", small=True)
+    _xl_cell(ws, 3, 10, "", small=True)
+
+    # --- Строки 4–5: двухуровневая шапка таблицы ---
+    HDR1, HDR2 = 4, 5
+    # Вертикальное объединение (шапка на 2 строки) для одиночных столбцов:
+    # 1 № сквозной | 2 № на листе | 3 Дата проведения | 7 Подразделение | 8 Инструктирующий
+    single = {
+        1: "№ сквозной",
+        2: "№ на листе",
+        3: "Дата проведения",
+        7: "Наименование структурного подразделения, в которое направлен инструктируемый",
+        8: "Фамилия, имя, отчество, должность инструктирующего",
+    }
+    for col_idx, text in single.items():
+        ws.merge_cells(start_row=HDR1, start_column=col_idx, end_row=HDR2, end_column=col_idx)
+        _xl_cell(ws, HDR1, col_idx, text, bold=True, small=True)
+        _xl_border_range(ws, HDR1, col_idx, HDR2, col_idx)  # обрамить обе строки объединения
+
+    # "Сведения об инструктируемом" — горизонтальное объединение колонок 4–6 в верхней строке,
+    # подстолбцы во второй.
+    ws.merge_cells(start_row=HDR1, start_column=4, end_row=HDR1, end_column=6)
+    _xl_cell(ws, HDR1, 4, "Сведения об инструктируемом", bold=True, small=True)
+    _xl_border_range(ws, HDR1, 4, HDR1, 6)  # обрамить всю верхнюю объединённую ячейку
+    _xl_cell(ws, HDR2, 4, "Фамилия, имя, отчество", bold=True, small=True)
+    _xl_cell(ws, HDR2, 5, "Дата рождения", bold=True, small=True)
+    _xl_cell(ws, HDR2, 6, "Профессия, должность", bold=True, small=True)
+
+    # "Подпись" — объединение колонок 9–10 в верхней строке, подстолбцы во второй.
+    ws.merge_cells(start_row=HDR1, start_column=9, end_row=HDR1, end_column=10)
+    _xl_cell(ws, HDR1, 9, "Подпись", bold=True, small=True)
+    _xl_border_range(ws, HDR1, 9, HDR1, 10)  # обрамить всю верхнюю объединённую ячейку
+    _xl_cell(ws, HDR2, 9, "Инструктирующего", bold=True, small=True)
+    _xl_cell(ws, HDR2, 10, "Инструктируемого", bold=True, small=True)
+
+    # Повтор шапки (строки 4–5) на каждом печатном листе.
+    ws.print_title_rows = f"{HDR1}:{HDR2}"
+
+    # --- Строки данных ---
+    # № на листе — позиция внутри текущей партии (1..JOURNAL_ROWS_PER_PAGE),
+    # та же семантика, что в docx-версии (см. комментарий там).
+    row_ptr = HDR2 + 1
+    for i, instr in enumerate(instructions):
+        emp = instr.employee
+        birth_str = emp.birth_date.strftime("%d.%m.%Y") if emp and emp.birth_date else ""
+        sheet_pos = (i % JOURNAL_ROWS_PER_PAGE) + 1
+        _xl_cell(ws, row_ptr, 1, str(instr.journal_row_number))
+        _xl_cell(ws, row_ptr, 2, str(sheet_pos))
+        _xl_cell(ws, row_ptr, 3, instr.conducted_at.strftime("%d.%m.%Y"))
+        _xl_cell(ws, row_ptr, 4, emp.full_name if emp else "?", left=True)
+        _xl_cell(ws, row_ptr, 5, birth_str)
+        _xl_cell(ws, row_ptr, 6, (emp.position or "") if emp else "", left=True)
+        _xl_cell(ws, row_ptr, 7, (emp.subdivision or "") if emp else "", left=True)
+        _xl_cell(ws, row_ptr, 8, instr.conducted_by, left=True)
+        _xl_cell(ws, row_ptr, 9, "")   # подпись инструктирующего — от руки
+        _xl_cell(ws, row_ptr, 10, "")  # подпись инструктируемого — от руки
+        row_ptr += 1
+
+    # --- Итоговая строка под таблицей: сколько внесено + диапазон сквозных номеров ---
+    # Ноль довеска пустыми строками (вариант заказчика): журнал кончается на
+    # последней реальной записи, сразу под ней — итог и футер.
+    if instructions:
+        nums = [instr.journal_row_number for instr in instructions
+                if instr.journal_row_number is not None]
+        if nums:
+            summary = f"Внесено записей: {len(instructions)} (строки {min(nums)}–{max(nums)})"
+        else:
+            summary = f"Внесено записей: {len(instructions)}"
+    else:
+        summary = "Внесено записей: 0"
+    ws.merge_cells(start_row=row_ptr, start_column=1, end_row=row_ptr, end_column=NCOLS)
+    c = ws.cell(row=row_ptr, column=1, value=summary)
+    c.font = _XL_FONT_BOLD
+    c.alignment = Alignment(horizontal="left", vertical="center")
+    row_ptr += 1
+
+    # Пустая разделительная строка
+    row_ptr += 1
+
+    # --- Футер: ГОСТ / приказ / сроки по закону (объединён на всю ширину) ---
+    footer_text = (
+        f"Журнал ведётся по рекомендуемой форме ГОСТ 12.0.004-2015. Порядок регистрации "
+        f"определён работодателем самостоятельно (п. 88 Правил №2464 от 24.12.2021; "
+        f"разъяснение Роструда №15-2/В-1677 от 30.05.2022) — {order_ref}. "
+        f"Подписи — собственноручные. Сроки по закону: вводный — в день начала работы; "
+        f"первичный на рабочем месте — до допуска к самостоятельной работе; повторный — "
+        f"не реже 1 раза в 6–12 мес.; внеплановый/целевой — по факту события."
+    )
+    ws.merge_cells(start_row=row_ptr, start_column=1, end_row=row_ptr, end_column=NCOLS)
+    c = ws.cell(row=row_ptr, column=1, value=footer_text)
+    c.font = Font(name="Times New Roman", size=8, italic=True)
+    c.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+
+    # --- Ширины столбцов (символы). ФИО/подразделение/инструктирующий — шире. ---
+    widths = {
+        "A": 8,   # № сквозной
+        "B": 7,   # № на листе
+        "C": 12,  # дата
+        "D": 30,  # ФИО инструктируемого
+        "E": 12,  # дата рождения
+        "F": 20,  # профессия/должность
+        "G": 22,  # подразделение
+        "H": 22,  # инструктирующий
+        "I": 14,  # подпись инструктирующего
+        "J": 14,  # подпись инструктируемого
+    }
+    for col_letter, w in widths.items():
+        ws.column_dimensions[col_letter].width = w
+
+    # Запрет разрыва строки данных между печатными листами: openpyxl/Excel не рвёт
+    # содержимое строки, разрыв ложится ТОЛЬКО по границе строк. Дополнительно
+    # задаём разумную высоту строкам данных, чтобы длинные подразделения переносились
+    # внутри ячейки, а не растягивали лист непредсказуемо.
+    for r in range(HDR2 + 1, HDR2 + 1 + len(instructions)):
+        ws.row_dimensions[r].height = 22
+    # Явная высота строк шапки — иначе при повторе print_title_rows на 2-м/3-м
+    # листе объединённые заголовки ("Сведения об инструктируемом", "Подпись",
+    # длинные подписи столбцов) сжимаются и читаются хуже, чем на 1-м листе.
+    ws.row_dimensions[HDR1].height = 30
+    ws.row_dimensions[HDR2].height = 42
+
+    path = f"{output_dir}/journal_{instruction_type.value}_{datetime.utcnow():%Y%m%d%H%M%S}.xlsx"
+    wb.save(path)
     return path
 
 
