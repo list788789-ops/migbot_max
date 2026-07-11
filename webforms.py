@@ -1470,8 +1470,9 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
         signed = sum(1 for m in members if m.signed_at is not None)
         return (
             f'<div class="card">№{o.number} — {o.work_description}<br>'
-            f'<span class="muted">{o.location} · {o.valid_from:%d.%m}–{o.valid_to:%d.%m.%Y} · '
-            f'ответственный: {o.responsible.full_name if o.responsible else "?"}</span><br>'
+            f'<span class="muted">{o.location} · {o.valid_from:%d.%m}–{o.valid_to:%d.%m.%Y}</span><br>'
+            f'<span class="muted">Руководитель: {o.responsible_supervisor.full_name if o.responsible_supervisor else "?"} · '
+            f'Исполнитель: {o.responsible_executor.full_name if o.responsible_executor else "?"}</span><br>'
             f'<span class="badge neutral">Подписали: {signed}/{len(members)}</span> '
             f'<a class="btn secondary" href="/production/work-orders/{o.id}/print">Печатный бланк</a> '
             f'<form method="post" action="/production/work-orders/{o.id}/close" style="display:inline">'
@@ -1486,13 +1487,25 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
 <h2>Новый наряд</h2>
 <form method="post" action="/production/work-orders/new">
 <input type="text" name="number" placeholder="Номер наряда" required>
-<textarea name="work_description" placeholder="Описание работ" required rows="3"></textarea>
-<input type="text" name="location" placeholder="Место проведения" required>
-<label>Ответственный производитель работ:
-<select name="responsible_employee_id" required>{emp_options}</select></label>
+<input type="text" name="subdivision" placeholder="Подразделение (например: ОС)">
+<textarea name="work_description" placeholder="На выполнение работ" required rows="3"></textarea>
+<input type="text" name="location" placeholder="Место выполнения работ" required>
+<label>Ответственный руководитель работ:
+<select name="responsible_supervisor_id" required>{emp_options}</select></label>
+<label>Ответственный исполнитель работ (бригадир):
+<select name="responsible_executor_id" required>{emp_options}</select></label>
 <label>Действует с: <input type="date" name="valid_from" required></label>
 <label>Действует по: <input type="date" name="valid_to" required></label>
 <fieldset><legend>Члены бригады</legend>{emp_checkboxes}</fieldset>
+<fieldset><legend>Дополнительно (необязательно)</legend>
+<textarea name="materials" placeholder="Материалы" rows="2"></textarea>
+<textarea name="tools" placeholder="Инструменты" rows="2"></textarea>
+<textarea name="equipment" placeholder="Приспособления" rows="2"></textarea>
+<textarea name="special_machinery" placeholder="Спецтехника" rows="2"></textarea>
+<input type="text" name="technological_card_ref" placeholder="Ссылка на технологическую карту (шифр ТК)">
+<textarea name="safety_systems" placeholder="Системы обеспечения безопасности (страховочные/поддерживающие/эвакуационные)" rows="2"></textarea>
+<textarea name="special_conditions" placeholder="Особые условия (погодные ограничения и т.п.)" rows="2"></textarea>
+</fieldset>
 <button type="submit">Создать наряд</button>
 </form>
 </section>
@@ -1505,22 +1518,40 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
 def work_order_create(
     request: Request,
     number: str = Form(...),
+    subdivision: str = Form(""),
     work_description: str = Form(...),
     location: str = Form(...),
-    responsible_employee_id: str = Form(...),
+    responsible_supervisor_id: str = Form(...),
+    responsible_executor_id: str = Form(...),
     valid_from: str = Form(...),
     valid_to: str = Form(...),
     member_ids: list[str] = Form(default=[]),
+    materials: str = Form(""),
+    tools: str = Form(""),
+    equipment: str = Form(""),
+    special_machinery: str = Form(""),
+    technological_card_ref: str = Form(""),
+    safety_systems: str = Form(""),
+    special_conditions: str = Form(""),
     db: Session = Depends(get_db),
 ):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
     actor = _actor_name(request, db)
     prod.create_work_order(
-        db, number, work_description, location, responsible_employee_id, actor,
+        db, number, work_description, location,
+        responsible_supervisor_id, responsible_executor_id, actor,
         datetime.strptime(valid_from, "%Y-%m-%d").date(),
         datetime.strptime(valid_to, "%Y-%m-%d").date(),
         member_ids,
+        subdivision=subdivision or None,
+        materials=materials or None,
+        tools=tools or None,
+        equipment=equipment or None,
+        special_machinery=special_machinery or None,
+        technological_card_ref=technological_card_ref or None,
+        safety_systems=safety_systems or None,
+        special_conditions=special_conditions or None,
     )
     return RedirectResponse("/production/work-orders", status_code=303)
 
@@ -1773,17 +1804,46 @@ def orders_page(request: Request, db: Session = Depends(get_db)):
 <section>
 <h2>Новый приказ</h2>
 <form method="post" action="/production/orders/new" enctype="multipart/form-data">
-<input type="text" name="number" placeholder="Номер (например: 20-ПСМ/2026)" value="{_pf_number}" required>
-<label>Дата: <input type="date" name="order_date" value="{_pf_date}" required></label>
-<input type="text" name="topic" placeholder="Тема приказа" value="{html.escape(_pf_topic)}" required>
+<input type="text" name="number" id="orderNumber" placeholder="Номер (например: 20-ПСМ/2026)" value="{_pf_number}" required>
+<label>Дата: <input type="date" name="order_date" id="orderDate" value="{_pf_date}" required></label>
+<input type="text" name="topic" id="orderTopic" placeholder="Тема приказа" value="{html.escape(_pf_topic)}" required>
 <label>Раздел: <select name="category">{category_options}</select></label>
 <textarea name="note" placeholder="Примечание (необязательно)" rows="2"></textarea>
 <label>Скан приказа (PDF/фото):</label>
-<input type="file" name="scan_file" accept="application/pdf,image/*,.doc,.docx" style="display:block;width:100%;margin:8px 0;padding:10px;border:1px solid #d9dde3;border-radius:8px;background:#fff;font-size:16px">
+<input type="file" name="scan_file" id="orderScanFile" accept="application/pdf,image/*,.doc,.docx" style="display:block;width:100%;margin:8px 0;padding:10px;border:1px solid #d9dde3;border-radius:8px;background:#fff;font-size:16px">
+<p class="muted" style="margin:0 0 10px">Имя файла вида Prikaz_20-ПСМ2026_Тема_01-06-2026 —
+поля заполнятся сами при выборе файла.</p>
 <button type="submit">Добавить в реестр</button>
 </form>
 </section>
 <p><a class="btn secondary" href="/production">← Производство</a></p>
+<script>
+(function(){{
+  var input = document.getElementById('orderScanFile');
+  if (!input) return;
+  // Известные темы по короткому обозначению в имени файла — расширять по мере
+  // появления новых приказов с другими темами.
+  var topicMap = {{
+    'OT-zhurnaly-naryady': 'О порядке ведения журналов инструктажей по охране труда и учёта нарядов-допусков',
+    'zhurnaly-naryady': 'О порядке ведения журналов инструктажей по охране труда и учёта нарядов-допусков'
+  }};
+  var customerMap = {{'PSM': 'ПСМ'}};
+  input.addEventListener('change', function(e){{
+    var f = e.target.files && e.target.files[0];
+    if (!f) return;
+    var name = f.name.replace(/\\.[^.]+$/, '');
+    // Формат: Prikaz_{{номер}}-{{заказчик}}{{год}}_{{тема}}_{{дд}}-{{мм}}-{{гггг}}
+    var m = name.match(/^Prikaz_(\\d+)-([A-Za-zА-Яа-я]+)(\\d{{4}})_(.+)_(\\d{{2}})-(\\d{{2}})-(\\d{{4}})$/);
+    if (!m) return;  // имя не по формату — не мешаем ручному вводу
+    var num = m[1], customerRaw = m[2].toUpperCase(), year = m[3];
+    var topicSlug = m[4], dd = m[5], mm = m[6], yyyy = m[7];
+    var customerRu = customerMap[customerRaw] || customerRaw;
+    document.getElementById('orderNumber').value = num + '-' + customerRu + '/' + year;
+    document.getElementById('orderDate').value = yyyy + '-' + mm + '-' + dd;
+    document.getElementById('orderTopic').value = topicMap[topicSlug] || topicSlug.replace(/-/g, ' ');
+  }});
+}})();
+</script>
 """
     return _render("Приказы", body, active="production", role=request.session.get("role", ""))
 
