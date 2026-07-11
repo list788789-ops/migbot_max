@@ -337,6 +337,25 @@ class BrigadeMember(Base):
     employee: Mapped["Employee"] = relationship()
 
 
+class Titul(Base):
+    """
+    Титул (объект работ) — справочник для поля «Место выполнения работ»
+    наряда-допуска (2026-07). По образцу Brigade: сохраняемое значение, отдельно
+    от конкретного наряда, ведётся через /production/tituly. code — шифр (15.21),
+    name — наименование (Лаборатория). В наряде наполняет WorkOrder.location
+    (строка); сам на наряде НЕ хранится — поэтому разовый объект не из справочника
+    вписывается в location вручную, а смена/удаление титула задним числом не
+    меняет уже выданные наряды (там место работ зафиксировано текстом).
+    """
+
+    __tablename__ = "tituly"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    code: Mapped[str] = mapped_column(String, nullable=False)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class WorkOrder(Base):
     """
     Наряд-допуск (2026-07, модуль «Производство», отдельный от миграционного
