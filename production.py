@@ -230,13 +230,34 @@ INSTRUCTION_LABELS = {
 # разумный дефолт под таблицу А4 с таким набором граф. Легко поменять.
 JOURNAL_ROWS_PER_PAGE = 20
 
+# Порог "критично" для непроведённых вводного/первичного инструктажей: сколько
+# дней после ДАТЫ НАЧАЛА РАБОТЫ считается некритичной просрочкой, после чего —
+# критичной. Согласовано явно: 5 дней. Стадии: "overdue" (дата начала прошла,
+# 0..5 дней) → "critical" (> 5 дней). Стадия "заранее" для этих двух видов на
+# практике не возникает, пока даты начала в прошлом (см. диалог) — включится
+# сама, когда появятся будущие даты начала работы.
+INSTRUCTION_OVERDUE_CRITICAL_DAYS = 5
 
-def get_employees_needing_introductory(session: Session) -> list[Employee]:
+# Виды инструктажа, проведение которых система ТРЕБУЕТ по дате начала работы
+# (разовые, привязаны к приёму). Повторный/внеплановый/целевой сюда НЕ входят:
+# повторный периодический (отложен), внеплановый/целевой — событийные, планового
+# срока по календарю у них нет.
+REQUIRED_INSTRUCTION_TYPES = (
+    InstructionType.INTRODUCTORY,
+    InstructionType.PRIMARY_WORKPLACE,
+)
+
+
+def get_employees_needing_instruction(
+    session: Session, instruction_type: InstructionType
+) -> list[Employee]:
     """Активные сотрудники, у кого известна дата начала работы (дата договора,
-    а если её ещё нет — дата въезда), но вводного инструктажа ещё нет ни одного."""
+    а если её ещё нет — дата въезда), но инструктажа ДАННОГО типа ещё нет ни
+    одного. Обобщение прежней get_employees_needing_introductory на любой тип —
+    чтобы вводный и первичный проверялись одной логикой, а не двумя копиями."""
     existing_ids = {
         i.employee_id for i in
-        session.query(Instruction).filter_by(type=InstructionType.INTRODUCTORY).all()
+        session.query(Instruction).filter_by(type=instruction_type).all()
     }
     employees = (
         session.query(Employee)
@@ -245,6 +266,48 @@ def get_employees_needing_introductory(session: Session) -> list[Employee]:
         .all()
     )
     return [e for e in employees if e.id not in existing_ids]
+
+
+def get_employees_needing_introductory(session: Session) -> list[Employee]:
+    """Обёртка над get_employees_needing_instruction для вводного — сохранена,
+    чтобы не менять вызовы в webforms.py (кнопка «Заполнить вводный всем»)."""
+    return get_employees_needing_instruction(session, InstructionType.INTRODUCTORY)
+
+
+def get_instruction_compliance_gaps(session: Session) -> list[dict]:
+    """Пробелы по ОБЯЗАТЕЛЬНЫМ инструктажам (вводный + первичный на рабочем месте):
+    активный сотрудник, у которого дата начала работы уже наступила, а инструктаж
+    этого типа не проведён. Для дашборда веба, раздела «Требует внимания» в боте
+    и утренней рассылки «до устранения».
+
+    Стадия:
+      "overdue"  — дата начала прошла, 0..INSTRUCTION_OVERDUE_CRITICAL_DAYS дней;
+      "critical" — прошло больше порога.
+    Сотрудники с ещё НЕ наступившей датой начала (будущий приём) сюда не попадают —
+    у них обязанность ещё не возникла (для них позже естественно оживёт стадия
+    «заранее», её добавим, когда появятся будущие даты)."""
+    today = date.today()
+    gaps: list[dict] = []
+    for itype in REQUIRED_INSTRUCTION_TYPES:
+        for emp in get_employees_needing_instruction(session, itype):
+            start_date = emp.contract_date or emp.entry_date
+            if start_date is None or start_date > today:
+                continue  # дата начала не наступила — обязанности ещё нет
+            days_overdue = (today - start_date).days
+            stage = "critical" if days_overdue > INSTRUCTION_OVERDUE_CRITICAL_DAYS else "overdue"
+            gaps.append({
+                "employee_id": emp.id,
+                "name": emp.full_name,
+                "instruction_type": itype,
+                "type_label": INSTRUCTION_LABELS.get(itype, itype.value),
+                "start_date": start_date,
+                "days_overdue": days_overdue,
+                "stage": stage,
+            })
+    # Критичные первыми, внутри — по возрастанию давности (свежие сверху),
+    # чтобы в рассылке/на дашборде взгляд цеплялся за самое горящее.
+    gaps.sort(key=lambda g: (g["stage"] != "critical", g["days_overdue"]))
+    return gaps
 
 
 def auto_create_introductory_instructions(session: Session, conducted_by: str) -> list[Instruction]:
@@ -734,10 +797,8 @@ def generate_instruction_journal_xlsx(
     footer_text = (
         f"Журнал ведётся по рекомендуемой форме ГОСТ 12.0.004-2015. Порядок регистрации "
         f"определён работодателем самостоятельно (п. 88 Правил №2464 от 24.12.2021; "
-        f"разъяснение Роструда №15-2/В-1677 от 30.05.2022) — {order_ref}. "
-        f"Подписи — собственноручные. Сроки по закону: вводный — в день начала работы; "
-        f"первичный на рабочем месте — до допуска к самостоятельной работе; повторный — "
-        f"не реже 1 раза в 6–12 мес.; внеплановый/целевой — по факту события."
+        f"разъяснение Роструда №15-2/В-1677 от 30.05.2022). Порядок и периодичность "
+        f"инструктажей установлены {order_ref}. Подписи — собственноручные."
     )
     ws.merge_cells(start_row=row_ptr, start_column=1, end_row=row_ptr, end_column=NCOLS)
     c = ws.cell(row=row_ptr, column=1, value=footer_text)
