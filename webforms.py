@@ -2086,10 +2086,24 @@ def brigades_page(request: Request, db: Session = Depends(get_db)):
     def brigade_row(b) -> str:
         member_ids = set(prod.get_brigade_member_ids(db, b.id))
         names = [e.full_name for e in employees if e.id in member_ids]
+        # Чекбоксы редактирования: текущие члены отмечены.
+        edit_checkboxes = "".join(
+            f'<label style="display:block;margin:2px 0"><input type="checkbox" name="member_ids" '
+            f'value="{e.id}"{" checked" if e.id in member_ids else ""}> {html.escape(e.full_name)}</label>'
+            for e in employees
+        )
         return (
-            f'<div class="card">{b.name}<br>'
-            f'<span class="muted">{", ".join(names) or "пусто"}</span><br>'
-            f'<form method="post" action="/production/brigades/{b.id}/delete" style="display:inline"'
+            f'<div class="card">{html.escape(b.name)}<br>'
+            f'<span class="muted">{", ".join(html.escape(n) for n in names) or "пусто"}</span><br>'
+            f'<details style="margin-top:6px">'
+            f'<summary style="cursor:pointer">✏️ Изменить</summary>'
+            f'<form method="post" action="/production/brigades/{b.id}/update" style="margin-top:8px">'
+            f'<input type="text" name="name" value="{html.escape(b.name)}" required '
+            f'style="display:block;margin-bottom:6px">'
+            f'<fieldset><legend>Состав</legend>{edit_checkboxes}</fieldset>'
+            f'<button type="submit">Сохранить изменения</button>'
+            f'</form></details>'
+            f'<form method="post" action="/production/brigades/{b.id}/delete" style="display:inline;margin-top:6px"'
             f' onsubmit="return confirm(\'Удалить бригаду?\')">'
             f'<button type="submit" class="btn secondary">Удалить</button></form></div>'
         )
@@ -2127,6 +2141,18 @@ def brigade_delete(brigade_id: str, request: Request, db: Session = Depends(get_
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
     prod.delete_brigade(db, brigade_id)
+    return RedirectResponse("/production/brigades", status_code=303)
+
+
+@app.post("/production/brigades/{brigade_id}/update")
+def brigade_update(
+    brigade_id: str, request: Request, name: str = Form(...),
+    member_ids: list[str] = Form(default=[]), db: Session = Depends(get_db),
+):
+    """Переименование + замена состава одной формой (см. prod.update_brigade)."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    prod.update_brigade(db, brigade_id, name, member_ids)
     return RedirectResponse("/production/brigades", status_code=303)
 
 
