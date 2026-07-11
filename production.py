@@ -250,7 +250,16 @@ def auto_create_introductory_instructions(session: Session, conducted_by: str) -
     самого инструктажа = дата начала работы конкретного человека (дата договора,
     а если пусто — дата въезда), НЕ сегодняшняя дата — так порядок строк в
     журнале при печати совпадёт с реальной хронологией приёма, а не с датой,
-    когда кто-то нажал кнопку в системе."""
+    когда кто-то нажал кнопку в системе.
+
+    2026-07: защита от гонки (двойное нажатие кнопки создавало дубли — нашли по
+    факту на первой же реальной распечатке, см. журнал патчей). Коммит ПО ОДНОМУ
+    сотруднику, а не одним общим commit() в конце — если где-то между чтением
+    списка и записью появился дубль (например, из-за параллельного запроса),
+    unique-индекс в БД (employee_id WHERE type='introductory') отклонит именно
+    эту одну вставку, не обрушив всю пачку остальных."""
+    from sqlalchemy.exc import IntegrityError
+
     employees = get_employees_needing_introductory(session)
     created = []
     for e in employees:
@@ -262,8 +271,11 @@ def auto_create_introductory_instructions(session: Session, conducted_by: str) -
             conducted_at=datetime.combine(start_date, datetime.min.time()),
         )
         session.add(instr)
-        created.append(instr)
-    session.commit()
+        try:
+            session.commit()
+            created.append(instr)
+        except IntegrityError:
+            session.rollback()  # уже есть (гонка/повторное нажатие) — пропускаем, не падаем
     return created
 
 
@@ -341,9 +353,32 @@ def get_instructions_for_employee(session: Session, employee_id: str) -> list[In
     )
 
 
+def _set_cell(cell, text: str, size: int = 8, bold: bool = False) -> None:
+    """Текст ячейки с уменьшенным шрифтом — чтобы длинные ФИО помещались в одну
+    строку при печати, не переносились на две-три (см. договорённость)."""
+    cell.text = ""
+    p = cell.paragraphs[0]
+    run = p.add_run(text)
+    run.font.size = Pt(size)
+    run.bold = bold
+
+
+def get_journal_started_at(session: Session, instruction_type: InstructionType) -> date | None:
+    """Дата самой ранней записи в журнале этого типа — для графы "Начат" на обложке.
+    Не дата печати текущей партии, а дата первой КОГДА-ЛИБО занесённой записи."""
+    first = (
+        session.query(Instruction)
+        .filter_by(type=instruction_type)
+        .order_by(Instruction.conducted_at)
+        .first()
+    )
+    return first.conducted_at.date() if first else None
+
+
 def generate_instruction_journal_docx(
     instructions: list[Instruction], instruction_type: InstructionType,
-    org_name: str, order_ref: str, output_dir: str = "/tmp",
+    org_name: str, order_ref: str, journal_number: int = 1,
+    started_at: date | None = None, output_dir: str = "/tmp",
 ) -> str:
     """
     Печать партии журнала инструктажей — по образцу рекомендуемой формы
@@ -353,6 +388,22 @@ def generate_instruction_journal_docx(
     довешенные прочерками до конца страницы (JOURNAL_ROWS_PER_PAGE) — довесок
     визуальный, не сохраняется как данные, следующая реальная запись получит
     следующий номер как ни в чём не бывало (см. договорённость в чате).
+
+    2026-07 (второй заход, по замечаниям к первой распечатке):
+    - journal_number — номер САМОЙ КНИГИ журнала (не строки внутри неё). Книга
+      заполняется, закрывается, заводится новая с №2 — это [Предполагаю] пока
+      НЕ автоматизировано (нет логики "книга заполнена, начать новую"), номер
+      передаётся параметром, по умолчанию 1. Явно отмечаю ограничение, чтобы
+      не выглядело как готовая функция ротации книг.
+    - started_at — дата "Начат" на обложке (по факту делопроизводства — дата
+      самой ранней записи в журнале ЭТОГО типа, не дата печати текущей партии).
+      "Окончен" пока всегда пусто — закрытие книги вручную не реализовано.
+    - Добавлены графы "Профессия (должность)" и "Подразделение" — были в
+      реальной рекомендуемой форме ГОСТ, у нас их не было. В Employee нет
+      полей профессии/подразделения — графы печатаются ПУСТЫМИ для заполнения
+      от руки, не выдумываю значения.
+    - Компактный шрифт (см. _set_cell) — чтобы строка помещалась в одну линию,
+      не переносилась на 2-3 (замечание после первой распечатки).
 
     order_ref — ссылка на приказ (INTERNAL_ORDER_REF), печатается мелким
     шрифтом внизу страницы — см. договорённость про подсказку для проверяющего.
@@ -367,26 +418,32 @@ def generate_instruction_journal_docx(
     run.font.size = Pt(14)
 
     doc.add_paragraph(f"Организация: {org_name}")
+    doc.add_paragraph(f"Журнал № {journal_number}")
+    started_str = started_at.strftime("%d.%m.%Y") if started_at else "—"
+    doc.add_paragraph(f"Начат: {started_str}          Окончен: —")
 
-    table = doc.add_table(rows=1, cols=7)
+    headers = ["№", "Дата", "ФИО", "Год рожд.", "Профессия (должность)", "Подразделение",
+               "Кто провёл", "Подпись инструкт.", "Подпись инструктирующего"]
+    table = doc.add_table(rows=1, cols=len(headers))
     table.style = "Table Grid"
+    table.autofit = False
     hdr = table.rows[0].cells
-    headers = ["№", "Дата", "ФИО", "Год рожд.", "Кто провёл",
-               "Подпись инструктируемого", "Подпись инструктирующего"]
     for i, h in enumerate(headers):
-        hdr[i].text = h
+        _set_cell(hdr[i], h, size=8, bold=True)
 
     for instr in instructions:
         row = table.add_row().cells
         emp = instr.employee
         birth_year = str(emp.birth_date.year) if emp and emp.birth_date else ""
-        row[0].text = str(instr.journal_row_number)
-        row[1].text = instr.conducted_at.strftime("%d.%m.%Y")
-        row[2].text = emp.full_name if emp else "?"
-        row[3].text = birth_year
-        row[4].text = instr.conducted_by
-        row[5].text = ""  # подпись — от руки на распечатке
-        row[6].text = ""
+        _set_cell(row[0], str(instr.journal_row_number))
+        _set_cell(row[1], instr.conducted_at.strftime("%d.%m.%Y"))
+        _set_cell(row[2], emp.full_name if emp else "?")
+        _set_cell(row[3], birth_year)
+        _set_cell(row[4], (emp.position or "") if emp else "")  # из карточки, если заполнено
+        _set_cell(row[5], (emp.subdivision or "") if emp else "")  # из карточки, если заполнено
+        _set_cell(row[6], instr.conducted_by)
+        _set_cell(row[7], "")  # подпись — от руки на распечатке
+        _set_cell(row[8], "")
 
     # Довесок прочерками до конца страницы — визуальный, не данные (не создаёт
     # записей Instruction, следующая допечатка продолжит нумерацию с реального
@@ -397,14 +454,17 @@ def generate_instruction_journal_docx(
         for _ in range(pad_rows):
             row = table.add_row().cells
             for cell in row:
-                cell.text = "—"
+                _set_cell(cell, "—")
 
     footer = doc.add_paragraph()
     footer_run = footer.add_run(
         f"Журнал ведётся по рекомендуемой форме ГОСТ 12.0.004-2015. Порядок регистрации "
         f"определён работодателем самостоятельно (п. 88 Правил №2464 от 24.12.2021; "
         f"разъяснение Роструда №15-2/В-1677 от 30.05.2022) — {order_ref}. "
-        f"Незаполненные строки погашены прочерком. Подписи — собственноручные."
+        f"Незаполненные строки погашены прочерком. Подписи — собственноручные. "
+        f"Сроки по закону: вводный — в день начала работы; первичный на рабочем месте — до "
+        f"допуска к самостоятельной работе; повторный — не реже 1 раза в 6–12 мес.; "
+        f"внеплановый/целевой — по факту события."
     )
     footer_run.font.size = Pt(7)
     footer_run.italic = True
