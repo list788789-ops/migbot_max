@@ -546,9 +546,9 @@ async def on_bot_started(event):
 async def on_start(event: MessageCreated):
     with Session(engine) as session:
         role = _role_for_max_id(session, event.message.sender.user_id)
-    text = "Автоматизированная система. Выберите действие:"
+    text = "Автоматизированная система учёта на производстве. Выберите действие:"
     if role:
-        text = f"Рабочее место: Автоматизированная система. Роль: {role}.\nВыберите действие:"
+        text = f"Рабочее место: Автоматизированная система учёта на производстве. Роль: {role}.\nВыберите действие:"
     await event.message.answer(
         text=text,
         attachments=[_build_main_menu(role).as_markup()],
