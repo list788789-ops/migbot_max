@@ -1522,11 +1522,12 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
     rows = "".join(order_row(o) for o in orders)
     body = f"""
 <h1>📋 Наряды-допуски</h1>
+<p><a class="btn secondary" href="/production/work-orders/journal">📒 Журнал учёта (Прил. № 5, высотные) — xlsx</a></p>
 <section class="grid"><h2>Активные ({len(orders)})</h2>{rows or '<p class="muted">Нет активных нарядов.</p>'}</section>
 <section>
 <h2>Новый наряд</h2>
 <form method="post" action="/production/work-orders/new">
-<input type="text" name="number" placeholder="Номер наряда" required>
+<input type="text" name="number" placeholder="Номер наряда (пусто = автономер, напр. 25-2026)">
 <input type="text" name="subdivision" placeholder="Подразделение (например: ОС)">
 <label>Типовая работа из справочника (необязательно — заполнит условия, ОВПФ, системы безопасности, раздел 3 и нормы):
 <select name="work_type_id"><option value="">— не выбрано —</option>{work_type_options}</select></label>
@@ -1576,7 +1577,7 @@ function _applyBrigade(){{
 @app.post("/production/work-orders/new")
 def work_order_create(
     request: Request,
-    number: str = Form(...),
+    number: str = Form(""),
     subdivision: str = Form(""),
     work_description: str = Form(...),
     location: str = Form(...),
@@ -1658,6 +1659,28 @@ def work_order_print(work_order_id: str, request: Request, db: Session = Depends
     return Response(
         content=data,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": _content_disposition(fn)},
+    )
+
+
+@app.get("/production/work-orders/journal")
+def work_order_journal(request: Request, db: Session = Depends(get_db)):
+    """Журнал учёта работ по наряду-допуску (Приложение № 5 к 782н), xlsx.
+    Только высотные наряды — те, что оформлены по типовой работе (work_type_id задан)."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    orders = db.scalars(
+        select(WorkOrder)
+        .where(WorkOrder.work_type_id.is_not(None))
+        .order_by(WorkOrder.valid_from)
+    ).all()
+    path = prod.generate_work_order_journal_xlsx(list(orders), org_name=ORG_NAME)
+    with open(path, "rb") as f:
+        data = f.read()
+    fn = f"Журнал_учёта_нарядов_{datetime.now(MSK):%d.%m.%Y}.xlsx"
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": _content_disposition(fn)},
     )
 
