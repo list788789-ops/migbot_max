@@ -620,6 +620,34 @@ async def on_register_start(event: MessageCreated):
     await event.message.answer("Регистрация. Введите ваше ФИО полностью:")
 
 
+@dp.message_created(F.message.body.text == "/subscribe")
+async def on_subscribe(event: MessageCreated):
+    """Подписать ТЕКУЩИЙ чат (в т.ч. групповой) на утреннюю рассылку напоминаний.
+    Отвечает кнопкой, а не регистрирует сразу: у MessageCreated путь к chat_id не
+    подтверждён (см. комментарий в on_bot_started), а у callback event.get_ids()
+    даёт chat_id надёжно. Поэтому регистрация — по нажатию кнопки (payload
+    'subscribe:confirm' в on_callback), где chat_id берётся проверенным путём."""
+    builder = InlineKeyboardBuilder()
+    builder.row(CallbackButton(text="✅ Подписать этот чат", payload="subscribe:confirm"))
+    await event.message.answer(
+        text=("Подписать этот чат на утренние напоминания (горящие дедлайны, "
+              "непроведённые инструктажи)? Нажмите кнопку для подтверждения."),
+        attachments=[builder.as_markup()],
+    )
+
+
+@dp.message_created(F.message.body.text == "/unsubscribe")
+async def on_unsubscribe(event: MessageCreated):
+    """Отписать текущий чат от рассылки. Тоже через кнопку — тот же надёжный путь
+    к chat_id, что и при подписке."""
+    builder = InlineKeyboardBuilder()
+    builder.row(CallbackButton(text="🚫 Отписать этот чат", payload="subscribe:remove"))
+    await event.message.answer(
+        text="Отписать этот чат от утренних напоминаний? Нажмите кнопку для подтверждения.",
+        attachments=[builder.as_markup()],
+    )
+
+
 async def _deliver_document_list(responder: "_Responder", employee_id: str) -> None:
     """Показывает загруженные документы работника кнопками. Скачивание — по нажатию (docget)."""
     with Session(engine) as session:
@@ -704,6 +732,39 @@ async def on_callback(event: MessageCallback):
         return
 
     responder = _Responder(event)
+
+    # Подписка/отписка текущего чата на рассылку. chat_id берём через get_ids()
+    # (проверенный путь для callback), затем пишем в notification_subscribers.
+    if payload == "subscribe:confirm":
+        chat_id, _ = event.get_ids()
+        with Session(engine) as session:
+            existing = (
+                session.query(NotificationSubscriber)
+                .filter_by(chat_id=str(chat_id))
+                .first()
+            )
+            if existing is None:
+                session.add(NotificationSubscriber(chat_id=str(chat_id)))
+                session.commit()
+                await responder.send("✅ Чат подписан. Утренние напоминания будут приходить сюда.")
+            else:
+                await responder.send("Этот чат уже подписан — напоминания приходят сюда.")
+        return
+    if payload == "subscribe:remove":
+        chat_id, _ = event.get_ids()
+        with Session(engine) as session:
+            existing = (
+                session.query(NotificationSubscriber)
+                .filter_by(chat_id=str(chat_id))
+                .first()
+            )
+            if existing is not None:
+                session.delete(existing)
+                session.commit()
+                await responder.send("🚫 Чат отписан. Утренние напоминания сюда больше не приходят.")
+            else:
+                await responder.send("Этот чат не был подписан.")
+        return
 
     # Навигация по разделам меню.
     if payload == "menu:main":
