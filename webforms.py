@@ -637,12 +637,23 @@ def register_submit(request: Request, full_name: str = Form(...), phone: str = F
     db.add(user)
     db.commit()
     log.info("Новая заявка на доступ: %s (%s)", full_name, norm)
+    # 2026-07: код для привязки MAX-аккаунта — см. auth_binding.generate_max_confirm_code
+    # и docstring поля pending_max_code в models.py.
+    from auth_binding import generate_max_confirm_code
+    confirm_code = generate_max_confirm_code(db, user)
     # TODO(bot): уведомить админа в MAX о новой заявке (реализуется в bot.py)
     return HTMLResponse(
-        LOGIN_HEAD + """
+        LOGIN_HEAD + f"""
 <div class="auth">
 <h1>Заявка отправлена</h1>
-<p class="subtitle">Администратор одобрит доступ и назначит роль. После этого войдите.</p>
+<p class="subtitle">Администратор одобрит доступ и назначит роль.</p>
+<div class="card" style="text-align:center">
+<p style="margin:0 0 8px">Чтобы пользоваться ботом в MAX без повторного ввода телефона —
+отправьте боту команду:</p>
+<p style="font-size:22px;font-weight:700;letter-spacing:2px;margin:8px 0">/confirm {confirm_code}</p>
+<p class="muted" style="margin:0">Код действует 30 минут. Можно пропустить этот шаг и
+позже выполнить /login с телефоном — тоже сработает.</p>
+</div>
 <a class="btn" href="/login">← К входу</a>
 </div>
 </body></html>""",
