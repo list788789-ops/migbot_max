@@ -1,4 +1,3 @@
-
 """
 production.py — наряды-допуски, инструктажи, удостоверения по профессиям
 (2026-07). Отдельный модуль от миграционного учёта — своя доменная область
@@ -12,6 +11,9 @@ bot.py/webforms.py дают только пункты меню/ссылки на
 
 from datetime import date, datetime, timedelta
 
+from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Pt
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -20,6 +22,8 @@ from models import (
     Employee,
     Instruction,
     InstructionType,
+    InternalOrder,
+    OrderCategory,
     WorkOrder,
     WorkOrderMember,
     WorkOrderStatus,
@@ -236,3 +240,122 @@ def get_expiring_certificates(session: Session, days_before: int = CERTIFICATE_E
                 })
     result.sort(key=lambda r: r["expiry_date"])
     return result
+
+
+# ================= Печатный бланк наряда-допуска =================
+# Печатный (не рукописный) наряд-допуск разрешён действующими Правилами по ОТ —
+# "документ можно составлять на компьютере или от руки" (проверено, см. журнал
+# патчей/обсуждение). Единственное, что должно остаться "живым" — подписи на
+# распечатанном экземпляре, сам текст печатать можно.
+#
+# [Предполагаю] Это ОБЩИЙ бланк, не учитывает разницу форм по видам работ
+# (электроустановки — приложение №7 к Приказу №903н, высотные — приложение №2
+# и т.д. — формы РАЗНЫЕ и менять их содержание нельзя). Пока WorkOrder не имеет
+# поля work_type, бланк один на все случаи — годится для общих/ремонтных работ,
+# где унифицированной формы законом не установлено. Для регламентированных видов
+# (электро-, высотные, огневые) нужен отдельный шаблон под конкретное приложение
+# правил — это следующий шаг, не делать вид, что текущий бланк их закрывает.
+
+def generate_work_order_docx(work_order: WorkOrder, members: list[WorkOrderMember],
+                              org_name: str, output_dir: str = "/tmp") -> str:
+    doc = Document()
+
+    title = doc.add_paragraph()
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = title.add_run(f"НАРЯД-ДОПУСК № {work_order.number}")
+    run.bold = True
+    run.font.size = Pt(16)
+
+    sub = doc.add_paragraph()
+    sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    sub.add_run(f"на производство работ повышенной опасности").italic = True
+
+    doc.add_paragraph(f"Организация: {org_name}")
+    doc.add_paragraph(f"Дата выдачи: {work_order.created_at.strftime('%d.%m.%Y')}")
+    doc.add_paragraph(
+        f"Действителен с {work_order.valid_from.strftime('%d.%m.%Y')} "
+        f"по {work_order.valid_to.strftime('%d.%m.%Y')}"
+    )
+    doc.add_paragraph(f"Место проведения работ: {work_order.location}")
+    doc.add_paragraph(f"Содержание работ: {work_order.work_description}")
+    doc.add_paragraph(
+        f"Ответственный производитель работ: "
+        f"{work_order.responsible.full_name if work_order.responsible else '—'}"
+    )
+    doc.add_paragraph(f"Наряд выдал: {work_order.issued_by}")
+
+    doc.add_paragraph()
+    doc.add_paragraph("Состав бригады:").bold = True
+    table = doc.add_table(rows=1, cols=3)
+    table.style = "Table Grid"
+    hdr = table.rows[0].cells
+    hdr[0].text = "№"
+    hdr[1].text = "ФИО"
+    hdr[2].text = "Подпись об ознакомлении"
+    for i, member in enumerate(members, start=1):
+        row = table.add_row().cells
+        row[0].text = str(i)
+        row[1].text = member.employee.full_name if member.employee else "?"
+        row[2].text = ""  # печатный бланк — подпись ставится от руки на распечатке
+
+    doc.add_paragraph()
+    doc.add_paragraph(
+        "Мероприятия по подготовке рабочих мест и меры безопасности "
+        "заполняются дополнительно в соответствии с видом работ."
+    )
+
+    doc.add_paragraph()
+    doc.add_paragraph("Подписи:")
+    doc.add_paragraph("Наряд выдал: _________________________  (подпись, расшифровка)")
+    doc.add_paragraph("Наряд получил (ответственный производитель работ): "
+                       "_________________________  (подпись, расшифровка)")
+
+    path = f"{output_dir}/naryad_{work_order.number}_{work_order.id[:8]}.docx"
+    doc.save(path)
+    return path
+
+
+# ================= Реестр приказов =================
+
+def create_order(session: Session, number: str, order_date: date, topic: str,
+                  category: OrderCategory = OrderCategory.OTHER,
+                  note: str | None = None) -> InternalOrder:
+    order = InternalOrder(number=number, order_date=order_date, topic=topic,
+                           category=category, note=note)
+    session.add(order)
+    session.commit()
+    return order
+
+
+def get_orders(session: Session) -> list[InternalOrder]:
+    return session.query(InternalOrder).order_by(InternalOrder.order_date.desc()).all()
+
+
+def get_orders_by_category(session: Session, category: OrderCategory) -> list[InternalOrder]:
+    return (
+        session.query(InternalOrder)
+        .filter_by(category=category)
+        .order_by(InternalOrder.order_date.desc())
+        .all()
+    )
+
+
+def set_order_scan_key(session: Session, order_id: str, scan_key: str) -> None:
+    order = session.get(InternalOrder, order_id)
+    if order is not None:
+        order.scan_key = scan_key
+        session.add(order)
+        session.commit()
+
+
+def get_latest_order_ref(session: Session) -> str:
+    """
+    Ссылка на актуальный приказ для футеров печатных бланков (наряд-допуск,
+    журналы инструктажа) — INTERNAL_ORDER_REF. Берёт последний по дате приказ
+    из реестра. Если реестр пуст — явная заглушка, чтобы не выглядело как
+    настоящая ссылка на несуществующий документ (см. договорённость)."""
+    orders = get_orders(session)
+    if not orders:
+        return "[Приказ не издан — заполнить в разделе «Приказы»]"
+    latest = orders[0]
+    return f"Приказ № {latest.number} от {latest.order_date.strftime('%d.%m.%Y')}"
