@@ -1707,7 +1707,10 @@ def instruction_print_journal(
     if not printed:
         return RedirectResponse("/production/instructions", status_code=303)
     order_ref = prod.get_latest_order_ref(db)
-    path = prod.generate_instruction_journal_docx(printed, t, org_name=ORG_NAME, order_ref=order_ref)
+    started_at = prod.get_journal_started_at(db, t)
+    path = prod.generate_instruction_journal_docx(
+        printed, t, org_name=ORG_NAME, order_ref=order_ref, started_at=started_at,
+    )
     with open(path, "rb") as f:
         data = f.read()
     label = prod.INSTRUCTION_LABELS.get(t, t.value)
@@ -2942,6 +2945,15 @@ value="{emp.entry_date.isoformat() if emp.entry_date else ''}">
 value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
 {help_contract_date}
 </fieldset>
+<fieldset>
+<legend>Должность и подразделение</legend>
+<label>Должность (профессия)</label>
+<input type="text" name="position" value="{html.escape(emp.position or '')}" placeholder="например: Бетонщик">
+<label>Подразделение</label>
+<input type="text" name="subdivision" value="{html.escape(emp.subdivision or '')}" placeholder="например: ОС">
+<p class="muted">Подставляется автоматически в журналы инструктажей (графы по ГОСТ) —
+заполнить один раз здесь, дальше не нужно вписывать вручную в каждой распечатке.</p>
+</fieldset>
 <button type="submit" class="btn-full">Сохранить</button>
 </form>"""
     else:
@@ -3446,6 +3458,8 @@ def employee_save(
     address_since: str = Form(""),
     registration_valid_until: str = Form(""),
     dactyloscopy_date: str = Form(""),
+    position: str = Form(""),
+    subdivision: str = Form(""),
     confirmed: str = Form(""),
     db: Session = Depends(get_db),
 ):
@@ -3504,6 +3518,8 @@ def employee_save(
 {_hid("address", address)}
 {_hid("address_since", address_since)}
 {_hid("dactyloscopy_date", dactyloscopy_date)}
+{_hid("position", position)}
+{_hid("subdivision", subdivision)}
 <input type="hidden" name="confirmed" value="1">
 <button type="submit">Подтвердить и сохранить</button>
 </form>
@@ -3527,6 +3543,13 @@ def employee_save(
             emp.address_since = asd
     elif addr_first_fill:
         emp.address = new_addr  # первый ввод — address_since не трогаем (нет смены)
+
+    # Должность/подразделение — простые справочные поля, без побочных эффектов на
+    # обязательства (в отличие от адреса/дактилоскопии выше), пишем всегда как есть.
+    if position.strip():
+        emp.position = position.strip()
+    if subdivision.strip():
+        emp.subdivision = subdivision.strip()
 
     # Срок регистрации до — справочное поле из уведомления Госуслуг, пишется всегда
     # (пустое -> None). Не привязано к смене адреса, не влияет на обязательства.
