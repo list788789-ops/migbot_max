@@ -202,6 +202,16 @@ class Employee(Base):
     # Дата записи в СФР на получение/объединение СНИЛС (если СНИЛС ещё нет).
     #   ALTER TABLE employees ADD COLUMN snils_appointment_date DATE;
     snils_appointment_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # Должность/профессия и подразделение (2026-07, модуль «Производство») — вводятся
+    # один раз в карточке, дальше подставляются автоматически в журналы инструктажей
+    # (графы "Профессия (должность)"/"Подразделение" по ГОСТ 12.0.004-2015, см.
+    # production.generate_instruction_journal_docx) и потенциально в другие документы
+    # вместо жёстко зашитого "Монтажник". OCR должности из сканов (наряд-допуск и т.п.)
+    # НЕ реализован — распознавание рукописной таблицы ненадёжно, вводится вручную.
+    #   ALTER TABLE employees ADD COLUMN position VARCHAR;
+    #   ALTER TABLE employees ADD COLUMN subdivision VARCHAR;
+    position: Mapped[str | None] = mapped_column(String, nullable=True)
+    subdivision: Mapped[str | None] = mapped_column(String, nullable=True)
     address: Mapped[str | None] = mapped_column(Text, nullable=True)
     entry_country: Mapped[str | None] = mapped_column(String, nullable=True)  # "откуда въехал"
     # Свободный текст, не дата: в таблице это либо дата+заметка ("25.07.2026 Хостел"), либо пусто.
