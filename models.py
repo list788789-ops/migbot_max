@@ -288,9 +288,23 @@ class WorkOrder(Base):
     """
     Наряд-допуск (2026-07, модуль «Производство», отдельный от миграционного
     учёта — своя доменная область, охрана труда). Официальный документ на
-    производство работ, не просто список задач на смену: ответственный
-    производитель работ + бригада (см. WorkOrderMember), срок действия,
-    подписи/подтверждения членов бригады.
+    производство работ.
+
+    2026-07 (пересмотр по образцу реального бланка ООО «Промстроймонтаж»,
+    наряд №25 на работы на высоте — фото прислал пользователь): структура
+    оказалась заметно сложнее первой версии. Ключевые поправки:
+
+    - ДВА разных ответственных, не один: responsible_supervisor_id
+      ("Ответственный руководитель работ" — уровень выше, например старший
+      производитель работ) и responsible_executor_id ("Ответственный
+      исполнитель работ" — бригадир). В реальном бланке это разные люди с
+      разными группами допуска, путать нельзя.
+    - Наряд действует НЕСКОЛЬКО ДНЕЙ (в примере — 9 дней), и каждый день
+      регистрируется ОТДЕЛЬНО в разделе "Ежедневный допуск к работе" —
+      см. WorkOrderDailyAdmission ниже. Один наряд ≠ одна явка.
+    - Материалы/инструменты/приспособления/спецтехника, ссылка на
+      технологическую карту, системы обеспечения безопасности (страховочные/
+      поддерживающие/эвакуационные) — были в реальном бланке, у меня не было.
 
     Реализовано в отдельном файле production.py — из bot.py/webforms.py только
     пункты меню/ссылки, минимальная связанность с основной системой (по
@@ -301,9 +315,12 @@ class WorkOrder(Base):
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
     number: Mapped[str] = mapped_column(String, nullable=False)  # номер наряда для документа
+    subdivision: Mapped[str | None] = mapped_column(String, nullable=True)  # "ОС" и т.п.
     work_description: Mapped[str] = mapped_column(Text, nullable=False)
     location: Mapped[str] = mapped_column(String, nullable=False)
-    responsible_employee_id: Mapped[str] = mapped_column(ForeignKey("employees.id"), nullable=False)
+
+    responsible_supervisor_id: Mapped[str] = mapped_column(ForeignKey("employees.id"), nullable=False)
+    responsible_executor_id: Mapped[str] = mapped_column(ForeignKey("employees.id"), nullable=False)
     issued_by: Mapped[str] = mapped_column(String, nullable=False)  # User.id кадровика/мастера
 
     valid_from: Mapped[date] = mapped_column(Date, nullable=False)
@@ -313,10 +330,52 @@ class WorkOrder(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
-    responsible: Mapped["Employee"] = relationship()
+    # Материалы/инструменты/приспособления/спецтехника — по образцу реального бланка,
+    # там это отдельные строки (см. фото: "Материалы: Арматура, опалубка, доска." и т.д.).
+    materials: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tools: Mapped[str | None] = mapped_column(Text, nullable=True)
+    equipment: Mapped[str | None] = mapped_column(Text, nullable=True)  # приспособления
+    special_machinery: Mapped[str | None] = mapped_column(Text, nullable=True)  # спецтехника
+    technological_card_ref: Mapped[str | None] = mapped_column(String, nullable=True)  # "Шифр ТК: НУЛ-ПСМ-ТК-07-24.005.3"
+    safety_systems: Mapped[str | None] = mapped_column(Text, nullable=True)  # страховочные/поддерживающие/эвакуационные
+    special_conditions: Mapped[str | None] = mapped_column(Text, nullable=True)  # погодные ограничения и т.п.
+
+    responsible_supervisor: Mapped["Employee"] = relationship(foreign_keys=[responsible_supervisor_id])
+    responsible_executor: Mapped["Employee"] = relationship(foreign_keys=[responsible_executor_id])
     members: Mapped[list["WorkOrderMember"]] = relationship(
         back_populates="work_order", cascade="all, delete-orphan"
     )
+    daily_admissions: Mapped[list["WorkOrderDailyAdmission"]] = relationship(
+        back_populates="work_order", cascade="all, delete-orphan"
+    )
+
+
+class WorkOrderDailyAdmission(Base):
+    """
+    Ежедневный допуск к работе (2026-07, по образцу реального бланка — раздел
+    "6. Ежедневный допуск к работе"). Наряд-допуск может действовать несколько
+    дней (в примере — 9), и КАЖДЫЙ день требует отдельной регистрации: бригада
+    получила целевой инструктаж (дата/время начала, ответственный руководитель
+    подтверждает), и отдельно — работа на этот день полностью закончена
+    (дата/время окончания, ответственный исполнитель подтверждает).
+
+    Это НЕ то же самое, что подпись члена бригады в WorkOrderMember (та —
+    разовое ознакомление с условиями при выдаче наряда). Здесь — суточный цикл
+    допуск/окончание, повторяется каждый рабочий день в пределах valid_from..valid_to.
+    """
+
+    __tablename__ = "work_order_daily_admissions"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    work_order_id: Mapped[str] = mapped_column(ForeignKey("work_orders.id"), nullable=False)
+    admission_date: Mapped[date] = mapped_column(Date, nullable=False)
+
+    briefing_time: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)  # выдан целевой инструктаж
+    briefing_confirmed_by: Mapped[str | None] = mapped_column(String, nullable=True)  # ответственный руководитель
+    completion_time: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)  # работа закончена, место убрано
+    completion_confirmed_by: Mapped[str | None] = mapped_column(String, nullable=True)  # ответственный исполнитель
+
+    work_order: Mapped["WorkOrder"] = relationship(back_populates="daily_admissions")
 
 
 class WorkOrderMember(Base):
@@ -324,6 +383,7 @@ class WorkOrderMember(Base):
     signed_at=NULL — ещё не подтвердил, что ознакомлен с условиями работ."""
 
     __tablename__ = "work_order_members"
+
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
     work_order_id: Mapped[str] = mapped_column(ForeignKey("work_orders.id"), nullable=False)
