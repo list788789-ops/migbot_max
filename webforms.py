@@ -81,6 +81,7 @@ from models import (
     SystemFlag,
     WorkOrderMember,
     WorkOrder,
+    WorkType,
     InstructionType,
     Certificate,
     InternalOrder,
@@ -1493,6 +1494,12 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
     )
     brigades = prod.get_brigades(db)
     brigade_options = "".join(f'<option value="{b.id}">{b.name}</option>' for b in brigades)
+    work_types = db.scalars(
+        select(WorkType).where(WorkType.active.is_(True)).order_by(WorkType.name)
+    ).all()
+    work_type_options = "".join(
+        f'<option value="{w.id}">{w.name}</option>' for w in work_types
+    )
     import json as _json
     brigades_js_map = _json.dumps({
         b.id: prod.get_brigade_member_ids(db, b.id) for b in brigades
@@ -1521,6 +1528,8 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
 <form method="post" action="/production/work-orders/new">
 <input type="text" name="number" placeholder="Номер наряда" required>
 <input type="text" name="subdivision" placeholder="Подразделение (например: ОС)">
+<label>Типовая работа из справочника (необязательно — заполнит условия, ОВПФ, системы безопасности, раздел 3 и нормы):
+<select name="work_type_id"><option value="">— не выбрано —</option>{work_type_options}</select></label>
 <textarea name="work_description" placeholder="На выполнение работ" required rows="3"></textarea>
 <input type="text" name="location" placeholder="Место выполнения работ" required>
 <label>Ответственный руководитель работ:
@@ -1583,12 +1592,13 @@ def work_order_create(
     technological_card_ref: str = Form(""),
     safety_systems: str = Form(""),
     special_conditions: str = Form(""),
+    work_type_id: str = Form(""),
     db: Session = Depends(get_db),
 ):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
     actor = _actor_name(request, db)
-    prod.create_work_order(
+    order = prod.create_work_order(
         db, number, work_description, location,
         responsible_supervisor_id, responsible_executor_id, actor,
         datetime.strptime(valid_from, "%Y-%m-%d").date(),
@@ -1602,7 +1612,23 @@ def work_order_create(
         technological_card_ref=technological_card_ref or None,
         safety_systems=safety_systems or None,
         special_conditions=special_conditions or None,
+        work_type_id=work_type_id or None,
     )
+    members = db.query(WorkOrderMember).filter_by(work_order_id=order.id).all()
+    problems = prod.check_work_order_problems(order, members) if work_type_id else []
+    if problems:
+        items = "".join(f"<li>{p}</li>" for p in problems)
+        body = f"""
+<h1>⚠️ Наряд №{order.number} создан, но есть замечания</h1>
+<section class="grid">
+<p class="muted">Наряд сохранён как черновик. По требованиям Правил 782н перед выпуском устраните:</p>
+<ul>{items}</ul>
+<p><a class="btn secondary" href="/production/work-orders/{order.id}/print">Всё равно распечатать</a>
+<a class="btn" href="/production/work-orders">К нарядам</a></p>
+</section>
+"""
+        return _render("Наряд: замечания", body, active="production",
+                       role=request.session.get("role", ""))
     return RedirectResponse("/production/work-orders", status_code=303)
 
 
@@ -1622,7 +1648,10 @@ def work_order_print(work_order_id: str, request: Request, db: Session = Depends
     if order is None:
         raise HTTPException(404, "Наряд не найден.")
     members = db.query(WorkOrderMember).filter_by(work_order_id=order.id).all()
-    path = prod.generate_work_order_docx(order, members, org_name=ORG_NAME)
+    if order.work_type_id:
+        path = prod.generate_height_work_order_docx(order, members, org_name=ORG_NAME)
+    else:
+        path = prod.generate_work_order_docx(order, members, org_name=ORG_NAME)
     with open(path, "rb") as f:
         data = f.read()
     fn = f"Наряд-допуск_№{order.number}.docx"
