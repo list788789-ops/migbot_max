@@ -89,6 +89,7 @@ from models import (
     Brigade,
     BrigadeMember,
     Instruction,
+    Titul,
 )
 from obligations import create_obligations_for_employee
 from auth_binding import get_role_label, find_user_by_max_id
@@ -1471,6 +1472,9 @@ def production_page(request: Request):
 <div class="card"><h3 style="margin:0 0 6px">👷 Бригады</h3>
 <p class="muted" style="margin:0 0 10px">Сохранённые составы — выбор бригадой целиком при создании наряда, без ручной отметки каждого.</p>
 <a class="btn" href="/production/brigades">Открыть</a></div>
+<div class="card"><h3 style="margin:0 0 6px">🏗 Титулы</h3>
+<p class="muted" style="margin:0 0 10px">Справочник объектов (шифр + наименование) — заполняет «Место выполнения работ» при создании наряда, без ручного набора.</p>
+<a class="btn" href="/production/tituly">Открыть</a></div>
 </section>
 """
     return _render("Производство", body, active="production", role=request.session.get("role", ""))
@@ -1500,6 +1504,12 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
     work_type_options = "".join(
         f'<option value="{w.id}">{w.name}</option>' for w in work_types
     )
+    # Титулы: value = готовая строка «код — наименование», ею наполняется поле location.
+    tituly = prod.get_tituly(db)
+    titul_options = "".join(
+        f'<option value="{html.escape(f"{t.code} — {t.name}")}">{html.escape(f"{t.code} — {t.name}")}</option>'
+        for t in tituly
+    )
     import json as _json
     brigades_js_map = _json.dumps({
         b.id: prod.get_brigade_member_ids(db, b.id) for b in brigades
@@ -1522,17 +1532,18 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
     rows = "".join(order_row(o) for o in orders)
     body = f"""
 <h1>📋 Наряды-допуски</h1>
-<p><a class="btn secondary" href="/production/work-orders/journal">📒 Журнал учёта (Прил. № 5, высотные) — xlsx</a></p>
 <section class="grid"><h2>Активные ({len(orders)})</h2>{rows or '<p class="muted">Нет активных нарядов.</p>'}</section>
 <section>
 <h2>Новый наряд</h2>
 <form method="post" action="/production/work-orders/new">
-<input type="text" name="number" placeholder="Номер наряда (пусто = автономер, напр. 25-2026)">
+<input type="text" name="number" placeholder="Номер наряда" required>
 <input type="text" name="subdivision" placeholder="Подразделение (например: ОС)">
 <label>Типовая работа из справочника (необязательно — заполнит условия, ОВПФ, системы безопасности, раздел 3 и нормы):
 <select name="work_type_id"><option value="">— не выбрано —</option>{work_type_options}</select></label>
 <textarea name="work_description" placeholder="На выполнение работ" required rows="3"></textarea>
-<input type="text" name="location" placeholder="Место выполнения работ" required>
+<label>Титул из справочника (заполнит место выполнения работ; можно вписать свой):
+<select id="titulSelect" onchange="_applyTitul()"><option value="">— вручную —</option>{titul_options}</select></label>
+<input type="text" id="location" name="location" placeholder="Место выполнения работ" required>
 <label>Ответственный руководитель работ:
 <select name="responsible_supervisor_id" required>{emp_options}</select></label>
 <label>Ответственный исполнитель работ (бригадир):
@@ -1569,6 +1580,10 @@ function _applyBrigade(){{
     if (cb) cb.checked = true;
   }});
 }}
+function _applyTitul(){{
+  var s = document.getElementById('titulSelect');
+  if (s.value) document.getElementById('location').value = s.value;
+}}
 </script>
 """
     return _render("Наряды-допуски", body, active="production", role=request.session.get("role", ""))
@@ -1577,7 +1592,7 @@ function _applyBrigade(){{
 @app.post("/production/work-orders/new")
 def work_order_create(
     request: Request,
-    number: str = Form(""),
+    number: str = Form(...),
     subdivision: str = Form(""),
     work_description: str = Form(...),
     location: str = Form(...),
@@ -1659,28 +1674,6 @@ def work_order_print(work_order_id: str, request: Request, db: Session = Depends
     return Response(
         content=data,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={"Content-Disposition": _content_disposition(fn)},
-    )
-
-
-@app.get("/production/work-orders/journal")
-def work_order_journal(request: Request, db: Session = Depends(get_db)):
-    """Журнал учёта работ по наряду-допуску (Приложение № 5 к 782н), xlsx.
-    Только высотные наряды — те, что оформлены по типовой работе (work_type_id задан)."""
-    if not _logged_in(request):
-        return RedirectResponse("/login", status_code=303)
-    orders = db.scalars(
-        select(WorkOrder)
-        .where(WorkOrder.work_type_id.is_not(None))
-        .order_by(WorkOrder.valid_from)
-    ).all()
-    path = prod.generate_work_order_journal_xlsx(list(orders), org_name=ORG_NAME)
-    with open(path, "rb") as f:
-        data = f.read()
-    fn = f"Журнал_учёта_нарядов_{datetime.now(MSK):%d.%m.%Y}.xlsx"
-    return Response(
-        content=data,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": _content_disposition(fn)},
     )
 
@@ -2206,6 +2199,79 @@ def brigade_update(
         return RedirectResponse("/login", status_code=303)
     prod.update_brigade(db, brigade_id, name, member_ids)
     return RedirectResponse("/production/brigades", status_code=303)
+
+
+# --- Титулы (справочник объектов) --------------------------------------------
+
+
+@app.get("/production/tituly", response_class=HTMLResponse)
+def tituly_page(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    tituly = prod.get_tituly(db)
+
+    def titul_row(t) -> str:
+        return (
+            f'<div class="card"><b>{html.escape(t.code)}</b> — {html.escape(t.name)}'
+            f'<details style="margin-top:6px">'
+            f'<summary style="cursor:pointer">✏️ Изменить</summary>'
+            f'<form method="post" action="/production/tituly/{t.id}/update" style="margin-top:8px">'
+            f'<input type="text" name="code" value="{html.escape(t.code)}" placeholder="Шифр" required '
+            f'style="display:block;margin-bottom:6px">'
+            f'<input type="text" name="name" value="{html.escape(t.name)}" placeholder="Наименование" required '
+            f'style="display:block;margin-bottom:6px">'
+            f'<button type="submit">Сохранить изменения</button>'
+            f'</form></details>'
+            f'<form method="post" action="/production/tituly/{t.id}/delete" style="display:inline;margin-top:6px"'
+            f' onsubmit="return confirm(\'Удалить титул?\')">'
+            f'<button type="submit" class="btn secondary">Удалить</button></form></div>'
+        )
+
+    rows = "".join(titul_row(t) for t in tituly)
+    body = f"""
+<h1>🏗 Титулы</h1>
+<section class="grid"><h2>Сохранённые ({len(tituly)})</h2>{rows or '<p class="muted">Пока нет ни одного.</p>'}</section>
+<section>
+<h2>Новый титул</h2>
+<form method="post" action="/production/tituly/new">
+<input type="text" name="code" placeholder="Шифр (например: 15.21)" required>
+<input type="text" name="name" placeholder="Наименование (например: Лаборатория)" required>
+<button type="submit">Сохранить</button>
+</form>
+</section>
+<p><a class="btn secondary" href="/production">← Производство</a></p>
+"""
+    return _render("Титулы", body, active="production", role=request.session.get("role", ""))
+
+
+@app.post("/production/tituly/new")
+def titul_create(
+    request: Request, code: str = Form(...), name: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    prod.create_titul(db, code, name)
+    return RedirectResponse("/production/tituly", status_code=303)
+
+
+@app.post("/production/tituly/{titul_id}/delete")
+def titul_delete(titul_id: str, request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    prod.delete_titul(db, titul_id)
+    return RedirectResponse("/production/tituly", status_code=303)
+
+
+@app.post("/production/tituly/{titul_id}/update")
+def titul_update(
+    titul_id: str, request: Request, code: str = Form(...), name: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    prod.update_titul(db, titul_id, code, name)
+    return RedirectResponse("/production/tituly", status_code=303)
 
 
 # --- Сотрудники: список + единая карточка ------------------------------------
