@@ -1656,7 +1656,8 @@ def certificates_page(request: Request, db: Session = Depends(get_db)):
 <input type="text" name="issued_by_org" placeholder="Кем выдано">
 <label>Дата выдачи: <input type="date" name="issue_date"></label>
 <label>Действует до (пусто — бессрочное): <input type="date" name="expiry_date"></label>
-<label>Скан: <input type="file" name="scan_file"></label>
+<label>Скан:</label>
+<input type="file" name="scan_file" accept="application/pdf,image/*,.doc,.docx" style="display:block;width:100%;margin:8px 0;padding:10px;border:1px solid #d9dde3;border-radius:8px;background:#fff;font-size:16px">
 <button type="submit">Добавить</button>
 </form>
 </section>
@@ -1754,8 +1755,17 @@ def orders_page(request: Request, db: Session = Depends(get_db)):
         )
 
     rows = "".join(order_row(o) for o in orders)
+    # Предзаполнение первой записи данными уже готового приказа №20-ПСМ/2026 —
+    # только пока реестр пуст, чтобы не подставлять эти значения повторно для
+    # следующих приказов.
+    _prefill = not orders
+    _pf_number = "20-ПСМ/2026" if _prefill else ""
+    _pf_date = "2026-06-01" if _prefill else ""
+    _pf_topic = ("О порядке ведения журналов инструктажей по охране труда и учёта "
+                 "нарядов-допусков" if _prefill else "")
     category_options = "".join(
-        f'<option value="{c.value}">{label}</option>' for c, label in _category_label.items()
+        f'<option value="{c.value}"{" selected" if _prefill and c == OrderCategory.PRODUCTION else ""}>{label}</option>'
+        for c, label in _category_label.items()
     )
     body = f"""
 <h1>📑 Приказы</h1>
@@ -1763,12 +1773,13 @@ def orders_page(request: Request, db: Session = Depends(get_db)):
 <section>
 <h2>Новый приказ</h2>
 <form method="post" action="/production/orders/new" enctype="multipart/form-data">
-<input type="text" name="number" placeholder="Номер (например: 20-ПСМ/2026)" required>
-<label>Дата: <input type="date" name="order_date" required></label>
-<input type="text" name="topic" placeholder="Тема приказа" required>
+<input type="text" name="number" placeholder="Номер (например: 20-ПСМ/2026)" value="{_pf_number}" required>
+<label>Дата: <input type="date" name="order_date" value="{_pf_date}" required></label>
+<input type="text" name="topic" placeholder="Тема приказа" value="{html.escape(_pf_topic)}" required>
 <label>Раздел: <select name="category">{category_options}</select></label>
 <textarea name="note" placeholder="Примечание (необязательно)" rows="2"></textarea>
-<label>Скан приказа (PDF/фото): <input type="file" name="scan_file"></label>
+<label>Скан приказа (PDF/фото):</label>
+<input type="file" name="scan_file" accept="application/pdf,image/*,.doc,.docx" style="display:block;width:100%;margin:8px 0;padding:10px;border:1px solid #d9dde3;border-radius:8px;background:#fff;font-size:16px">
 <button type="submit">Добавить в реестр</button>
 </form>
 </section>
