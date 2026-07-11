@@ -18,6 +18,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from models import (
+    Brigade,
+    BrigadeMember,
     Certificate,
     Employee,
     Instruction,
@@ -34,6 +36,51 @@ from models import (
 # миграционного учёта. [Предполагаю] 30 дней — не согласовано явно, разумный
 # дефолт, легко поменять одной константой.
 CERTIFICATE_EXPIRY_WARNING_DAYS = 30
+
+
+# ================= Бригады =================
+
+def create_brigade(session: Session, name: str, member_employee_ids: list[str]) -> Brigade:
+    brigade = Brigade(name=name)
+    session.add(brigade)
+    session.flush()
+    for employee_id in member_employee_ids:
+        session.add(BrigadeMember(brigade_id=brigade.id, employee_id=employee_id))
+    session.commit()
+    return brigade
+
+
+def get_brigades(session: Session) -> list[Brigade]:
+    return session.query(Brigade).order_by(Brigade.name).all()
+
+
+def get_brigade_member_ids(session: Session, brigade_id: str) -> list[str]:
+    return [
+        m.employee_id for m in
+        session.query(BrigadeMember).filter_by(brigade_id=brigade_id).all()
+    ]
+
+
+def update_brigade_members(session: Session, brigade_id: str, member_employee_ids: list[str]) -> bool:
+    """Заменяет состав целиком (не история — просто текущий список, см. docstring
+    Brigade в models.py)."""
+    brigade = session.get(Brigade, brigade_id)
+    if brigade is None:
+        return False
+    session.query(BrigadeMember).filter_by(brigade_id=brigade_id).delete()
+    for employee_id in member_employee_ids:
+        session.add(BrigadeMember(brigade_id=brigade_id, employee_id=employee_id))
+    session.commit()
+    return True
+
+
+def delete_brigade(session: Session, brigade_id: str) -> bool:
+    brigade = session.get(Brigade, brigade_id)
+    if brigade is None:
+        return False
+    session.delete(brigade)
+    session.commit()
+    return True
 
 
 # ================= Наряды-допуски =================
@@ -176,6 +223,87 @@ INSTRUCTION_LABELS = {
     InstructionType.TARGETED: "Целевой",
 }
 
+# Строк на страницу при допечатке журнала — [Предполагаю] не согласовано явно,
+# разумный дефолт под таблицу А4 с таким набором граф. Легко поменять.
+JOURNAL_ROWS_PER_PAGE = 20
+
+
+def get_employees_needing_introductory(session: Session) -> list[Employee]:
+    """Активные сотрудники, у кого известна дата начала работы (дата договора,
+    а если её ещё нет — дата въезда), но вводного инструктажа ещё нет ни одного."""
+    existing_ids = {
+        i.employee_id for i in
+        session.query(Instruction).filter_by(type=InstructionType.INTRODUCTORY).all()
+    }
+    employees = (
+        session.query(Employee)
+        .filter(Employee.contract_end_date.is_(None))
+        .filter((Employee.contract_date.isnot(None)) | (Employee.entry_date.isnot(None)))
+        .all()
+    )
+    return [e for e in employees if e.id not in existing_ids]
+
+
+def auto_create_introductory_instructions(session: Session, conducted_by: str) -> list[Instruction]:
+    """Заводит вводный инструктаж для ВСЕХ сотрудников разом — по договорённости
+    "заполнять всеми сотрудниками с разделением по дате начала работы". Дата
+    самого инструктажа = дата начала работы конкретного человека (дата договора,
+    а если пусто — дата въезда), НЕ сегодняшняя дата — так порядок строк в
+    журнале при печати совпадёт с реальной хронологией приёма, а не с датой,
+    когда кто-то нажал кнопку в системе."""
+    employees = get_employees_needing_introductory(session)
+    created = []
+    for e in employees:
+        start_date = e.contract_date or e.entry_date
+        instr = Instruction(
+            employee_id=e.id,
+            type=InstructionType.INTRODUCTORY,
+            conducted_by=conducted_by,
+            conducted_at=datetime.combine(start_date, datetime.min.time()),
+        )
+        session.add(instr)
+        created.append(instr)
+    session.commit()
+    return created
+
+
+def get_unprinted_instructions(session: Session, instruction_type: InstructionType) -> list[Instruction]:
+    return (
+        session.query(Instruction)
+        .filter_by(type=instruction_type, printed_at=None)
+        .order_by(Instruction.conducted_at)
+        .all()
+    )
+
+
+def get_last_journal_row_number(session: Session, instruction_type: InstructionType) -> int:
+    last = (
+        session.query(Instruction)
+        .filter_by(type=instruction_type)
+        .filter(Instruction.journal_row_number.isnot(None))
+        .order_by(Instruction.journal_row_number.desc())
+        .first()
+    )
+    return last.journal_row_number if last else 0
+
+
+def print_new_journal_entries(session: Session, instruction_type: InstructionType) -> list[Instruction]:
+    """"Допечатать новые записи" — присваивает номера строк последовательно, продолжая
+    с последнего уже выданного номера (отдельная нумерация на каждый InstructionType —
+    это разные физические журналы), помечает printed_at. Старые (уже напечатанные и
+    подшитые) записи не трогает и не перепечатывает — см. договорённость в чате."""
+    unprinted = get_unprinted_instructions(session, instruction_type)
+    if not unprinted:
+        return []
+    next_num = get_last_journal_row_number(session, instruction_type) + 1
+    now = datetime.utcnow()
+    for instr in unprinted:
+        instr.journal_row_number = next_num
+        instr.printed_at = now
+        next_num += 1
+    session.commit()
+    return unprinted
+
 
 def create_instruction(
     session: Session, employee_id: str, instruction_type: InstructionType,
@@ -211,6 +339,79 @@ def get_instructions_for_employee(session: Session, employee_id: str) -> list[In
         .order_by(Instruction.conducted_at.desc())
         .all()
     )
+
+
+def generate_instruction_journal_docx(
+    instructions: list[Instruction], instruction_type: InstructionType,
+    org_name: str, order_ref: str, output_dir: str = "/tmp",
+) -> str:
+    """
+    Печать партии журнала инструктажей — по образцу рекомендуемой формы
+    ГОСТ 12.0.004-2015 (Приложение А.4 вводный / А.5 на рабочем месте / А.6
+    целевой). Только НОВЫЕ строки (см. print_new_journal_entries — вызывается
+    ДО этой функции, здесь просто печать уже пронумерованных записей),
+    довешенные прочерками до конца страницы (JOURNAL_ROWS_PER_PAGE) — довесок
+    визуальный, не сохраняется как данные, следующая реальная запись получит
+    следующий номер как ни в чём не бывало (см. договорённость в чате).
+
+    order_ref — ссылка на приказ (INTERNAL_ORDER_REF), печатается мелким
+    шрифтом внизу страницы — см. договорённость про подсказку для проверяющего.
+    """
+    doc = Document()
+
+    title = doc.add_paragraph()
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    label = INSTRUCTION_LABELS.get(instruction_type, instruction_type.value)
+    run = title.add_run(f"ЖУРНАЛ РЕГИСТРАЦИИ ИНСТРУКТАЖА ({label.upper()})")
+    run.bold = True
+    run.font.size = Pt(14)
+
+    doc.add_paragraph(f"Организация: {org_name}")
+
+    table = doc.add_table(rows=1, cols=7)
+    table.style = "Table Grid"
+    hdr = table.rows[0].cells
+    headers = ["№", "Дата", "ФИО", "Год рожд.", "Кто провёл",
+               "Подпись инструктируемого", "Подпись инструктирующего"]
+    for i, h in enumerate(headers):
+        hdr[i].text = h
+
+    for instr in instructions:
+        row = table.add_row().cells
+        emp = instr.employee
+        birth_year = str(emp.birth_date.year) if emp and emp.birth_date else ""
+        row[0].text = str(instr.journal_row_number)
+        row[1].text = instr.conducted_at.strftime("%d.%m.%Y")
+        row[2].text = emp.full_name if emp else "?"
+        row[3].text = birth_year
+        row[4].text = instr.conducted_by
+        row[5].text = ""  # подпись — от руки на распечатке
+        row[6].text = ""
+
+    # Довесок прочерками до конца страницы — визуальный, не данные (не создаёт
+    # записей Instruction, следующая допечатка продолжит нумерацию с реального
+    # следующего номера, не с номера довеска).
+    remainder = len(instructions) % JOURNAL_ROWS_PER_PAGE
+    if remainder != 0:
+        pad_rows = JOURNAL_ROWS_PER_PAGE - remainder
+        for _ in range(pad_rows):
+            row = table.add_row().cells
+            for cell in row:
+                cell.text = "—"
+
+    footer = doc.add_paragraph()
+    footer_run = footer.add_run(
+        f"Журнал ведётся по рекомендуемой форме ГОСТ 12.0.004-2015. Порядок регистрации "
+        f"определён работодателем самостоятельно (п. 88 Правил №2464 от 24.12.2021; "
+        f"разъяснение Роструда №15-2/В-1677 от 30.05.2022) — {order_ref}. "
+        f"Незаполненные строки погашены прочерком. Подписи — собственноручные."
+    )
+    footer_run.font.size = Pt(7)
+    footer_run.italic = True
+
+    path = f"{output_dir}/journal_{instruction_type.value}_{datetime.utcnow():%Y%m%d%H%M%S}.docx"
+    doc.save(path)
+    return path
 
 
 def get_due_instructions(session: Session, days_before: int = 7) -> list[dict]:
