@@ -81,6 +81,7 @@ import production as prod
 from auth_binding import (
     bind_max_account, find_user_by_max_id, get_role_label,
     confirm_max_code, register_via_max,
+    set_max_chat_id, get_admins_with_chat,
 )
 from common_utils import category_for_citizenship
 from consent_texts import get_consent_text  # см. consent_texts.py
@@ -733,8 +734,13 @@ async def on_callback(event: MessageCallback):
 
     responder = _Responder(event)
 
-    # Подписка/отписка текущего чата на рассылку. chat_id берём через get_ids()
-    # (проверенный путь для callback), затем пишем в notification_subscribers.
+    # Кнопка «Подать заявку на регистрацию» (после неудачного /login с ненайденным
+    # номером). Запускает тот же флоу, что /register: спрашиваем ФИО, потом телефон,
+    # затем register_via_max создаёт PENDING-заявку и уведомляет админов.
+    if payload == "register:start":
+        _pending_forms[responder.user_id()] = {"state": "awaiting_register_name"}
+        await responder.send("Регистрация. Введите ваше ФИО полностью (например: Иванов Пётр):")
+        return
     if payload == "subscribe:confirm":
         chat_id, _ = event.get_ids()
         with Session(engine) as session:
@@ -1612,12 +1618,33 @@ async def on_text(event: MessageCreated):
     user_id = event.message.sender.user_id
     form = _pending_forms.get(user_id)
 
+    # Вариант 3 (согласовано): при ЛЮБОМ текстовом действии обновляем chat_id
+    # личного диалога у привязанного пользователя — чтобы у активного админа
+    # chat_id заполнился сам, без спец. /login, и заявки на регистрацию доходили.
+    # No-op, если пользователь не привязан или chat_id уже совпадает.
+    _chat_id = getattr(event, "chat_id", None)
+    if _chat_id is not None:
+        try:
+            with Session(engine) as session:
+                set_max_chat_id(session, user_id, _chat_id)
+        except Exception:
+            log.exception("on_text: не удалось обновить max_chat_id")
+
     if form and form.get("state") == "awaiting_login_phone":
         phone = event.message.body.text.strip()
         _pending_forms.pop(user_id, None)
         with Session(engine) as session:
-            ok, text = bind_max_account(session, phone, user_id)
+            ok, text = bind_max_account(session, phone, user_id, chat_id=_chat_id)
         await event.message.answer(text)
+        # Номер не найден → предлагаем подать заявку на регистрацию (вместо тупика).
+        if not ok and "нет в системе" in text:
+            builder = InlineKeyboardBuilder()
+            builder.row(CallbackButton(text="📝 Подать заявку на регистрацию",
+                                       payload="register:start"))
+            await event.message.answer(
+                text="Хотите подать заявку? Админ проверит и откроет доступ.",
+                attachments=[builder.as_markup()],
+            )
         return
 
     if form and form.get("state") == "awaiting_register_name":
@@ -1638,8 +1665,20 @@ async def on_text(event: MessageCreated):
         full_name = form["full_name"]
         _pending_forms.pop(user_id, None)
         with Session(engine) as session:
-            ok, text = register_via_max(session, full_name, phone, user_id)
+            ok, text = register_via_max(session, full_name, phone, user_id, chat_id=_chat_id)
+            # Уведомляем админов о новой заявке (только если создана новая заявка).
+            if ok:
+                admins = get_admins_with_chat(session)
         await event.message.answer(text)
+        if ok:
+            note = (f"📝 Новая заявка на регистрацию:\n"
+                    f"ФИО: {full_name}\nТелефон: {phone}\n"
+                    f"Одобрите и назначьте роль в веб-разделе пользователей.")
+            for admin in admins:
+                try:
+                    await bot.send_message(chat_id=admin.max_chat_id, text=note)
+                except Exception:
+                    log.exception("register: не удалось уведомить админа chat_id=%s", admin.max_chat_id)
         return
 
     if form and form.get("state") == "awaiting_actual_return_date":
