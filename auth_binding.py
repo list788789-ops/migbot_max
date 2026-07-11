@@ -58,12 +58,16 @@ def bind_max_account(session: Session, phone: str, max_user_id: str) -> tuple[bo
         )
 
     if user.max_user_id == str(max_user_id):
-        return True, f"Вы уже вошли как {user.full_name} ({user.role.value if user.role else '—'})."
+        return True, (f"Вы уже вошли как {user.full_name}.\n"
+                       f"Рабочее место: Автоматизированная система. Роль: "
+                       f"{user.role.value if user.role else '—'}.")
 
     user.max_user_id = str(max_user_id)
     session.add(user)
     session.commit()
-    return True, f"Готово, вы вошли как {user.full_name} ({user.role.value if user.role else '—'})."
+    return True, (f"Готово, вы вошли как {user.full_name}.\n"
+                   f"Рабочее место: Автоматизированная система. Роль: "
+                   f"{user.role.value if user.role else '—'}.")
 
 
 def get_role_label(user: User) -> str:
@@ -123,7 +127,8 @@ def confirm_max_code(session: Session, code: str, max_user_id: str) -> tuple[boo
     if user.status == UserStatus.PENDING:
         return True, (f"Готово, MAX привязан. Заявка {user.full_name} ещё ожидает "
                        f"одобрения админом — доступ откроется после этого.")
-    return True, f"Готово, вы вошли как {user.full_name} ({get_role_label(user)})."
+    return True, (f"Готово, вы вошли как {user.full_name}.\n"
+                   f"Рабочее место: Автоматизированная система. Роль: {get_role_label(user)}.")
 
 
 # ================= Регистрация ТОЛЬКО через MAX (без веба) =================
