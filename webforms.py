@@ -80,8 +80,11 @@ from models import (
     RotationReturn,
     SystemFlag,
     WorkOrderMember,
+    WorkOrder,
     InstructionType,
     Certificate,
+    InternalOrder,
+    OrderCategory,
 )
 from obligations import create_obligations_for_employee
 from auth_binding import get_role_label, find_user_by_max_id
@@ -1437,6 +1440,9 @@ def production_page(request: Request):
 <div class="card"><h3 style="margin:0 0 6px">🪪 Удостоверения</h3>
 <p class="muted" style="margin:0 0 10px">Удостоверения по профессиям — сроки действия, сканы, напоминания об истечении.</p>
 <a class="btn" href="/production/certificates">Открыть</a></div>
+<div class="card"><h3 style="margin:0 0 6px">📑 Приказы</h3>
+<p class="muted" style="margin:0 0 10px">Реестр внутренних приказов — сканы, номера, используется в футерах печатных бланков.</p>
+<a class="btn" href="/production/orders">Открыть</a></div>
 </section>
 """
     return _render("Производство", body, active="production", role=request.session.get("role", ""))
@@ -1467,6 +1473,7 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
             f'<span class="muted">{o.location} · {o.valid_from:%d.%m}–{o.valid_to:%d.%m.%Y} · '
             f'ответственный: {o.responsible.full_name if o.responsible else "?"}</span><br>'
             f'<span class="badge neutral">Подписали: {signed}/{len(members)}</span> '
+            f'<a class="btn secondary" href="/production/work-orders/{o.id}/print">Печатный бланк</a> '
             f'<form method="post" action="/production/work-orders/{o.id}/close" style="display:inline">'
             f'<button type="submit" class="btn secondary">Закрыть наряд</button></form></div>'
         )
@@ -1524,6 +1531,25 @@ def work_order_close(work_order_id: str, request: Request, db: Session = Depends
         return RedirectResponse("/login", status_code=303)
     prod.close_work_order(db, work_order_id)
     return RedirectResponse("/production/work-orders", status_code=303)
+
+
+@app.get("/production/work-orders/{work_order_id}/print")
+def work_order_print(work_order_id: str, request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    order = db.get(WorkOrder, work_order_id)
+    if order is None:
+        raise HTTPException(404, "Наряд не найден.")
+    members = db.query(WorkOrderMember).filter_by(work_order_id=order.id).all()
+    path = prod.generate_work_order_docx(order, members, org_name=ORG_NAME)
+    with open(path, "rb") as f:
+        data = f.read()
+    fn = f"Наряд-допуск_№{order.number}.docx"
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": _content_disposition(fn)},
+    )
 
 
 # --- Инструктажи ---------------------------------------------------------------
@@ -1697,6 +1723,105 @@ def certificate_download(certificate_id: str, request: Request, db: Session = De
     ext = "pdf" if "pdf" in ct else ("jpg" if "jpeg" in ct or "jpg" in ct else "bin")
     fio = (cert.employee.full_name if cert.employee else "").strip().replace(" ", "_")
     fn = f"{fio}_{cert.profession.replace(' ', '_')}.{ext}" if fio else f"certificate.{ext}"
+    return Response(content=data, media_type=ct,
+                    headers={"Content-Disposition": _content_disposition(fn)})
+
+
+# --- Приказы (2026-07) ---------------------------------------------------------
+
+@app.get("/production/orders", response_class=HTMLResponse)
+def orders_page(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    orders = prod.get_orders(db)
+
+    _category_label = {
+        OrderCategory.PERSONNEL: "Кадровый", OrderCategory.PRODUCTION: "Производственный",
+        OrderCategory.OTHER: "Прочее",
+    }
+    _category_badge = {
+        OrderCategory.PERSONNEL: "orange", OrderCategory.PRODUCTION: "green", OrderCategory.OTHER: "neutral",
+    }
+
+    def order_row(o) -> str:
+        scan_link = (f'<a class="btn secondary" href="/production/orders/{o.id}/download">Скачать скан</a>'
+                     if o.scan_key else '<span class="muted">без скана</span>')
+        note = f'<br><span class="muted">{o.note}</span>' if o.note else ''
+        badge = f'<span class="badge {_category_badge[o.category]}">{_category_label[o.category]}</span>'
+        return (
+            f'<div class="card">№ {o.number} от {o.order_date:%d.%m.%Y} — {o.topic} {badge}{note}<br>'
+            f'{scan_link}</div>'
+        )
+
+    rows = "".join(order_row(o) for o in orders)
+    category_options = "".join(
+        f'<option value="{c.value}">{label}</option>' for c, label in _category_label.items()
+    )
+    body = f"""
+<h1>📑 Приказы</h1>
+<section class="grid"><h2>Реестр ({len(orders)})</h2>{rows or '<p class="muted">Пока пусто.</p>'}</section>
+<section>
+<h2>Новый приказ</h2>
+<form method="post" action="/production/orders/new" enctype="multipart/form-data">
+<input type="text" name="number" placeholder="Номер (например: 20-ПСМ/2026)" required>
+<label>Дата: <input type="date" name="order_date" required></label>
+<input type="text" name="topic" placeholder="Тема приказа" required>
+<label>Раздел: <select name="category">{category_options}</select></label>
+<textarea name="note" placeholder="Примечание (необязательно)" rows="2"></textarea>
+<label>Скан приказа (PDF/фото): <input type="file" name="scan_file"></label>
+<button type="submit">Добавить в реестр</button>
+</form>
+</section>
+<p><a class="btn secondary" href="/production">← Производство</a></p>
+"""
+    return _render("Приказы", body, active="production", role=request.session.get("role", ""))
+
+
+@app.post("/production/orders/new")
+async def order_create(
+    request: Request,
+    number: str = Form(...),
+    order_date: str = Form(...),
+    topic: str = Form(...),
+    category: str = Form(OrderCategory.OTHER.value),
+    note: str = Form(""),
+    scan_file: UploadFile = File(None),
+    db: Session = Depends(get_db),
+):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    order = prod.create_order(
+        db, number, datetime.strptime(order_date, "%Y-%m-%d").date(), topic,
+        category=OrderCategory(category), note=note or None,
+    )
+    if scan_file is not None and scan_file.filename:
+        from s3_storage import _s3_upload, _scan_key
+        scan_type = f"order_{order.id}"
+        content = await scan_file.read()
+        content_type = scan_file.content_type or "application/octet-stream"
+        try:
+            _s3_upload(scan_type, None, content, content_type)
+            prod.set_order_scan_key(db, order.id, _scan_key(scan_type, None))
+        except RuntimeError as e:
+            log.warning("order_create: загрузка скана не удалась: %s", e)
+    return RedirectResponse("/production/orders", status_code=303)
+
+
+@app.get("/production/orders/{order_id}/download")
+def order_download(order_id: str, request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    order = db.get(InternalOrder, order_id)
+    if order is None or not order.scan_key:
+        raise HTTPException(404, "Скан не найден.")
+    from s3_storage import _s3_download
+    scan_type = f"order_{order.id}"
+    try:
+        data, ct = _s3_download(scan_type, None)
+    except RuntimeError as e:
+        raise HTTPException(404, str(e))
+    ext = "pdf" if "pdf" in ct else ("jpg" if "jpeg" in ct or "jpg" in ct else "bin")
+    fn = f"Приказ_{order.number.replace('/', '-')}.{ext}"
     return Response(content=data, media_type=ct,
                     headers={"Content-Disposition": _content_disposition(fn)})
 
