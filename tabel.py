@@ -206,7 +206,10 @@ def get_marked_night(session: Session, mark_date: date | None = None) -> list[Em
 
 
 def get_not_worked_day(session: Session, mark_date: date | None = None) -> list[Employee]:
-    """Активные, кто НЕ работал днём (слот != Д) — их можно поставить в ночь."""
+    """Активные, кого можно поставить в ночь: дневной слот != Д И ещё НЕ отмечены в ночь (НЧ).
+    Раньше исключались только отработавшие день, а уже отмеченные ночью оставались в списке —
+    из-за этого вечерний picker не обновлялся после простановки (отметка в БД шла, но человек
+    не убирался, счётчик застревал, edit «того же самого» залипал). Теперь снимаем обоих."""
     mark_date = mark_date or date.today()
     active = get_active_employees(session)
     day_worked_ids = {
@@ -215,7 +218,13 @@ def get_not_worked_day(session: Session, mark_date: date | None = None) -> list[
         .filter_by(mark_date=mark_date, slot="day", code=DAY)
         .all()
     }
-    return [e for e in active if e.id not in day_worked_ids]
+    night_ids = {
+        row.employee_id for row in
+        session.query(AttendanceMark.employee_id)
+        .filter_by(mark_date=mark_date, slot="night", code=NIGHT)
+        .all()
+    }
+    return [e for e in active if e.id not in day_worked_ids and e.id not in night_ids]
 
 
 def get_night_rest(session: Session, mark_date: date | None = None) -> list[Employee]:
