@@ -912,6 +912,22 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
             f'<a class="btn" href="/employees/{e.id}">Открыть карточку</a></div>'
         )
 
+    # Непроведённые обязательные инструктажи (вводный / первичный на рабочем месте):
+    # дата начала работы наступила, а инструктажа нет. Отдельный раздел от "пробелов
+    # в карточке" — это не незаполненное поле, а невыполненное действие по охране труда.
+    instruction_gaps = prod.get_instruction_compliance_gaps(db)
+
+    def instruction_gap_row(g: dict) -> str:
+        badge_class = "red" if g["stage"] == "critical" else "orange"
+        stage_word = "критично" if g["stage"] == "critical" else "просрочено"
+        return (
+            f'<div class="card">{html.escape(g["name"])} — {g["type_label"]}<br>'
+            f'<span class="badge {badge_class}">{stage_word} · с {g["start_date"].strftime("%d.%m.%Y")} '
+            f'({g["days_overdue"]} дн.)</span><br>'
+            f'<a class="btn" href="/production/instructions">К инструктажам</a> '
+            f'<a class="btn secondary" href="/employees/{g["employee_id"]}">Карточка</a></div>'
+        )
+
     # Межвахта с открытыми обязательствами (2026-07, слияние с ботом ТабельБелокаменка).
     # Видит только кадровик/админ — прораб ставит межвахту не глядя на это (см.
     # UserRole.PRORAB в models.py и договорённость "данные направлены в отдел кадров").
@@ -1042,6 +1058,11 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
 <section class="grid">
 <h2>Требуют внимания в карточке ({len(needs_attention)})</h2>
 {''.join(attention_row(e, b) for e, b in needs_attention) or '<p class="muted">У всех сотрудников заполнены ключевые поля.</p>'}
+</section>
+
+<section class="grid">
+<h2>🦺 Инструктажи не проведены ({len(instruction_gaps)}{f", из них критично: {sum(1 for g in instruction_gaps if g['stage'] == 'critical')}" if any(g['stage'] == 'critical' for g in instruction_gaps) else ""})</h2>
+{''.join(instruction_gap_row(g) for g in instruction_gaps) or '<p class="muted">Вводный и первичный проведены у всех, кто уже начал работу.</p>'}
 </section>
 
 {f'''<section class="grid">
