@@ -1250,6 +1250,15 @@ def generate_work_order_docx(session, work_order, output_dir="/tmp"):
     sup_name = getattr(sup, "full_name", None) or "____________"
     ex_name = getattr(ex, "full_name", None) or "____________"
 
+    # Тексты, зависящие от вида работ, берутся из связанного WorkType (если наряд заполнен
+    # из справочника). Собственное поле наряда имеет приоритет, справочник — запасной источник.
+    wt = getattr(work_order, "work_type", None)
+    work_name = work_order.work_description or getattr(wt, "name", None)
+    content_val = getattr(wt, "content", None) or work_order.work_description
+    conditions_val = work_order.special_conditions or getattr(wt, "conditions", None)
+    hazards_val = getattr(work_order, "hazards", None) or getattr(wt, "hazards", None)
+    norms_val = getattr(wt, "norms", None)
+
     _p("Приложение № 2 к Правилам по охране труда при работе на высоте", italic=True, size=9)
     _p("(Приказ Минтруда России от 16.11.2020 № 782н)", italic=True, size=9)
     _p()
@@ -1268,7 +1277,7 @@ def generate_work_order_docx(session, work_order, output_dir="/tmp"):
     _label("Действителен до ", f"{_date_or_dash(work_order.valid_to)} года")
     _label("Ответственному руководителю работ: ", getattr(sup, "full_name", None))
     _label("Ответственному исполнителю (производителю) работ: ", getattr(ex, "full_name", None))
-    _label("На выполнение работ: ", work_order.work_description)
+    _label("На выполнение работ: ", work_name)
 
     _p()
     _p("Состав исполнителей работ (члены бригады):")
@@ -1290,19 +1299,30 @@ def generate_work_order_docx(session, work_order, output_dir="/tmp"):
 
     _p()
     _label("Место выполнения работ: ", work_order.location)
-    _label("Содержание работ: ", work_order.work_description)
-    _label("Условия проведения работ: ", work_order.special_conditions)
+    _label("Содержание работ: ", content_val)
+    _label("Условия проведения работ: ", conditions_val)
     _label(
         "Опасные и вредные производственные факторы, которые действуют или могут возникнуть "
         "в местах выполнения работ: ",
-        getattr(work_order, "hazards", None),
+        hazards_val,
     )
     _label("Начало работ: ", f"{WORK_ORDER_START_TIME} {_date_or_dash(work_order.valid_from)}")
     _label("Окончание работ: ", f"{WORK_ORDER_END_TIME} {_date_or_dash(work_order.valid_to)}")
+    if norms_val:
+        _label("Нормативные основания: ", norms_val)
 
     _p()
     _p("Системы обеспечения безопасности работ на высоте:", bold=True)
-    ss = _wo_split_safety_systems(getattr(work_order, "safety_systems", None))
+    if (work_order.safety_systems or "").strip():
+        ss = _wo_split_safety_systems(work_order.safety_systems)
+    elif wt is not None:
+        ss = [
+            getattr(wt, "sys_restraint", None) or DASH,
+            getattr(wt, "sys_fall_arrest", None) or DASH,
+            getattr(wt, "sys_rescue", None) or DASH,
+        ]
+    else:
+        ss = [DASH, DASH, DASH]
     _grid(
         ["Системы обеспечения безопасности", "Состав системы"],
         [
@@ -1333,8 +1353,12 @@ def generate_work_order_docx(session, work_order, output_dir="/tmp"):
 
     _p()
     _p("3. В процессе производства работ необходимо выполнить следующие мероприятия:", bold=True)
-    _grid(["Наименование мероприятия", "Срок выполнения", "Ответственный исполнитель"],
-          [["", "", ""] for _ in range(3)])
+    proc_lines = [ln.strip() for ln in (getattr(wt, "process_measures", None) or "").splitlines() if ln.strip()]
+    if proc_lines:
+        proc_rows = [[m, "Постоянно в процессе работ", ex_name] for m in proc_lines]
+    else:
+        proc_rows = [["", "", ""] for _ in range(3)]
+    _grid(["Наименование мероприятия", "Срок выполнения", "Ответственный исполнитель"], proc_rows)
 
     _p()
     _p("4. Особые условия проведения работ:", bold=True)
