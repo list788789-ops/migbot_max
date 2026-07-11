@@ -1541,7 +1541,7 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
 <label>Типовая работа из справочника (необязательно — заполнит условия, ОВПФ, системы безопасности, раздел 3 и нормы):
 <select name="work_type_id"><option value="">— не выбрано —</option>{work_type_options}</select></label>
 <textarea name="work_description" placeholder="На выполнение работ" required rows="3"></textarea>
-<label>Титул из справочника (заполнит место выполнения работ; можно вписать свой):
+<label style="display:block;margin-top:6px">Титул из справочника (заполнит место выполнения работ; можно вписать свой):
 <select id="titulSelect" onchange="_applyTitul()"><option value="">— вручную —</option>{titul_options}</select></label>
 <input type="text" id="location" name="location" placeholder="Место выполнения работ" required>
 <label>Ответственный руководитель работ:
