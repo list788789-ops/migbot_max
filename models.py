@@ -396,9 +396,15 @@ class WorkOrder(Base):
     # Добавлено 2026-07 под генератор наряда; в БД заведено:
     #   ALTER TABLE work_orders ADD COLUMN hazards TEXT;
     hazards: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Ссылка на типовую работу из справочника work_types, из которой заполнен наряд
+    # (опциональна: старые наряды и ручной ввод — без неё). Тексты в бланк берутся из
+    # справочника на момент генерации; в БД заведено:
+    #   ALTER TABLE work_orders ADD COLUMN work_type_id VARCHAR REFERENCES work_types(id);
+    work_type_id: Mapped[str | None] = mapped_column(ForeignKey("work_types.id"), nullable=True)
 
     responsible_supervisor: Mapped["Employee"] = relationship(foreign_keys=[responsible_supervisor_id])
     responsible_executor: Mapped["Employee"] = relationship(foreign_keys=[responsible_executor_id])
+    work_type: Mapped["WorkType | None"] = relationship(foreign_keys=[work_type_id])
     members: Mapped[list["WorkOrderMember"]] = relationship(
         back_populates="work_order", cascade="all, delete-orphan"
     )
@@ -449,6 +455,34 @@ class WorkOrderMember(Base):
 
     work_order: Mapped["WorkOrder"] = relationship(back_populates="members")
     employee: Mapped["Employee"] = relationship()
+
+
+class WorkType(Base):
+    """Справочник типовых видов работ для наряда-допуска на высоте (2026-07).
+    Одна запись = один вид работ (армирование, опалубка, бетонирование и т.д.) и несёт
+    все зависящие от вида работ поля бланка: содержание, условия проведения, ОВПФ,
+    три строки систем безопасности, мероприятия «в процессе» (раздел 3) и нормативные
+    ссылки. При выпуске наряда генератор берёт эти тексты из справочника (см.
+    WorkOrder.work_type_id). Заводится ALTER-скриптом work_types_seed.sql.
+
+    process_measures — мероприятия раздела 3 «в процессе производства работ», ПО ОДНОМУ
+    В СТРОКУ (генератор раскладывает по строкам таблицы; срок и ответственный проставляются
+    генератором: «Постоянно в процессе работ» / ответственный исполнитель наряда).
+    Строки систем безопасности sys_rescue — РЕАЛЬНОЕ средство спасения (не привязь)."""
+
+    __tablename__ = "work_types"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(String, nullable=False, unique=True)  # «На выполнение работ»
+    content: Mapped[str | None] = mapped_column(Text, nullable=True)          # содержание работ
+    conditions: Mapped[str | None] = mapped_column(Text, nullable=True)       # условия проведения
+    hazards: Mapped[str | None] = mapped_column(Text, nullable=True)          # ОВПФ
+    sys_restraint: Mapped[str | None] = mapped_column(Text, nullable=True)    # удерживающие системы
+    sys_fall_arrest: Mapped[str | None] = mapped_column(Text, nullable=True)  # страховочные системы
+    sys_rescue: Mapped[str | None] = mapped_column(Text, nullable=True)       # эвакуационные и спасательные
+    process_measures: Mapped[str | None] = mapped_column(Text, nullable=True)  # раздел 3, по строке на пункт
+    norms: Mapped[str | None] = mapped_column(Text, nullable=True)            # нормативные ссылки
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
 
 
 class Instruction(Base):
