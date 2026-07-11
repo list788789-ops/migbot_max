@@ -640,10 +640,8 @@ def _fix_table_width(table, widths_mm):
 def generate_duty_receipt_docx(kind: str, employee=None, payer_name: str = "", output_dir: str = "/tmp") -> str:
     """Квитанция на оплату госпошлины, форма ПД-4сб(налог). kind: "registration" (500, постановка
     на учёт) или "renewal" (1000, продление пребывания). Реквизиты фиксированные (DUTY_*), сумма
-    фиксированная по типу. Плательщик (ФИО/адрес) — поля предусмотрены, но пустые: ФИО плательщика
-    из payer_name (если не задано — прочерк), адрес плательщика — прочерк (по решению не вводим).
-    employee — используется для ФИО иностранного гражданина ("за кого"), печатается отдельной
-    строкой бланка; если employee не передан, строка идёт с прочерком.
+    фиксированная по типу. Плательщик (ФИО/адрес) — поля предусмотрены, но пустые: заполняются
+    вручную (пользователь: ФИО пока не подставляем). employee — задел на будущее автозаполнение.
 
     ПД-4сб состоит из двух одинаковых частей: «Извещение» (остаётся в банке) и «Квитанция»
     (у плательщика). Обе части идентичны — строятся одной вспомогательной функцией."""
@@ -666,9 +664,7 @@ def generate_duty_receipt_docx(kind: str, employee=None, payer_name: str = "", o
     # ФИО плательщика — из формы (кадровик вводит; плательщик НЕ обязательно работник).
     payer_fio = (payer_name or "").strip() or DASH
     payer_addr = DASH  # адрес плательщика — прочерк (по решению: не вводим)
-    # ФИО работника, за кого платёж — печатается ОТДЕЛЬНОЙ строкой бланка (а не в назначении,
-    # как в реальном чеке, где ФИО иностранца — самостоятельное поле). Появится на бланке,
-    # только если форма передала employee; иначе строка печатается с прочерком.
+    # ФИО работника, за кого платёж, добавляется в назначение платежа.
     _worker = (getattr(employee, "full_name", "") or "").strip() if employee else ""
 
     # QR один раз генерируем во временный файл, вставляем в обе части (извещение и квитанция).
@@ -710,8 +706,7 @@ def generate_duty_receipt_docx(kind: str, employee=None, payer_name: str = "", o
             ("Банк получателя", DUTY_BANK_NAME),
             ("БИК / Кор. счёт", f"{DUTY_BIC} / {DUTY_CORRESP_ACC}"),
             ("КБК", spec["kbk"]),
-            ("Наименование платежа", spec["purpose"]),
-            ("Ф.И.О. иностранного гражданина (за кого)", _worker or DASH),
+            ("Наименование платежа", spec["purpose"] + (f" за {_worker}" if _worker else "")),
             ("Ф.И.О. плательщика", payer_fio),
             ("Адрес плательщика", payer_addr),
             ("Сумма платежа", f"{spec['amount']} руб. 00 коп."),
@@ -1040,20 +1035,13 @@ def generate_medical_referral_docx(employee: Employee, output_dir: str = "/tmp")
 def generate_employees_xlsx(employees: list[Employee], output_dir: str = "/tmp") -> str:
     """Полный список сотрудников таблицей — замена постраничному тексту в /employees.
     Отдельный файл от Google Sheets: тот обновляется по крону раз в сутки командой
-    export_to_sheets_api.py, этот — генерируется по запросу с текущим состоянием БД.
-
-    2026-07: имя файла раньше было жёстко "employees.xlsx" (одно и то же при каждом
-    вызове) — при повторных запросах MAX мог показать закешированное вложение по
-    имени файла вместо свежего, хотя данные внутри честно генерировались заново из БД
-    при каждом вызове. Плюс жёсткое имя означало гонку при одновременном запросе
-    отчёта двумя людьми (второй мог перезаписать файл первого мидвей записи). Теперь
-    имя включает метку времени — гарантированно новый файл на каждый вызов."""
+    export_to_sheets_api.py, этот — генерируется по запросу с текущим состоянием БД."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Сотрудники"
 
     headers = [
-        "№", "ФИО", "Гражданство", "Категория", "Дата въезда", "Дата договора",
+        "ФИО", "Гражданство", "Категория", "Дата въезда", "Дата договора",
         "Статус занятости", "Согласие", "Телефон", "Язык",
         "Дата рождения", "Серия паспорта", "Номер паспорта", "Адрес", "Откуда въехал",
     ]
@@ -1061,9 +1049,8 @@ def generate_employees_xlsx(employees: list[Employee], output_dir: str = "/tmp")
     for cell in ws[1]:
         cell.font = Font(bold=True)
 
-    for i, emp in enumerate(employees, start=1):
+    for emp in employees:
         ws.append([
-            i,
             emp.full_name,
             emp.citizenship or "",
             emp.category.value if emp.category else "",
@@ -1084,7 +1071,337 @@ def generate_employees_xlsx(employees: list[Employee], output_dir: str = "/tmp")
         max_len = max((len(str(c.value)) for c in col if c.value), default=10)
         ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 40)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(output_dir, f"employees_{timestamp}.xlsx")
+    path = os.path.join(output_dir, "employees.xlsx")
     wb.save(path)
     return path
+
+
+# ============================================================================
+# НАРЯД-ДОПУСК НА ПРОИЗВОДСТВО РАБОТ НА ВЫСОТЕ
+# (Приложение № 2 к Правилам по охране труда при работе на высоте,
+#  Приказ Минтруда России от 16.11.2020 № 782н)
+#
+# v1 (согласовано): читает существующую модель WorkOrder. Упрощения v1:
+#   1. Время работ фиксировано (WORK_ORDER_START_TIME/END_TIME = 08:00/19:00) —
+#      в модели времени нет, только даты valid_from/valid_to.
+#   2. safety_systems — одно текстовое поле; раскладывается по 3 строкам таблицы
+#      по переносам строк (недостающие строки — прочерком, лишние — в последнюю).
+# Справочники типовых работ/титулов и автонумерация — отдельными шагами.
+# ============================================================================
+
+import re as _re
+
+WORK_ORDER_ORG_NAME = os.environ.get("WORK_ORDER_ORG_NAME") or COMPANY_NAME
+# Лицо, выдающее наряд (фиксированное, назначается приказом). По умолчанию —
+# наименование организации; переопределяется, если выдающий — назначенное лицо.
+WORK_ORDER_ISSUER_NAME = os.environ.get("WORK_ORDER_ISSUER_NAME") or WORK_ORDER_ORG_NAME
+WORK_ORDER_DEFAULT_SUBDIVISION = os.environ.get("WORK_ORDER_DEFAULT_SUBDIVISION") or "Мурманск"
+WORK_ORDER_START_TIME = "08:00"
+WORK_ORDER_END_TIME = "19:00"
+WORK_ORDER_MAX_DAYS = 15  # 782н: срок действия ≤ 15 календарных дней (+1 продление ≤15)
+
+# Раздел 2 «Мероприятия до начала работ» — типовой текст (одинаков всегда).
+WORK_ORDER_PREP_MEASURES = [
+    "Оформить наряд-допуск на работы повышенной опасности с обязательным указанием в нём: "
+    "ответственного исполнителя работ; ответственного руководителя работ; место выполнения "
+    "работ на высоте находится в зоне прямой видимости ответственного исполнителя работ "
+    "и/или ответственного руководителя работ.",
+    "Ознакомление и обсуждение Плана производства работ (технологической карты) с "
+    "ответственным руководителем работ, ответственным исполнителем работ, исполнителями работ.",
+    "Обсуждение начала рабочего процесса, разъяснение ответственным руководителем работ всех "
+    "специфических обязанностей и процедур всем работникам и соблюдение правил безопасности.",
+    "Работники, впервые допускаемые к работам на высоте, должны обладать практическими "
+    "навыками применения оборудования, приборов, механизмов и оказания первой помощи "
+    "пострадавшим, практическими навыками применения соответствующих СИЗ, их осмотром до и "
+    "после использования.",
+    "Средства коллективной и индивидуальной защиты работников должны использоваться по "
+    "назначению в соответствии с требованиями инструкций изготовителя и нормативной технической "
+    "документации, введённой в действие в установленном порядке.",
+]
+
+
+def _height_group_num(value):
+    """Из строки группы («2-я гр. по безопасности работ на высоте») достаёт число 2."""
+    if not value:
+        return None
+    m = _re.search(r"(\d+)", str(value))
+    return int(m.group(1)) if m else None
+
+
+def _wo_set_cell(cell, text, *, bold=False, size=9, align=None):
+    cell.text = ""
+    p = cell.paragraphs[0]
+    if align is not None:
+        p.alignment = align
+    run = p.add_run("" if text in (None, "") else str(text))
+    run.bold = bold
+    run.font.size = Pt(size)
+
+
+def _wo_split_safety_systems(raw):
+    """safety_systems (одно текстовое поле) -> 3 значения строк таблицы.
+    Меньше 3 строк -> недостающие прочерком; больше 3 -> лишние склеиваются в последнюю."""
+    lines = [ln.strip() for ln in (raw or "").splitlines() if ln.strip()]
+    vals = []
+    for i in range(3):
+        if i < len(lines):
+            vals.append(" ".join(lines[2:]) if (i == 2 and len(lines) > 3) else lines[i])
+        else:
+            vals.append(DASH)
+    return vals
+
+
+def check_work_order_problems(work_order):
+    """Список проблем наряда-допуска (782н + наши правила). Пустой список = ок.
+    Документ строится ВСЕГДА (черновик); блокировать выпуск по этому списку — задача
+    вызывающего кода (webforms.py/bot.py) через WorkOrderStatus.DRAFT."""
+    problems = []
+    sup = getattr(work_order, "responsible_supervisor", None)
+    ex = getattr(work_order, "responsible_executor", None)
+
+    sup_grp = _height_group_num(getattr(sup, "height_safety_group", None)) if sup else None
+    if sup_grp != 3:
+        problems.append(
+            "Ответственный руководитель работ должен быть 3-й группы по безопасности работ на "
+            f"высоте (сейчас: {getattr(sup, 'height_safety_group', None) or DASH})."
+        )
+    ex_grp = _height_group_num(getattr(ex, "height_safety_group", None)) if ex else None
+    if ex_grp is None or ex_grp < 2:
+        problems.append(
+            "Ответственный исполнитель работ должен быть не ниже 2-й группы "
+            f"(сейчас: {getattr(ex, 'height_safety_group', None) or DASH})."
+        )
+
+    members = list(getattr(work_order, "members", None) or [])
+    if not members:
+        problems.append("Состав бригады пуст — нельзя выпустить наряд без исполнителей.")
+    for m in members:
+        emp = getattr(m, "employee", None)
+        name = getattr(emp, "full_name", None)
+        if not emp or not name:
+            problems.append("В бригаде есть член без привязанного сотрудника (пустая строка).")
+            continue
+        g = _height_group_num(getattr(emp, "height_safety_group", None))
+        if g is None or g < 2:
+            problems.append(f"У члена бригады «{name}» не указана группа по высоте (нужна ≥2-й).")
+
+    try:
+        span = (work_order.valid_to - work_order.valid_from).days + 1
+        if span > WORK_ORDER_MAX_DAYS:
+            problems.append(f"Срок действия наряда {span} дн. превышает 15 календарных дней (782н).")
+        if span < 1:
+            problems.append("Дата окончания раньше даты начала.")
+    except Exception:
+        problems.append("Не заданы корректные даты периода (valid_from/valid_to).")
+
+    rescue = _wo_split_safety_systems(getattr(work_order, "safety_systems", None))[2].lower()
+    if rescue != DASH.lower() and ("привяз" in rescue or "строп" in rescue or "фал" in rescue):
+        problems.append(
+            "Строка «Эвакуационные и спасательные системы» указывает страховочную привязь/строп/"
+            "фал — нужно реальное средство спасения (например, автогидроподъёмник)."
+        )
+    return problems
+
+
+def generate_work_order_docx(session, work_order, output_dir="/tmp"):
+    """Наряд-допуск на работы на высоте (Приложение № 2 к 782н) из WorkOrder.
+    Возвращает (path, problems): документ строится ВСЕГДА (черновик), problems — список
+    нарушений (см. check_work_order_problems); блокировать выпуск по нему — дело вызывающего
+    кода. session принимается для единообразия и на случай подгрузки связей."""
+    problems = check_work_order_problems(work_order)
+
+    doc = Document()
+    _set_default_style(doc)
+    doc.styles["Normal"].font.size = Pt(11)
+
+    def _p(text="", *, bold=False, italic=False, center=False, size=11):
+        p = doc.add_paragraph()
+        if center:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        r = p.add_run(text)
+        r.bold = bold
+        r.italic = italic
+        r.font.size = Pt(size)
+        return p
+
+    def _label(label, value):
+        p = doc.add_paragraph()
+        r = p.add_run(label)
+        r.bold = True
+        r.font.size = Pt(11)
+        r2 = p.add_run(value if value not in (None, "") else DASH)
+        r2.font.size = Pt(11)
+        return p
+
+    def _grid(headers, rows):
+        t = doc.add_table(rows=1, cols=len(headers))
+        t.style = "Table Grid"
+        for i, h in enumerate(headers):
+            _wo_set_cell(t.rows[0].cells[i], h, bold=True, size=9, align=WD_ALIGN_PARAGRAPH.CENTER)
+        for row in rows:
+            cells = t.add_row().cells
+            for i, val in enumerate(row):
+                _wo_set_cell(cells[i], val, size=9)
+        return t
+
+    sup = getattr(work_order, "responsible_supervisor", None)
+    ex = getattr(work_order, "responsible_executor", None)
+    subdivision = work_order.subdivision or WORK_ORDER_DEFAULT_SUBDIVISION
+    sup_name = getattr(sup, "full_name", None) or "____________"
+    ex_name = getattr(ex, "full_name", None) or "____________"
+
+    _p("Приложение № 2 к Правилам по охране труда при работе на высоте", italic=True, size=9)
+    _p("(Приказ Минтруда России от 16.11.2020 № 782н)", italic=True, size=9)
+    _p()
+    _p("УТВЕРЖДАЮ:", bold=True)
+    _p(WORK_ORDER_ORG_NAME)
+    _p("_________________ / ____________")
+    _p("«____» _____________ 20___ г.", italic=True)
+    _p()
+    _p(f"НАРЯД-ДОПУСК № {work_order.number or DASH}", bold=True, center=True, size=13)
+    _p("НА ПРОИЗВОДСТВО РАБОТ НА ВЫСОТЕ", bold=True, center=True)
+    _p()
+
+    _label("Организация: ", WORK_ORDER_ORG_NAME)
+    _label("Подразделение: ", subdivision)
+    _label("Выдан ", f"{_date_or_dash(work_order.valid_from)} года")
+    _label("Действителен до ", f"{_date_or_dash(work_order.valid_to)} года")
+    _label("Ответственному руководителю работ: ", getattr(sup, "full_name", None))
+    _label("Ответственному исполнителю (производителю) работ: ", getattr(ex, "full_name", None))
+    _label("На выполнение работ: ", work_order.work_description)
+
+    _p()
+    _p("Состав исполнителей работ (члены бригады):")
+    member_rows = []
+    for i, m in enumerate(getattr(work_order, "members", None) or [], 1):
+        emp = getattr(m, "employee", None)
+        name = getattr(emp, "full_name", None) or DASH
+        pos = getattr(emp, "position", None) or ""
+        grp = getattr(emp, "height_safety_group", None) or ""
+        pos_grp = ", ".join([x for x in (pos, grp) if x]) or DASH
+        member_rows.append([str(i), name, pos_grp, "", ""])
+    if not member_rows:
+        member_rows = [["", DASH, DASH, "", ""]]
+    _grid(
+        ["№", "Фамилия, имя, отчество", "Должность (разряд)",
+         "Инструктаж провёл (подпись)", "Ознакомлен (подпись)"],
+        member_rows,
+    )
+
+    _p()
+    _label("Место выполнения работ: ", work_order.location)
+    _label("Содержание работ: ", work_order.work_description)
+    _label("Условия проведения работ: ", work_order.special_conditions)
+    _label(
+        "Опасные и вредные производственные факторы, которые действуют или могут возникнуть "
+        "в местах выполнения работ: ",
+        getattr(work_order, "hazards", None),
+    )
+    _label("Начало работ: ", f"{WORK_ORDER_START_TIME} {_date_or_dash(work_order.valid_from)}")
+    _label("Окончание работ: ", f"{WORK_ORDER_END_TIME} {_date_or_dash(work_order.valid_to)}")
+
+    _p()
+    _p("Системы обеспечения безопасности работ на высоте:", bold=True)
+    ss = _wo_split_safety_systems(getattr(work_order, "safety_systems", None))
+    _grid(
+        ["Системы обеспечения безопасности", "Состав системы"],
+        [
+            ["Удерживающие системы", ss[0]],
+            ["Страховочные системы", ss[1]],
+            ["Эвакуационные и спасательные системы", ss[2]],
+        ],
+    )
+
+    _p()
+    _p("1. Необходимые для производства работ:", bold=True)
+    for lbl, val in [
+        ("Материалы: ", work_order.materials),
+        ("Инструмент: ", work_order.tools),
+        ("Приспособления: ", work_order.equipment),
+        ("Спецтехника: ", work_order.special_machinery),
+        ("Шифр ТК: ", work_order.technological_card_ref),
+    ]:
+        if val:
+            _label(lbl, val)
+
+    _p()
+    _p("2. До начала работ следует выполнить следующие мероприятия:", bold=True)
+    _grid(
+        ["Наименование мероприятия", "Срок выполнения", "Ответственный исполнитель"],
+        [[m, "До начала работ", ""] for m in WORK_ORDER_PREP_MEASURES],
+    )
+
+    _p()
+    _p("3. В процессе производства работ необходимо выполнить следующие мероприятия:", bold=True)
+    _grid(["Наименование мероприятия", "Срок выполнения", "Ответственный исполнитель"],
+          [["", "", ""] for _ in range(3)])
+
+    _p()
+    _p("4. Особые условия проведения работ:", bold=True)
+    _grid(["Наименование условий", "Срок выполнения", "Ответственный исполнитель"],
+          [["", "", ""] for _ in range(2)])
+
+    _p()
+    _p("Отдельные указания: _______________________________________________")
+    _p(f"Наряд выдал: ______________ (дата, время)   Подпись: ____________ / {WORK_ORDER_ISSUER_NAME}")
+    _p("Наряд продлил: ____________ (дата, время)   Подпись: ____________ / ____________")
+
+    _p()
+    _p("5. Разрешение на подготовку рабочих мест и на допуск к выполнению работ:", bold=True)
+    _grid(["Разрешение на подготовку и допуск получил", "Дата, время", "Подпись"], [["", "", ""]])
+    _p("Рабочие места подготовлены. Ответственный руководитель работ: ____________ / " + sup_name)
+
+    _p()
+    _p("6. Ежедневный допуск к работе и время её окончания:", bold=True)
+    day_rows = []
+    try:
+        d = work_order.valid_from
+        while d <= work_order.valid_to:
+            day_rows.append([d.strftime("%d.%m.%Y"), "", ""])
+            d = d + timedelta(days=1)
+    except Exception:
+        pass
+    if not day_rows:
+        day_rows = [["", "", ""]]
+    _grid(
+        ["Дата", "Бригада получила целевой инструктаж и допущена (дата, время, подпись)",
+         "Работа закончена, бригада удалена (дата, время, подпись)"],
+        day_rows,
+    )
+
+    _p()
+    _p("7. Изменения в составе бригады:", bold=True)
+    _grid(["Введён в состав (ФИО)", "Выведен из состава (ФИО)", "Дата, время", "Разрешил (ФИО, подпись)"],
+          [["", "", "", ""] for _ in range(3)])
+
+    _p()
+    _p("8. Регистрация целевого инструктажа при первичном допуске:", bold=True)
+    _p("Инструктаж провёл: ____________ / " + sup_name)
+    _p("Инструктаж прошёл: ____________ / ____________")
+    _p("Лицо, выдавшее наряд: ____________ / " + WORK_ORDER_ISSUER_NAME)
+    _p("Ответственный руководитель работ: ____________ / " + sup_name)
+    _p("Ответственный исполнитель: ____________ / " + ex_name)
+
+    _p()
+    _p("9. Письменное разрешение (акт-допуск) действующего предприятия на производство работ "
+       "имеется. Мероприятия по безопасности согласованы:", bold=True)
+    _p("__________________________________________ (должность, ФИО, подпись)")
+
+    _p()
+    _p("10. Рабочее место и условия труда проверены. Мероприятия по безопасности выполнены. "
+       "Разрешаю приступить к выполнению работ:", bold=True)
+    _p("_______________________ (дата, подпись) ____________________ (ФИО)")
+    _p("Наряд-допуск продлён до: ______________ (дата, подпись) ____________ (ФИО)")
+
+    _p()
+    _p("11. Работа выполнена в полном объёме. Материалы, инструмент, приспособления убраны. "
+       "Члены бригады выведены.", bold=True)
+    _p("Ответственный исполнитель (производитель) работ: ____________ (дата, подпись)")
+    _p("Наряд-допуск закрыт.")
+    _p("Ответственный руководитель работ: ____________ (дата, подпись)     "
+       "Лицо, выдавшее наряд-допуск: ____________ (дата, подпись)")
+
+    filename = f"work_order_{work_order.number or 'draft'}.docx".replace("/", "-").replace(" ", "_")
+    path = os.path.join(output_dir, filename)
+    doc.save(path)
+    return path, problems
