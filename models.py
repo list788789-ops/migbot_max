@@ -212,6 +212,16 @@ class Employee(Base):
     #   ALTER TABLE employees ADD COLUMN subdivision VARCHAR;
     position: Mapped[str | None] = mapped_column(String, nullable=True)
     subdivision: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Группа допуска по безопасности работ на высоте — для графы "Должность (разряд)"
+    # в наряде-допуске на высотные работы (приложение №2 к Приказу Минтруда №903н).
+    # server_default проставляет "2-я гр..." всем существующим и новым (у всех она
+    # одна) — менять вручную только тем, у кого другая. Заводится ALTER:
+    #   ALTER TABLE employees ADD COLUMN height_safety_group VARCHAR
+    #     DEFAULT '2-я гр. по безопасности работ на высоте';
+    height_safety_group: Mapped[str | None] = mapped_column(
+        String, nullable=True,
+        server_default="2-я гр. по безопасности работ на высоте",
+    )
     address: Mapped[str | None] = mapped_column(Text, nullable=True)
     entry_country: Mapped[str | None] = mapped_column(String, nullable=True)  # "откуда въехал"
     # Свободный текст, не дата: в таблице это либо дата+заметка ("25.07.2026 Хостел"), либо пусто.
@@ -712,6 +722,17 @@ class User(Base):
     # таблицы):
     #   ALTER TABLE users ADD COLUMN max_user_id VARCHAR UNIQUE;
     max_user_id: Mapped[str | None] = mapped_column(String, nullable=True, unique=True)
+
+    # chat_id личного диалога с ботом в MAX (2026-07). Отдельно от max_user_id:
+    # user_id идентифицирует человека, а для ПРОАКТИВНОЙ отправки личного сообщения
+    # (bot.send_message(chat_id=...)) нужен именно chat_id диалога. Заполняется
+    # автоматически при ЛЮБОМ действии пользователя в боте (см. bot.py, обновление
+    # в точке определения роли) — не только при /login. Нужен, чтобы слать админам
+    # уведомления о новых заявках на регистрацию. NULL = ещё ни разу не писал боту
+    # после введения этого поля. НЕ unique: у разных диалогов chat_id разные, но
+    # ограничение уникальности тут не нужно и мешало бы.
+    #   ALTER TABLE users ADD COLUMN max_chat_id VARCHAR;
+    max_chat_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
     # Код подтверждения привязки MAX при регистрации ЧЕРЕЗ ВЕБ (2026-07). Веб не
     # знает MAX-аккаунт человека напрямую — форма показывает код, человек шлёт его
