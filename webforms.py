@@ -445,7 +445,7 @@ fieldset legend{{font-size:12px;color:var(--accent-ink);text-transform:uppercase
 </style></head><body>
 <header class="org">
 <div class="org-name">{org_name}</div>
-<div class="page-title">Автоматизированная система — {title}</div>
+<div class="page-title">Автоматизированная система учёта на производстве — {title}</div>
 </header>
 """
 PAGE_FOOT = """
@@ -502,7 +502,7 @@ LOGIN_HEAD = """<!doctype html>
 body.login-page{margin:0;min-height:100dvh;display:flex;flex-direction:column;justify-content:flex-start;align-items:center;background:url('/login-bg.svg') no-repeat center bottom / cover, #fff;font-family:var(--sans);color:var(--ink)}
 .auth{width:100%;max-width:440px;margin:0 auto;padding:56px 24px 40px}
 .auth-row{background:#fff;border:1px solid #e6e9ee;border-radius:16px;padding:14px;box-shadow:0 6px 24px rgba(20,24,30,.10);display:flex;gap:10px;flex-wrap:wrap;align-items:stretch}
-.auth h1{font-family:var(--serif);font-weight:700;letter-spacing:-.02em;font-size:clamp(2.25rem,6vw,3.25rem);line-height:1.03;margin:0 0 .3em}
+.auth h1{font-family:var(--serif);font-weight:700;letter-spacing:-.02em;font-size:clamp(1.5rem,5.5vw,2.25rem);line-height:1.15;margin:0 0 .3em}
 .auth .subtitle{font-family:var(--serif);font-weight:400;color:var(--sub);font-size:clamp(1.125rem,2.5vw,1.375rem);margin:0 0 1.75rem}
 .auth input{flex:1 1 45%;min-width:130px;font-family:var(--sans);font-size:16px;padding:14px 16px;border:1px solid #b8c0cc;border-radius:12px;background:#fff;margin:0}
 .auth input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px #4a90e222}
@@ -523,7 +523,7 @@ body.login-page{margin:0;min-height:100dvh;display:flex;flex-direction:column;ju
 def login_form():
     return LOGIN_HEAD + """
 <form class="auth" method="post" action="/login" autocomplete="on">
-<h1>Автоматизированная система</h1>
+<h1>Автоматизированная система учёта на производстве</h1>
 <p class="subtitle">Вход по номеру телефона</p>
 <div class="auth-row">
 <input type="text" name="phone" placeholder="Телефон" autocomplete="username" required>
@@ -539,7 +539,7 @@ def _login_error(msg: str, code: int = 401):
     return HTMLResponse(
         LOGIN_HEAD + f"""
 <div class="auth">
-<h1>Автоматизированная система</h1>
+<h1>Автоматизированная система учёта на производстве</h1>
 <p class="err">{msg}</p>
 <a class="btn" href="/login">← Назад</a>
 </div>
@@ -1008,7 +1008,7 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
 {f'''<div class="warning-banner" style="background:#fdecec;border-left-color:#c0392b;color:#7a1f1f">
 🚨 СРОЧНО: явка без действующего договора у {len(invalid_contract_marks)} чел. — проверьте ниже.
 </div>''' if invalid_contract_marks else ""}
-<p class="muted" style="margin:0 0 10px">Рабочее место: Автоматизированная система.
+<p class="muted" style="margin:0 0 10px">Рабочее место: Автоматизированная система учёта на производстве.
 Вы вошли как {html.escape(_current_user_obj.full_name if _current_user_obj else "?")},
 роль: {role or "—"}.</p>
 <h1>Задачи</h1>
