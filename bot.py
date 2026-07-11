@@ -77,7 +77,10 @@ from models import (
 from obligations import create_obligations_for_employee
 import tabel
 import reports as reports_data
-from auth_binding import bind_max_account, find_user_by_max_id, get_role_label
+from auth_binding import (
+    bind_max_account, find_user_by_max_id, get_role_label,
+    confirm_max_code, register_via_max,
+)
 from common_utils import category_for_citizenship
 from consent_texts import get_consent_text  # см. consent_texts.py
 from s3_storage import (
@@ -581,6 +584,36 @@ async def on_login_start(event: MessageCreated):
         "Введите номер телефона, под которым вас зарегистрировал кадровик "
         "(тот же, что при подаче заявки на веб-форме)."
     )
+
+
+@dp.message_created(F.message.body.text.startswith("/confirm"))
+async def on_confirm_code(event: MessageCreated):
+    """Привязка MAX по коду с веб-регистрации — см. auth_binding.confirm_max_code."""
+    user_id = event.message.sender.user_id
+    parts = event.message.body.text.strip().split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await event.message.answer("Формат: /confirm 123456 (код с сайта после регистрации).")
+        return
+    code = parts[1].strip()
+    with Session(engine) as session:
+        ok, text = confirm_max_code(session, code, user_id)
+    await event.message.answer(text)
+
+
+@dp.message_created(F.message.body.text == "/register")
+async def on_register_start(event: MessageCreated):
+    """Регистрация с нуля прямо в боте, без веба — см. auth_binding.register_via_max."""
+    user_id = event.message.sender.user_id
+    with Session(engine) as session:
+        existing = find_user_by_max_id(session, user_id)
+        if existing is not None:
+            await event.message.answer(
+                f"Этот MAX-аккаунт уже привязан к {existing.full_name} "
+                f"({get_role_label(existing)}). Обратитесь к админу, если это ошибка."
+            )
+            return
+    _pending_forms[user_id] = {"state": "awaiting_register_name"}
+    await event.message.answer("Регистрация. Введите ваше ФИО полностью:")
 
 
 async def _deliver_document_list(responder: "_Responder", employee_id: str) -> None:
@@ -1519,6 +1552,28 @@ async def on_text(event: MessageCreated):
         _pending_forms.pop(user_id, None)
         with Session(engine) as session:
             ok, text = bind_max_account(session, phone, user_id)
+        await event.message.answer(text)
+        return
+
+    if form and form.get("state") == "awaiting_register_name":
+        name = event.message.body.text.strip()
+        parts = name.split()
+        if len(parts) < 2 or not all(all(ch.isalpha() or ch == "-" for ch in p) for p in parts):
+            await event.message.answer(
+                "⚠️ Похоже, это не ФИО. Введите минимум 2 слова кириллицей "
+                "(Фамилия Имя), например: Иванов Пётр."
+            )
+            return  # состояние остаётся, ждём корректный ввод
+        _pending_forms[user_id] = {"state": "awaiting_register_phone", "full_name": name}
+        await event.message.answer("Теперь введите номер телефона:")
+        return
+
+    if form and form.get("state") == "awaiting_register_phone":
+        phone = event.message.body.text.strip()
+        full_name = form["full_name"]
+        _pending_forms.pop(user_id, None)
+        with Session(engine) as session:
+            ok, text = register_via_max(session, full_name, phone, user_id)
         await event.message.answer(text)
         return
 
