@@ -704,9 +704,13 @@ def generate_instruction_journal_xlsx(
 
     page_break_rows: list[int] = []
 
-    def _write_cover(r: int) -> int:
-        """Блок обложки (только лист 1): название журнала, организация, Начат/Окончен,
-        затем пустая строка-разделитель. Возвращает следующую свободную строку."""
+    def _write_cover(r: int, page_no: int) -> int:
+        """Блок обложки (ТОЛЬКО лист 1): название журнала, организация, строка
+        Начат/Окончен/Количество листов/Лист, затем пустая строка-разделитель.
+        "Количество листов" — пусто (общее число листов журнала неизвестно, пока
+        журнал открыт; заполняется от руки при сшивке). "Лист" — сквозной номер
+        листа (на листе 1 это 1). На листах 2+ Начат/Окончен НЕ повторяются —
+        там только компактная строка "Лист N" (см. _write_sheet_label)."""
         ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=NCOLS)
         c = ws.cell(row=r, column=1, value=f"ЖУРНАЛ РЕГИСТРАЦИИ ИНСТРУКТАЖА ({label.upper()})")
         c.font = Font(name="Times New Roman", size=14, bold=True)
@@ -719,7 +723,7 @@ def generate_instruction_journal_xlsx(
         started_str = started_at.strftime("%d.%m.%Y") if started_at else "—"
         cover = [
             ("Начат", started_str), ("Окончен", "—"),
-            ("Количество листов", str(total_sheets)), ("Лист", str(sheet_number)),
+            ("Количество листов", ""), ("Лист", str(page_no)),
         ]
         col = 1
         for lbl, val in cover:
@@ -729,6 +733,15 @@ def generate_instruction_journal_xlsx(
         _xl_cell(ws, r + 2, 9, "", small=True)
         _xl_cell(ws, r + 2, 10, "", small=True)
         return r + 4  # r, r+1, r+2 заняты + r+3 пустой разделитель → следующая r+4
+
+    def _write_sheet_label(r: int, page_no: int) -> int:
+        """Компактная строка "Лист N" для листов 2+ (без Начат/Окончен — они только
+        на листе 1). Справа над таблицей. Возвращает следующую строку."""
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=NCOLS)
+        c = ws.cell(row=r, column=1, value=f"Лист {page_no}")
+        c.font = _XL_FONT_BOLD
+        c.alignment = Alignment(horizontal="right", vertical="center")
+        return r + 1
 
     def _write_table_header(r: int) -> int:
         """Двухуровневая шапка таблицы (2 строки). Вставляется на КАЖДОМ листе.
@@ -796,9 +809,10 @@ def generate_instruction_journal_xlsx(
     while idx < n or page_num == 0:
         page_num += 1
         if page_num == 1:
-            row = _write_cover(row)
+            row = _write_cover(row, page_num)  # обложка + "Лист 1" в её ячейке
             capacity = ROWS_FIRST_PAGE
         else:
+            row = _write_sheet_label(row, page_num)  # компактная "Лист N", без обложки
             capacity = ROWS_OTHER_PAGES
         row = _write_table_header(row)
         pos_on_page = 0
