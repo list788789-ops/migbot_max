@@ -1657,15 +1657,26 @@ def instructions_page(request: Request, db: Session = Depends(get_db)):
 {journal_rows}
 </section>
 
-{f'''<section>
+<section>
 <h2>Вводный инструктаж — автозаполнение</h2>
 <p class="muted">Сотрудников без вводного инструктажа: {need_intro}. Заводит запись каждому
 датой начала работы (дата договора, а если её нет — дата въезда) — не сегодняшним числом,
 чтобы порядок строк в журнале при печати совпадал с реальной хронологией приёма.</p>
 <form method="post" action="/production/instructions/auto-introductory">
-<button type="submit">Заполнить вводный всем ({need_intro})</button>
+<button type="submit"{" disabled" if not need_intro else ""}>Заполнить вводный всем ({need_intro})</button>
 </form>
-</section>''' if need_intro else ''}
+</section>
+
+<section>
+<h2>⚠️ ВРЕМЕННО (тест)</h2>
+<p class="muted">Очищает ВСЕ записи инструктажей всех видов — вводный, на рабочем месте,
+повторный, внеплановый, целевой. Только для проверки автозаполнения/допечатки с чистого
+листа. Удалить эту кнопку и функцию production.test_clear_all_instructions после теста.</p>
+<form method="post" action="/production/instructions/test-clear"
+onsubmit="return confirm('Удалить ВСЕ записи инструктажей без возможности отмены?')">
+<button type="submit" class="secondary">🧪 Очистить инструктажи (тест)</button>
+</form>
+</section>
 
 <section>
 <h2>Провести инструктаж (по одному)</h2>
@@ -1690,6 +1701,18 @@ def instruction_auto_introductory(request: Request, db: Session = Depends(get_db
         return RedirectResponse("/login", status_code=303)
     actor = _actor_name(request, db)
     prod.auto_create_introductory_instructions(db, actor)
+    return RedirectResponse("/production/instructions", status_code=303)
+
+
+@app.post("/production/instructions/test-clear")
+def instruction_test_clear(request: Request, db: Session = Depends(get_db)):
+    """ВРЕМЕННО (тест) — удаляет ВСЕ записи инструктажей, чтобы проверить
+    автозаполнение/допечатку с чистого листа. УДАЛИТЬ этот роут вместе с
+    production.test_clear_all_instructions и кнопкой в instructions_page,
+    когда тестирование закончится."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    prod.test_clear_all_instructions(db)
     return RedirectResponse("/production/instructions", status_code=303)
 
 
