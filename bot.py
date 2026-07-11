@@ -375,6 +375,14 @@ async def _deliver_picker(
     if only_if_open and key not in _open_pickers:
         return
 
+    # Если для этого пользователя список этого типа УЖЕ открыт — редактируем его
+    # на месте, даже если вызвано открытие из меню (edit=False). Иначе повторное
+    # нажатие «Утро (явка)»/«Вечер» плодит новый список поверх старого (дубли на
+    # экране — см. отчёт с двумя наборами кнопок). edit-ветка ниже сама откатится
+    # на отправку нового, если старое сообщение уже устарело/удалено.
+    if key in _open_pickers:
+        edit = True
+
     with Session(engine) as session:
         employees = _picker_employees(session, prefix)
 
