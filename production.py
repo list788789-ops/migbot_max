@@ -29,6 +29,7 @@ from models import (
     InstructionType,
     InternalOrder,
     OrderCategory,
+    Titul,
     WorkOrder,
     WorkOrderDailyAdmission,
     WorkOrderMember,
@@ -104,6 +105,52 @@ def delete_brigade(session: Session, brigade_id: str) -> bool:
     # (если он есть, лишним не будет; если нет — не остаётся сирот BrigadeMember).
     session.query(BrigadeMember).filter_by(brigade_id=brigade_id).delete()
     session.delete(brigade)
+    session.commit()
+    return True
+
+
+# ================= Титулы (объекты работ) =================
+# Плоский справочник для поля «Место выполнения работ» наряда-допуска. По образцу
+# бригад: своя сущность + страница ведения (/production/tituly), в наряде select
+# наполняет WorkOrder.location. Сам титул на наряде НЕ хранится — location остаётся
+# строкой, поэтому разовый объект не из справочника можно вписать вручную.
+# code — шифр (15.21), name — наименование (Лаборатория).
+
+def create_titul(session: Session, code: str, name: str) -> Titul:
+    titul = Titul(code=code.strip(), name=name.strip())
+    session.add(titul)
+    session.commit()
+    return titul
+
+
+def get_tituly(session: Session) -> list[Titul]:
+    return (
+        session.query(Titul)
+        .order_by(Titul.code)
+        .all()
+    )
+
+
+def update_titul(session: Session, titul_id: str, code: str, name: str) -> bool:
+    """Пустое/пробельное значение игнорируется — прежнее не обнуляется (как в
+    update_brigade)."""
+    titul = session.get(Titul, titul_id)
+    if titul is None:
+        return False
+    if code and code.strip():
+        titul.code = code.strip()
+    if name and name.strip():
+        titul.name = name.strip()
+    session.add(titul)
+    session.commit()
+    return True
+
+
+def delete_titul(session: Session, titul_id: str) -> bool:
+    titul = session.get(Titul, titul_id)
+    if titul is None:
+        return False
+    session.delete(titul)
     session.commit()
     return True
 
