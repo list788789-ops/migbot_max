@@ -533,7 +533,7 @@ async def on_bot_started(event):
     await bot.send_message(
         chat_id=event.chat_id,
         text=(
-            "Бот миграционного учёта.\n"
+            "Автоматизированная система учёта персонала и миграционного контроля.\n"
             "Выберите действие или используйте команды: /medical_exam_result <id> <done|failed>, "
             "/set_entry_date <id> <ГГГГ-ММ-ДД>, /send_consent_doc <id>, /send_medical_referral <id>.\n\n"
             "Напоминания о горящих дедлайнах будут приходить в этот чат."
@@ -546,8 +546,11 @@ async def on_bot_started(event):
 async def on_start(event: MessageCreated):
     with Session(engine) as session:
         role = _role_for_max_id(session, event.message.sender.user_id)
+    text = "Автоматизированная система. Выберите действие:"
+    if role:
+        text = f"Рабочее место: Автоматизированная система. Роль: {role}.\nВыберите действие:"
     await event.message.answer(
-        text="Бот миграционного учёта запущен. Выберите действие:",
+        text=text,
         attachments=[_build_main_menu(role).as_markup()],
     )
 
@@ -1926,6 +1929,22 @@ async def morning_job():
             )
         except Exception:
             log.exception("morning_job: не удалось отправить количество активных в chat_id=%s", chat_id)
+
+    # 0.5. Подсказка по командам бота — напоминание раз в день, не нужно листать
+    # старую переписку в поисках, как что называется.
+    commands_hint = (
+        "ℹ️ Команды бота:\n"
+        "/login — привязать этот MAX к своей учётной записи (если уже зарегистрированы)\n"
+        "/register — зарегистрироваться с нуля прямо здесь, если аккаунта ещё нет\n"
+        "/confirm <код> — привязать MAX по коду, полученному при регистрации на сайте\n\n"
+        "Разметка явки (Утро/Вечер), отчёты и остальное — через меню, кнопки появятся "
+        "после /login или /register."
+    )
+    for chat_id in chat_ids:
+        try:
+            await bot.send_message(chat_id=chat_id, text=commands_hint)
+        except Exception:
+            log.exception("morning_job: не удалось отправить подсказку команд в chat_id=%s", chat_id)
 
     # 1. Месячные проблемные.
     if monthly_problems:
