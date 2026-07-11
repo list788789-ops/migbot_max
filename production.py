@@ -77,10 +77,31 @@ def update_brigade_members(session: Session, brigade_id: str, member_employee_id
     return True
 
 
+def update_brigade(session: Session, brigade_id: str, name: str,
+                   member_employee_ids: list[str]) -> bool:
+    """Переименование + замена состава одной операцией (одна форма редактирования
+    в вебе). Пустое/пробельное имя игнорируется — остаётся прежнее, чтобы случайно
+    не обнулить название."""
+    brigade = session.get(Brigade, brigade_id)
+    if brigade is None:
+        return False
+    if name and name.strip():
+        brigade.name = name.strip()
+    session.query(BrigadeMember).filter_by(brigade_id=brigade_id).delete()
+    for employee_id in member_employee_ids:
+        session.add(BrigadeMember(brigade_id=brigade_id, employee_id=employee_id))
+    session.add(brigade)
+    session.commit()
+    return True
+
+
 def delete_brigade(session: Session, brigade_id: str) -> bool:
     brigade = session.get(Brigade, brigade_id)
     if brigade is None:
         return False
+    # Явно удаляем членов перед бригадой — не полагаемся на каскад в модели
+    # (если он есть, лишним не будет; если нет — не остаётся сирот BrigadeMember).
+    session.query(BrigadeMember).filter_by(brigade_id=brigade_id).delete()
     session.delete(brigade)
     session.commit()
     return True
