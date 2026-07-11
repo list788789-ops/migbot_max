@@ -76,6 +76,7 @@ from models import (
 )
 from obligations import create_obligations_for_employee
 import tabel
+import reports as reports_data
 from auth_binding import bind_max_account, find_user_by_max_id, get_role_label
 from common_utils import category_for_citizenship
 from consent_texts import get_consent_text  # см. consent_texts.py
@@ -228,7 +229,10 @@ def _build_section_menu(section: str, role: str | None = None) -> InlineKeyboard
                                         payload="menu:pending_rotation"))
     elif section == "reports":
         builder.row(CallbackButton(text="📅 Табель за сегодня", payload="menu:tabel_today"))
-        builder.row(CallbackButton(text="◀ Прочее в разработке", payload="menu:main"))
+        builder.row(CallbackButton(text="🐛 Журнал патчей", payload="menu:report_changelog"))
+        builder.row(CallbackButton(text="📊 Проблемные за месяц", payload="menu:report_monthly_problems"))
+        builder.row(CallbackButton(text="📋 Обязательства", payload="menu:report_obligations"))
+        builder.row(CallbackButton(text="🕵️ Активность в табеле", payload="menu:report_activity"))
     builder.row(CallbackButton(text="⬅️ Назад", payload="menu:main"))
     return builder
 
@@ -1047,6 +1051,69 @@ async def on_callback(event: MessageCallback):
             lines.append("\nОтсутствуют/особое:")
             for name, code in s["absent_list"]:
                 lines.append(f"  • {name} — {code}")
+        await responder.send("\n".join(lines))
+        return
+
+    if payload == "menu:report_changelog":
+        # Урезанно: только заголовки и счётчик, без «было/исправлено» построчно —
+        # полный текст в веб-отчёте (/reports/changelog).
+        n_tabel = len(reports_data.CHANGELOG_TABEL)
+        n_migbot = len(reports_data.CHANGELOG_MIGBOT)
+        lines = [f"🐛 Журнал патчей: {n_tabel + n_migbot} находок ({n_tabel} ТабельБелокаменка, "
+                 f"{n_migbot} слияние с миграционным учётом).\n"]
+        for h, _problem, _fix in reports_data.CHANGELOG_TABEL + reports_data.CHANGELOG_MIGBOT:
+            lines.append(f"  • {h}")
+        lines.append("\nПолный текст (было/исправлено по каждому) — в веб-версии, раздел «Отчёты».")
+        await responder.send("\n".join(lines))
+        return
+
+    if payload == "menu:report_monthly_problems":
+        with Session(engine) as session:
+            data = reports_data.get_monthly_problems_report(session)
+        if not data["problems"]:
+            await responder.send(f"📊 Проблемные за {data['month_label']}: никто не превысил пороги.")
+            return
+        lines = [f"📊 Проблемные за {data['month_label']} ({len(data['problems'])}):"]
+        for p in data["problems"]:
+            parts = []
+            if p["absent_count"] >= data["absent_threshold"]:
+                parts.append(f"неявок {p['absent_count']}")
+            if p["weekend_count"] >= data["weekend_threshold"]:
+                parts.append(f"выходных {p['weekend_count']}")
+            lines.append(f"  • {p['name']} — {', '.join(parts)}")
+        await responder.send("\n".join(lines))
+        return
+
+    if payload == "menu:report_obligations":
+        # Урезанно: только сводка по типам/статусам, без детального списка
+        # просроченных с карточками — тот список в веб-версии.
+        with Session(engine) as session:
+            data = reports_data.get_obligations_report(session)
+        if not data["counts"]:
+            await responder.send("📋 Обязательства: нет данных по активным сотрудникам.")
+            return
+        lines = ["📋 Обязательства по активным сотрудникам:"]
+        for (type_val, status_val), count in sorted(data["counts"].items()):
+            lines.append(f"  • {type_val} — {status_val}: {count}")
+        n_overdue = len(data["overdue_details"])
+        if n_overdue:
+            lines.append(f"\n🚨 Просрочено: {n_overdue}. Детали (кто, дедлайн, карточка) — в веб-версии.")
+        await responder.send("\n".join(lines))
+        return
+
+    if payload == "menu:report_activity":
+        # Урезанно: топ-5 по количеству отметок, без полного списка.
+        with Session(engine) as session:
+            data = reports_data.get_activity_report(session)
+        if not data["actors"]:
+            await responder.send("🕵️ Активность: за месяц отметок ещё не было.")
+            return
+        lines = [f"🕵️ Активность за {data['month_start'].strftime('%B %Y')} "
+                 f"(всего {data['total']} отметок), топ-5:"]
+        for a in data["actors"][:5]:
+            lines.append(f"  • {a['label']} — {a['count']}")
+        if len(data["actors"]) > 5:
+            lines.append(f"\n...и ещё {len(data['actors']) - 5}. Полный список — в веб-версии.")
         await responder.send("\n".join(lines))
         return
 
