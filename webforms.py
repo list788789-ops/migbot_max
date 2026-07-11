@@ -64,6 +64,7 @@ from models import (
     User,
     UserRole,
     UserStatus,
+    AttendanceMark,
     Category,
     Consent,
     ConsentMethod,
@@ -80,6 +81,7 @@ from models import (
     SystemFlag,
 )
 from obligations import create_obligations_for_employee
+from auth_binding import get_role_label, find_user_by_max_id
 import tabel
 from deadlines import lead_days_for
 from document_templates import (
@@ -1264,72 +1266,12 @@ def tabel_mark(
 
 
 # --- Отчёты (2026-07) --------------------------------------------------------
-# Расширяемая подсистема: REPORTS_REGISTRY — список карточек-ссылок на
-# /reports, каждая своим маршрутом ниже. Первый отчёт — журнал найденных
-# багов/патчей за время разработки (статический, не из БД — это история
-# самой разработки, не бизнес-данные). Следующие отчёты добавляются так же:
-# новая запись в REPORTS_REGISTRY + новый @app.get маршрут.
+# Данные — в reports.py (общие с ботом, см. bot.py "📊 Отчёты"). Здесь только
+# HTML-рендер. Чтобы добавить отчёт: новая запись в reports.REPORTS_REGISTRY +
+# функция данных в reports.py + маршрут здесь (полный HTML) + опционально
+# урезанный текстовый рендер в bot.py.
 
-REPORTS_REGISTRY = [
-    ("changelog", "/reports/changelog", "🐛 Журнал ошибок и патчей",
-     "Все найденные баги и внесённые исправления за время разработки табеля/миграционного учёта."),
-]
-
-# Журнал патчей — по категориям, в порядке обнаружения. Формат записи:
-# (заголовок, что было не так, как исправлено).
-_CHANGELOG_TABEL = [
-    ("Синтаксис при вставке через телефон",
-     "Докстринг в sheets.py ломался при копировании текста на телефоне (смарт-кавычки/тире вместо прямых) — файл не запускался вообще.",
-     "Заливать файл как файл (Upload files на GitHub), не вставлять текст в веб-редактор."),
-    ("Нечёткое сопоставление ФИО при дублях",
-     "Один и тот же человек мог попасть в базу дважды при разном написании отчества.",
-     "find_fuzzy_matches — сравнение по Фамилия+Имя, отчество не мешает совпадению."),
-    ("Квота Google Sheets API",
-     "До 14 запросов на одного сотрудника при массовой загрузке — упирались в лимит 60/мин.",
-     "Батчинг: 2 запроса на сотрудника вместо 14 (кэш метаданных + один batchUpdate)."),
-    ("day_summary не считал МУ",
-     "Отчёт «Табель за сегодня» вообще не показывал строку миграционного учёта — код МУ проваливался мимо всех веток подсчёта.",
-     "Добавлена ветка МУ в day_summary + строка «📋 Мигр.учёт» в шаблон отчёта."),
-    ("Дата межвахты принималась любая",
-     "Можно было ввести сегодняшнюю или прошедшую дату как «дату возврата» — не имеет смысла.",
-     "Валидация: дата возврата обязана быть в будущем, иначе просит ввести заново."),
-    ("Путаница дата отъезда / дата возврата",
-     "Прораб путал, какую именно дату вводит при постановке МЖ.",
-     "Текст промпта явно: «дата ВОЗВРАТА, не отъезда»."),
-    ("5 пикеров плодили новый список вместо обновления",
-     "menu:docpick, menu:incomplete, menu:contractdate, menu:pending_consent, menu:delete_employee — все звали _deliver_picker без edit=True, «Назад к списку» создавал дубль сообщения.",
-     "edit=True добавлен во все 5 мест — список редактируется на месте."),
-    ("Отчёт «Список сотрудников» кэшировался",
-     "Файл всегда сохранялся под одним и тем же именем employees.xlsx — риск показа старой версии.",
-     "Имя файла с меткой времени (employees_ГГГГММДД_ЧЧММСС.xlsx) на каждый запрос."),
-]
-
-_CHANGELOG_MIGBOT = [
-    ("Категория гражданства: английский vs русский",
-     "bot.py сравнивал citizenship.lower()==\"belarus\" (английское слово), а webforms.py — с русским «Беларусь». Через бота Белоруссию никогда бы не распознали → неверный срок постановки на учёт (30 дней вместо 90).",
-     "Вынесено в common_utils.py, единая функция category_for_citizenship для обоих сервисов."),
-    ("Нормализация телефона задублирована",
-     "webforms.py и auth_binding.py имели свои копии _normalize_phone — риск рассинхрона при правке одного места.",
-     "Вынесено в common_utils.py, оба места импортируют оттуда."),
-    ("DetachedInstanceError после commit",
-     "В 4+ местах bot.py обращение к employee.full_name происходило ПОСЛЕ session.commit() и закрытия сессии — SQLAlchemy инвалидирует атрибуты после коммита.",
-     "Имя сотрудника забирается строкой ДО commit, используется вместо повторного обращения к ORM-объекту."),
-    ("Обработчик reasoncode:force был недостижим",
-     "Порядок проверок: общий if payload.startswith(\"reasoncode:\") перехватывал и force-вариант раньше, чем до него доходила очередь — кнопка «Всё равно МУ» не работала.",
-     "Проверка :force вынесена и проверяется первой, до общего обработчика."),
-    ("Ложные срабатывания «явка без договора»",
-     "Проверка помечала ЛЮБУЮ явку у уволенного — включая дни ДО увольнения, что нормально (последний рабочий день).",
-     "Помечается только явка ПОСЛЕ даты увольнения / ДО даты начала договора — реальное нарушение, не рутинный факт."),
-    ("Уволенные видны в /employees веба",
-     "Отдельный /archive для уволенных уже существовал, но /employees их не исключал — сотрудник виден сразу в обоих местах.",
-     "Добавлен фильтр contract_end_date IS NULL в /employees, как и в отчёте бота."),
-    ("«Осиротевшие» межвахты после переноса истории",
-     "Разовый скрипт переноса истории из Google Sheets копировал код «МЖ», но не создавал запись в rotation_returns (та создаётся только через tabel.set_rotation) — 5 человек стояли на межвахте без даты возврата и не появлялись ни в напоминаниях, ни во флагах кадровику.",
-     "Разовый скрипт-заглушка создал записи с expected_return_date=NULL; добавлен постоянный флоу уточнения (кадровику — задача в вебе, прорабу — напоминание с кнопкой в боте)."),
-    ("Рассылка могла раскрыть кадровику-only данные прорабу",
-     "NotificationSubscriber.chat_id не связан с ролью пользователя — проактивная рассылка ушла бы всем подписавшимся, включая прораба, которому детали обязательств видеть не должны.",
-     "Для чувствительных данных (явка без договора) оставлен только пассивный пункт меню с проверкой роли; для нейтральных (межвахта, никогда не отмеченные — это работа самого прораба) рассылка оставлена как есть."),
-]
+import reports as reports_data
 
 
 @app.get("/reports", response_class=HTMLResponse)
@@ -1340,7 +1282,7 @@ def reports_page(request: Request):
         f'<div class="card"><h3 style="margin:0 0 6px">{title}</h3>'
         f'<p class="muted" style="margin:0 0 10px">{desc}</p>'
         f'<a class="btn" href="{href}">Открыть</a></div>'
-        for _key, href, title, desc in REPORTS_REGISTRY
+        for _key, href, title, desc in reports_data.REPORTS_REGISTRY
     )
     body = f"""
 <h1>Отчёты</h1>
@@ -1367,11 +1309,90 @@ def report_changelog(request: Request):
 <h1>🐛 Журнал ошибок и патчей</h1>
 <p class="muted">Собрано по ходу разработки табеля (ТабельБелокаменка) и слияния с ботом
 миграционного учёта. Не автоматический отчёт — фиксирует находки вручную по мере работы.</p>
-{section(f"ТабельБелокаменка ({len(_CHANGELOG_TABEL)})", _CHANGELOG_TABEL)}
-{section(f"Слияние с миграционным учётом ({len(_CHANGELOG_MIGBOT)})", _CHANGELOG_MIGBOT)}
+{section(f"ТабельБелокаменка ({len(reports_data.CHANGELOG_TABEL)})", reports_data.CHANGELOG_TABEL)}
+{section(f"Слияние с миграционным учётом ({len(reports_data.CHANGELOG_MIGBOT)})", reports_data.CHANGELOG_MIGBOT)}
 <p><a class="btn secondary" href="/reports">← Все отчёты</a></p>
 """
     return _render("Журнал патчей", body, active="reports", role=request.session.get("role", ""))
+
+
+@app.get("/reports/monthly-problems", response_class=HTMLResponse)
+def report_monthly_problems(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    data = reports_data.get_monthly_problems_report(db)
+    rows = "".join(
+        f'<div class="card">{p["name"]}<br>'
+        + (f'<span class="badge red" style="margin-right:6px">неявок: {p["absent_count"]}</span>'
+           if p["absent_count"] >= data["absent_threshold"] else "")
+        + (f'<span class="badge orange">выходных: {p["weekend_count"]}</span>'
+           if p["weekend_count"] >= data["weekend_threshold"] else "")
+        + '</div>'
+        for p in data["problems"]
+    )
+    body = f"""
+<h1>📊 Проблемные за месяц</h1>
+<p class="muted">{data["month_label"]} — пороги: неявки от {data["absent_threshold"]},
+выходные от {data["weekend_threshold"]}. Учитываются только активные сотрудники (действующий договор).</p>
+<section class="grid">
+<h2>Всего: {len(data["problems"])}</h2>
+{rows or '<p class="muted">Никто не превысил пороги.</p>'}
+</section>
+<p><a class="btn secondary" href="/reports">← Все отчёты</a></p>
+"""
+    return _render("Проблемные за месяц", body, active="reports", role=request.session.get("role", ""))
+
+
+@app.get("/reports/obligations", response_class=HTMLResponse)
+def report_obligations(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    data = reports_data.get_obligations_report(db)
+    summary_rows = "".join(
+        f'<div class="card" style="display:flex;justify-content:space-between;align-items:center">'
+        f'<span>{OBLIGATION_LABELS.get(_t, _t)} — {_s}</span>'
+        f'<span class="badge {"red" if _s == "overdue" else ("green" if _s == "done" else "neutral")}">{_c}</span>'
+        f'</div>'
+        for (_t, _s), _c in sorted(data["counts"].items())
+    )
+    overdue_rows = "".join(
+        f'<div class="card">{item["name"]} — {OBLIGATION_LABELS.get(item["type_value"], item["type_value"])}<br>'
+        f'<span class="badge red">Дедлайн был {item["deadline_date"]:%d.%m.%Y}</span><br>'
+        f'<a class="btn" href="/employees/{item["employee_id"]}">Открыть карточку</a></div>'
+        for item in data["overdue_details"]
+    )
+    body = f"""
+<h1>📋 Обязательства — сводка по статусам</h1>
+<p class="muted">Только активные сотрудники (действующий договор). Только актуальные версии обязательств (is_current).</p>
+<section class="grid"><h2>По типам и статусам</h2>{summary_rows or '<p class="muted">Нет данных.</p>'}</section>
+<section class="grid"><h2>🚨 Просроченные, с деталями ({len(data["overdue_details"])})</h2>
+{overdue_rows or '<p class="muted">Просроченных нет.</p>'}</section>
+<p><a class="btn secondary" href="/reports">← Все отчёты</a></p>
+"""
+    return _render("Обязательства", body, active="reports", role=request.session.get("role", ""))
+
+
+@app.get("/reports/activity", response_class=HTMLResponse)
+def report_activity(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+
+    data = reports_data.get_activity_report(db)
+    rows = "".join(
+        f'<div class="card">{a["label"]}<br>'
+        f'<span class="badge neutral">{a["count"]} отметок</span> '
+        f'<span class="muted">{a["first"]:%d.%m}–{a["last"]:%d.%m}</span></div>'
+        for a in data["actors"]
+    )
+    body = f"""
+<h1>🕵️ Активность в табеле</h1>
+<p class="muted">{data["month_start"].strftime("%B %Y")} — кто и сколько отметок поставил
+(включая перенесённую историю из Google Sheets).</p>
+<section class="grid"><h2>Всего отметок за месяц: {data["total"]}</h2>{rows or '<p class="muted">Нет данных.</p>'}</section>
+<p><a class="btn secondary" href="/reports">← Все отчёты</a></p>
+"""
+    return _render("Активность", body, active="reports", role=request.session.get("role", ""))
 
 
 # --- Сотрудники: список + единая карточка ------------------------------------
