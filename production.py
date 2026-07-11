@@ -474,6 +474,16 @@ def generate_instruction_journal_docx(
     return path
 
 
+# ВРЕМЕННО (тест, 2026-07): очистка всех записей инструктажей, чтобы можно было
+# заново проверить автозаполнение/допечатку с чистого листа. УДАЛИТЬ эту функцию
+# и кнопку в webforms.py, когда тестирование закончится — см. пометку там же.
+def test_clear_all_instructions(session: Session) -> int:
+    count = session.query(Instruction).count()
+    session.query(Instruction).delete()
+    session.commit()
+    return count
+
+
 def get_due_instructions(session: Session, days_before: int = 7) -> list[dict]:
     """Повторные инструктажи, у которых next_due_date приближается или уже
     прошёл — для напоминания, по аналогии с get_rotation_reminders в tabel.py."""
