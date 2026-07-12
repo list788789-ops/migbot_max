@@ -1487,6 +1487,23 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
     orders = prod.get_active_work_orders(db)
+    # Автонумерация наряда: формат «{порядковый}-{год}» со сбросом по годам.
+    # Берём максимальный порядковый среди ВСЕХ нарядов текущего года (включая
+    # закрытые — чтобы не переиспользовать номер), +1. Старые номера без «-ГГГГ»
+    # под шаблон не подпадают и игнорируются. Поле редактируемое — можно заменить.
+    import re as _re_num
+    _today = datetime.now(MSK).date()
+    _year = _today.year
+    _all_numbers = db.scalars(select(WorkOrder.number)).all()
+    _seqs = [
+        int(_m.group(1))
+        for _n in _all_numbers
+        if (_m := _re_num.match(rf"^(\d+)-{_year}$", (_n or "").strip()))
+    ]
+    _next_number = f"{(max(_seqs) + 1) if _seqs else 1}-{_year}"
+    # Даты по умолчанию: «с» = сегодня, «по» = +14 дней (предел срока по 782н).
+    _valid_from_default = _today.isoformat()
+    _valid_to_default = (_today + timedelta(days=14)).isoformat()
     employees = db.scalars(
         select(Employee).where(Employee.contract_end_date.is_(None)).order_by(Employee.full_name)
     ).all()
@@ -1552,7 +1569,7 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
 <section>
 <h2>Новый наряд</h2>
 <form method="post" action="/production/work-orders/new">
-<input type="text" name="number" placeholder="Номер наряда" required>
+<input type="text" name="number" placeholder="Номер наряда" value="{_next_number}" required>
 <input type="text" name="subdivision" placeholder="Подразделение (например: ОС)">
 <label>Типовая работа из справочника (необязательно — заполнит условия, ОВПФ, системы безопасности, раздел 3 и нормы):
 <select name="work_type_id" onchange="_applyWorkType()"><option value="">— не выбрано —</option>{work_type_options}</select></label>
@@ -1564,8 +1581,8 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
 <select name="responsible_supervisor_id" required>{emp_options}</select></label>
 <label>Ответственный исполнитель работ (бригадир):
 <select name="responsible_executor_id" required>{worker_options}</select></label>
-<label>Действует с: <input type="date" id="validFrom" name="valid_from" onchange="_applyValidTo()" required></label>
-<label>Действует по: <input type="date" id="validTo" name="valid_to" required></label>
+<label>Действует с: <input type="date" id="validFrom" name="valid_from" value="{_valid_from_default}" onchange="_applyValidTo()" required></label>
+<label>Действует по: <input type="date" id="validTo" name="valid_to" value="{_valid_to_default}" required></label>
 <label>Выбрать готовую бригаду (необязательно):
 <select id="brigadeSelect"><option value="">— вручную —</option>{brigade_options}</select></label>
 <button type="button" class="secondary" onclick="_applyBrigade()">Применить состав</button>
@@ -1603,13 +1620,16 @@ function _applyTitul(){{
 }}
 function _applyWorkType(){{
   // Подставляет название выбранной типовой работы в «На выполнение работ».
-  // ТОЛЬКО если поле ещё пустое — не затираем формулировку, вписанную вручную
-  // (задание часто конкретнее названия: «...фундамента оси 5-7»).
+  // Перезаписывает, если поле пустое ИЛИ было заполнено этой же автоподстановкой
+  // (метка data-auto="1") — тогда смена работы обновляет название. Если кадровик
+  // правил поле руками (метка снята обработчиком input ниже) — не трогаем.
   var sel = document.querySelector('select[name=work_type_id]');
   var ta = document.getElementById('workDescription');
-  if (!sel.value || ta.value.trim()) return;
+  if (!sel.value) return;
+  var manual = ta.value.trim() && ta.dataset.auto !== '1';
+  if (manual) return;
   var name = _workTypesData[sel.value];
-  if (name) ta.value = name;
+  if (name) {{ ta.value = name; ta.dataset.auto = '1'; }}
 }}
 function _applyValidTo(){{
   // Автозаполнение "Действует по" = "с" + 14 дней (предельный срок наряда по
@@ -1633,6 +1653,10 @@ function _applyValidTo(){{
 document.addEventListener('DOMContentLoaded', function(){{
   _applyWorkType();
   _applyValidTo();
+  // Ручная правка «На выполнение работ» снимает метку авто — после этого смена
+  // типовой работы больше не перезаписывает вписанное кадровиком.
+  var _ta = document.getElementById('workDescription');
+  if (_ta) _ta.addEventListener('input', function(){{ _ta.dataset.auto = ''; }});
 }});
 </script>
 """
