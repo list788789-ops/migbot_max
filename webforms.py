@@ -1525,6 +1525,11 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
     brigades_js_map = _json.dumps({
         b.id: prod.get_brigade_member_ids(db, b.id) for b in brigades
     })
+    # Словарь id->название типовой работы для автоподстановки в «На выполнение работ» (JS).
+    # <  ->  \u003c, чтобы название с "<" не могло закрыть <script> раньше времени.
+    work_types_js_map = _json.dumps(
+        {w.id: w.name for w in work_types}, ensure_ascii=False
+    ).replace("<", "\\u003c")
 
     def order_row(o) -> str:
         members = db.query(WorkOrderMember).filter_by(work_order_id=o.id).all()
@@ -1550,8 +1555,8 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
 <input type="text" name="number" placeholder="Номер наряда" required>
 <input type="text" name="subdivision" placeholder="Подразделение (например: ОС)">
 <label>Типовая работа из справочника (необязательно — заполнит условия, ОВПФ, системы безопасности, раздел 3 и нормы):
-<select name="work_type_id"><option value="">— не выбрано —</option>{work_type_options}</select></label>
-<textarea name="work_description" placeholder="На выполнение работ" required rows="3"></textarea>
+<select name="work_type_id" onchange="_applyWorkType()"><option value="">— не выбрано —</option>{work_type_options}</select></label>
+<textarea name="work_description" id="workDescription" placeholder="На выполнение работ" required rows="3"></textarea>
 <label style="display:block;margin-top:6px">Титул из справочника (заполнит место выполнения работ; можно вписать свой):
 <select id="titulSelect" onchange="_applyTitul()"><option value="">— вручную —</option>{titul_options}</select></label>
 <input type="text" id="location" name="location" placeholder="Место выполнения работ" required>
@@ -1580,6 +1585,7 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
 <p><a class="btn secondary" href="/production">← Производство</a></p>
 <script>
 var _brigadesData = {brigades_js_map};
+var _workTypesData = {work_types_js_map};
 function _applyBrigade(){{
   var sel = document.getElementById('brigadeSelect');
   var brigadeId = sel.value;
@@ -1594,6 +1600,16 @@ function _applyBrigade(){{
 function _applyTitul(){{
   var s = document.getElementById('titulSelect');
   if (s.value) document.getElementById('location').value = s.value;
+}}
+function _applyWorkType(){{
+  // Подставляет название выбранной типовой работы в «На выполнение работ».
+  // ТОЛЬКО если поле ещё пустое — не затираем формулировку, вписанную вручную
+  // (задание часто конкретнее названия: «...фундамента оси 5-7»).
+  var sel = document.querySelector('select[name=work_type_id]');
+  var ta = document.getElementById('workDescription');
+  if (!sel.value || ta.value.trim()) return;
+  var name = _workTypesData[sel.value];
+  if (name) ta.value = name;
 }}
 function _applyValidTo(){{
   // Автозаполнение "Действует по" = "с" + 14 дней (предельный срок наряда по
