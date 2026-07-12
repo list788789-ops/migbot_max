@@ -81,6 +81,7 @@ from models import (
     SystemFlag,
     WorkOrderMember,
     WorkOrderMemberChange,
+    WorkLogEntry,
     MemberChangeType,
     WorkOrder,
     WorkType,
@@ -1477,9 +1478,203 @@ def production_page(request: Request):
 <div class="card"><h3 style="margin:0 0 6px">🏗 Титулы</h3>
 <p class="muted" style="margin:0 0 10px">Справочник объектов (шифр + наименование) — заполняет «Место выполнения работ» при создании наряда, без ручного набора.</p>
 <a class="btn" href="/production/tituly">Открыть</a></div>
+<div class="card"><h3 style="margin:0 0 6px">📓 Журналы</h3>
+<p class="muted" style="margin:0 0 10px">Журнал инструктажей, журнал учёта нарядов, общий журнал работ — учёт и выгрузка для печати/показа.</p>
+<a class="btn" href="/production/journals">Открыть</a></div>
 </section>
 """
     return _render("Производство", body, active="production", role=request.session.get("role", ""))
+
+
+# --- Журналы ------------------------------------------------------------------
+
+@app.get("/production/journals", response_class=HTMLResponse)
+def journals_hub(request: Request):
+    """Хаб журналов. Показываем только рабочее (инструктажи, наряды, ОЖР);
+    журналы лесов и трёхступенчатого контроля появятся по мере готовности."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    body = """
+<h1>📓 Журналы</h1>
+<section class="grid">
+<div class="card"><h3 style="margin:0 0 6px">🎓 Журнал инструктажей</h3>
+<p class="muted" style="margin:0 0 10px">Вводный, первичный, повторный, целевой — допечатка партиями, отдельная нумерация по каждому виду.</p>
+<a class="btn" href="/production/instructions">Открыть</a></div>
+<div class="card"><h3 style="margin:0 0 6px">📋 Журнал учёта нарядов</h3>
+<p class="muted" style="margin:0 0 10px">Учёт работ по наряду-допуску (Приложение №5 к 782н) — по данным выпущенных нарядов, выгрузка в xlsx.</p>
+<a class="btn" href="/production/journals/work-orders">Открыть</a></div>
+<div class="card"><h3 style="margin:0 0 6px">🏗 Общий журнал работ</h3>
+<p class="muted" style="margin:0 0 10px">Ежедневные записи по наряду — что сделано, погода. Подпись УКЭП (КриптоПро) подключается отдельно.</p>
+<a class="btn" href="/production/journals/work-log">Открыть</a></div>
+</section>
+<p><a class="btn secondary" href="/production">← Производство</a></p>
+"""
+    return _render("Журналы", body, active="production", role=request.session.get("role", ""))
+
+
+# --- Журнал учёта нарядов -----------------------------------------------------
+
+@app.get("/production/journals/work-orders", response_class=HTMLResponse)
+def wo_journal_page(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    unprinted = len(prod.get_unprinted_work_orders(db))
+    last_num = prod.get_last_wo_journal_row_number(db)
+    body = f"""
+<h1>📋 Журнал учёта нарядов</h1>
+<p class="muted">Учёт работ по наряду-допуску (Приложение №5 к 782н). Строится по выпущенным нарядам.
+Допечатка партиями: печатаются только новые наряды, ещё не попавшие в журнал, со сквозной нумерацией.</p>
+<section class="grid">
+<div class="card">
+<span class="badge {'orange' if unprinted else 'neutral'}">Ждут внесения в журнал: {unprinted}</span><br>
+<span class="muted">Последний номер строки в журнале: {last_num or '—'}</span><br>
+<form method="post" action="/production/journals/work-orders/print" style="margin-top:8px">
+<button type="submit" class="btn"{' disabled' if not unprinted else ''}>Допечатать новые записи ({unprinted})</button></form>
+</div>
+</section>
+<p><a class="btn secondary" href="/production/journals">← Журналы</a></p>
+"""
+    return _render("Журнал нарядов", body, active="production", role=request.session.get("role", ""))
+
+
+@app.post("/production/journals/work-orders/print")
+def wo_journal_print(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    printed = prod.print_new_wo_journal_entries(db)
+    if not printed:
+        return RedirectResponse("/production/journals/work-orders", status_code=303)
+    path = prod.generate_wo_journal_xlsx(printed, org_name=ORG_NAME)
+    with open(path, "rb") as f:
+        data = f.read()
+    fn = f"Журнал_нарядов_{datetime.now(MSK):%d.%m.%Y}.xlsx"
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": _content_disposition(fn)},
+    )
+
+
+# --- Общий журнал работ (ОЖР) -------------------------------------------------
+
+@app.get("/production/journals/work-log", response_class=HTMLResponse)
+def work_log_page(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    entries = prod.get_work_log_entries(db)
+    orders = db.scalars(select(WorkOrder).order_by(WorkOrder.created_at.desc())).all()
+    wo_options = "".join(
+        f'<option value="{o.id}">№{o.number} — {html.escape(o.work_description)} ({o.location})</option>'
+        for o in orders
+    )
+    unprinted = len(prod.get_unprinted_work_log(db))
+
+    rows = ""
+    for e in entries:
+        wo = e.work_order
+        place = f"№{wo.number} · {html.escape(wo.location)} — {html.escape(wo.work_description)}" if wo else "—"
+        signed = e.sign_status == WorkLogSignStatus.SIGNED
+        sign_badge = (
+            f'<span class="badge neutral">Подписано ({html.escape(e.signed_by or "")})</span>'
+            if signed else '<span class="badge orange">Черновик — не подписано</span>'
+        )
+        del_btn = (
+            "" if signed else
+            f'<form method="post" action="/production/journals/work-log/{e.id}/delete" style="display:inline"'
+            f' onsubmit="return confirm(\'Удалить запись журнала?\')">'
+            f'<button type="submit" class="btn secondary">🗑 Удалить</button></form>'
+        )
+        rows += (
+            f'<div class="card"><b>{e.entry_date:%d.%m.%Y}</b> · {place}<br>'
+            f'<span>{html.escape(e.work_done)}</span><br>'
+            f'{f"<span class=\"muted\">Погода: {html.escape(e.weather)}</span><br>" if e.weather else ""}'
+            f'{f"<span class=\"muted\">{html.escape(e.note)}</span><br>" if e.note else ""}'
+            f'{sign_badge} {del_btn}</div>'
+        )
+
+    body = f"""
+<h1>🏗 Общий журнал работ</h1>
+<p class="muted">Внутренний электронный журнал: одна запись — один день работ по наряду. Место, работа и
+состав берутся из наряда. Погодные условия важны для зимнего бетонирования. Подпись УКЭП (КриптоПро)
+подключается отдельно — пока записи в статусе «черновик».</p>
+
+<section class="grid">
+<h2>Записи журнала ({len(entries)})</h2>
+{rows or '<p class="muted">Записей пока нет.</p>'}
+</section>
+
+<section>
+<h2>Печать журнала</h2>
+<p class="muted">Ждут внесения в журнал: {unprinted}. Допечатка партиями со сквозной нумерацией.</p>
+<form method="post" action="/production/journals/work-log/print">
+<button type="submit"{' disabled' if not unprinted else ''}>Допечатать новые записи ({unprinted})</button></form>
+</section>
+
+<section>
+<h2>Новая запись</h2>
+<form method="post" action="/production/journals/work-log/new">
+<label>Наряд-допуск: <select name="work_order_id" required>{wo_options}</select></label>
+<label>Дата: <input type="date" name="entry_date" required></label>
+<label>Выполнено за день:<br><textarea name="work_done" rows="3" required style="width:100%"></textarea></label>
+<input type="text" name="weather" placeholder="Погодные условия (температура, осадки)">
+<input type="text" name="note" placeholder="Примечания (необязательно)">
+<button type="submit">Добавить запись</button>
+</form>
+</section>
+<p><a class="btn secondary" href="/production/journals">← Журналы</a></p>
+"""
+    return _render("Общий журнал работ", body, active="production", role=request.session.get("role", ""))
+
+
+@app.post("/production/journals/work-log/new")
+def work_log_create(
+    request: Request,
+    work_order_id: str = Form(...),
+    entry_date: str = Form(...),
+    work_done: str = Form(...),
+    weather: str = Form(""),
+    note: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    from datetime import date as _date
+    try:
+        d = _date.fromisoformat(entry_date)
+    except ValueError:
+        raise HTTPException(400, "Неверная дата.")
+    actor = _actor_name(request, db)
+    prod.create_work_log_entry(
+        db, work_order_id, d, work_done.strip(),
+        weather=weather.strip() or None, note=note.strip() or None, created_by=actor,
+    )
+    return RedirectResponse("/production/journals/work-log", status_code=303)
+
+
+@app.post("/production/journals/work-log/{entry_id}/delete")
+def work_log_delete(entry_id: str, request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    prod.delete_work_log_entry(db, entry_id)
+    return RedirectResponse("/production/journals/work-log", status_code=303)
+
+
+@app.post("/production/journals/work-log/print")
+def work_log_print(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    printed = prod.print_new_work_log_entries(db)
+    if not printed:
+        return RedirectResponse("/production/journals/work-log", status_code=303)
+    path = prod.generate_work_log_xlsx(printed, org_name=ORG_NAME)
+    with open(path, "rb") as f:
+        data = f.read()
+    fn = f"Общий_журнал_работ_{datetime.now(MSK):%d.%m.%Y}.xlsx"
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": _content_disposition(fn)},
+    )
 
 
 # --- Наряды-допуски -----------------------------------------------------------
