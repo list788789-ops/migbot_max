@@ -213,7 +213,7 @@ class Employee(Base):
     position: Mapped[str | None] = mapped_column(String, nullable=True)
     subdivision: Mapped[str | None] = mapped_column(String, nullable=True)
     # Группа допуска по безопасности работ на высоте — для графы "Должность (разряд)"
-    # в наряде-допуске на высотные работы (приложение №2 к Приказу Минтруда №903н).
+    # в наряде-допуске на высотные работы (приложение №2 к Приказу Минтруда №782н).
     # server_default проставляет "2-я гр..." всем существующим и новым (у всех она
     # одна) — менять вручную только тем, у кого другая. Заводится ALTER:
     #   ALTER TABLE employees ADD COLUMN height_safety_group VARCHAR
@@ -221,6 +221,14 @@ class Employee(Base):
     height_safety_group: Mapped[str | None] = mapped_column(
         String, nullable=True,
         server_default="2-я гр. по безопасности работ на высоте",
+    )
+    # Не табельный сотрудник: есть в employees (чтобы выбираться ответственным
+    # руководителем/исполнителем в наряде-допуске), но исключён из табеля вахты и
+    # из состава бригады-исполнителей. Пример — ИП-руководитель (Буц): работает
+    # руководителем работ, но в табель не входит. Заводится ALTER (уже в проде):
+    #   ALTER TABLE employees ADD COLUMN off_tabel boolean NOT NULL DEFAULT false;
+    off_tabel: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false",
     )
     address: Mapped[str | None] = mapped_column(Text, nullable=True)
     entry_country: Mapped[str | None] = mapped_column(String, nullable=True)  # "откуда въехал"
