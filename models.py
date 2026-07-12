@@ -302,6 +302,12 @@ class WorkOrderStatus(str, enum.Enum):
     CANCELLED = "cancelled"
 
 
+class MemberChangeType(str, enum.Enum):
+    """Тип изменения состава бригады в действующем наряде (п.7 бланка 782н)."""
+    ADDED = "added"      # введён в состав
+    REMOVED = "removed"  # выведен из состава
+
+
 class InstructionType(str, enum.Enum):
     """Виды инструктажей по охране труда — все нужны и учитываются отдельно
     (2026-07, модуль «Производство»)."""
@@ -410,8 +416,12 @@ class WorkOrder(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
-    # Материалы/инструменты/приспособления/спецтехника — по образцу реального бланка,
-    # там это отдельные строки (см. фото: "Материалы: Арматура, опалубка, доска." и т.д.).
+    # Размер бригады, зафиксированный при выпуске наряда — база для правила 782н
+    # «изменение состава более чем наполовину → нужен новый наряд». Считается
+    # суммарно (вводы+выводы) от этого числа. NULL у старых нарядов (до 2026-07):
+    # для них правило считается от текущего состава как fallback. Заводится ALTER:
+    #   ALTER TABLE work_orders ADD COLUMN initial_member_count INTEGER;
+    initial_member_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     materials: Mapped[str | None] = mapped_column(Text, nullable=True)
     tools: Mapped[str | None] = mapped_column(Text, nullable=True)
     equipment: Mapped[str | None] = mapped_column(Text, nullable=True)  # приспособления
@@ -436,6 +446,9 @@ class WorkOrder(Base):
         back_populates="work_order", cascade="all, delete-orphan"
     )
     daily_admissions: Mapped[list["WorkOrderDailyAdmission"]] = relationship(
+        back_populates="work_order", cascade="all, delete-orphan"
+    )
+    member_changes: Mapped[list["WorkOrderMemberChange"]] = relationship(
         back_populates="work_order", cascade="all, delete-orphan"
     )
 
@@ -481,6 +494,33 @@ class WorkOrderMember(Base):
     signed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     work_order: Mapped["WorkOrder"] = relationship(back_populates="members")
+    employee: Mapped["Employee"] = relationship()
+
+
+class WorkOrderMemberChange(Base):
+    """Изменение состава бригады в действующем наряде — пункт 7 бланка (782н).
+    Каждая запись = один ввод или вывод работника. По Правилам 782н изменение
+    оформляет ответственный руководитель/исполнитель, фиксируя ФИО того, кто дал
+    указание (ordered_by). Суммарное изменение (вводы+выводы) не должно превышать
+    половину первоначального состава (WorkOrder.initial_member_count) — иначе
+    наряд аннулируется и нужен новый (проверка в production.py).
+
+    Создаётся автоматически через Base.metadata.create_all (целая новая таблица),
+    ALTER не требуется — в отличие от колонок к существующим таблицам."""
+
+    __tablename__ = "work_order_member_changes"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    work_order_id: Mapped[str] = mapped_column(ForeignKey("work_orders.id"), nullable=False)
+    employee_id: Mapped[str] = mapped_column(ForeignKey("employees.id"), nullable=False)
+    change_type: Mapped[MemberChangeType] = mapped_column(
+        Enum(MemberChangeType), nullable=False
+    )
+    ordered_by: Mapped[str] = mapped_column(String, nullable=False)  # ФИО давшего указание (782н)
+    changed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_by: Mapped[str | None] = mapped_column(String, nullable=True)  # User.id оформившего
+
+    work_order: Mapped["WorkOrder"] = relationship(back_populates="member_changes")
     employee: Mapped["Employee"] = relationship()
 
 
