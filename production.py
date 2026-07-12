@@ -1332,6 +1332,10 @@ def generate_height_work_order_docx(work_order: WorkOrder, members: list[WorkOrd
     conditions_val = work_order.special_conditions or getattr(wt, "conditions", None)
     hazards_val = getattr(work_order, "hazards", None) or getattr(wt, "hazards", None)
     norms_val = getattr(wt, "norms", None)
+    # Пункт 1: собственное поле наряда в приоритете, иначе — типовое из справочника.
+    materials_val = work_order.materials or getattr(wt, "materials", None)
+    tools_val = work_order.tools or getattr(wt, "tools", None)
+    equipment_val = work_order.equipment or getattr(wt, "equipment", None)
 
     _p("Приложение № 2 к Правилам по охране труда при работе на высоте", italic=True, size=9)
     _p("(Приказ Минтруда России от 16.11.2020 № 782н)", italic=True, size=9)
@@ -1362,9 +1366,12 @@ def generate_height_work_order_docx(work_order: WorkOrder, members: list[WorkOrd
         pos = getattr(emp, "position", None) or ""
         grp = getattr(emp, "height_safety_group", None) or ""
         pos_grp = ", ".join([x for x in (pos, grp) if x]) or _HWO_DASH
-        member_rows.append([str(i), nm, pos_grp, "", ""])
+        # Вариант Б: печатаем ФИО ответственного руководителя в графу «Инструктаж
+        # провёл» (он проводит целевой инструктаж по п.8 бланка 782н); подпись он
+        # ставит от руки. «Ознакомлен» оставляем пустым — там подпись работника.
+        member_rows.append([str(i), nm, pos_grp, sup_name, ""])
     if not member_rows:
-        member_rows = [["", _HWO_DASH, _HWO_DASH, "", ""]]
+        member_rows = [["", _HWO_DASH, _HWO_DASH, sup_name, ""]]
     _grid(["№", "Фамилия, имя, отчество", "Должность (разряд)",
            "Инструктаж провёл (подпись)", "Ознакомлен (подпись)"], member_rows)
 
@@ -1396,8 +1403,8 @@ def generate_height_work_order_docx(work_order: WorkOrder, members: list[WorkOrd
 
     _p()
     _p("1. Необходимые для производства работ:", bold=True)
-    for lbl, val in [("Материалы: ", work_order.materials), ("Инструмент: ", work_order.tools),
-                     ("Приспособления: ", work_order.equipment),
+    for lbl, val in [("Материалы: ", materials_val), ("Инструмент: ", tools_val),
+                     ("Приспособления: ", equipment_val),
                      ("Спецтехника: ", work_order.special_machinery),
                      ("Шифр ТК: ", work_order.technological_card_ref)]:
         if val:
