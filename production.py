@@ -34,6 +34,8 @@ from models import (
     WorkOrderDailyAdmission,
     WorkOrderMember,
     WorkOrderMemberChange,
+    WorkLogEntry,
+    WorkLogSignStatus,
     MemberChangeType,
     WorkOrderStatus,
     WorkType,
@@ -317,6 +319,147 @@ def get_member_changes(session: Session, work_order_id: str) -> list[WorkOrderMe
         .order_by(WorkOrderMemberChange.changed_at)
         .all()
     )
+
+
+# ============================================================================
+# ЖУРНАЛ УЧЁТА РАБОТ ПО НАРЯДУ-ДОПУСКУ (Приложение №5 к 782н)
+# ============================================================================
+# Данные уже есть в WorkOrder/WorkOrderMember — журнал это «вид» существующих
+# нарядов с допечаткой партиями и сквозной нумерацией (как у инструктажей).
+
+def get_unprinted_work_orders(session: Session) -> list[WorkOrder]:
+    """Наряды, ещё не попавшие в распечатанную партию журнала (journal_row_number пуст)."""
+    return (
+        session.query(WorkOrder)
+        .filter(WorkOrder.journal_row_number.is_(None))
+        .order_by(WorkOrder.created_at)
+        .all()
+    )
+
+
+def get_last_wo_journal_row_number(session: Session) -> int:
+    last = (
+        session.query(WorkOrder)
+        .filter(WorkOrder.journal_row_number.isnot(None))
+        .order_by(WorkOrder.journal_row_number.desc())
+        .first()
+    )
+    return last.journal_row_number if last else 0
+
+
+def print_new_wo_journal_entries(session: Session) -> list[WorkOrder]:
+    """Допечатать новые наряды в журнал: присваивает сквозные номера строк,
+    помечает journal_printed_at. Уже напечатанные наряды не трогает."""
+    unprinted = get_unprinted_work_orders(session)
+    if not unprinted:
+        return []
+    next_num = get_last_wo_journal_row_number(session) + 1
+    now = datetime.utcnow()
+    for wo in unprinted:
+        wo.journal_row_number = next_num
+        wo.journal_printed_at = now
+        next_num += 1
+    session.commit()
+    return unprinted
+
+
+# ============================================================================
+# ОБЩИЙ ЖУРНАЛ РАБОТ (ОЖР) — внутренний, электронный, заполняется по наряду
+# ============================================================================
+
+def create_work_log_entry(
+    session: Session, work_order_id: str, entry_date: date, work_done: str,
+    weather: str | None = None, note: str | None = None, created_by: str | None = None,
+) -> WorkLogEntry:
+    """Создаёт запись ОЖР по наряду. Место/работа/состав НЕ дублируются в запись —
+    они берутся из связанного наряда при отображении/печати. Статус — черновик
+    (подпись УКЭП ставится отдельно, когда подключён КриптоПро)."""
+    entry = WorkLogEntry(
+        work_order_id=work_order_id,
+        entry_date=entry_date,
+        work_done=work_done,
+        weather=weather,
+        note=note,
+        created_by=created_by,
+        sign_status=WorkLogSignStatus.DRAFT,
+    )
+    session.add(entry)
+    session.commit()
+    return entry
+
+
+def get_work_log_entries(session: Session, work_order_id: str | None = None) -> list[WorkLogEntry]:
+    """Записи ОЖР: все или по конкретному наряду, в хронологии по дате записи."""
+    q = session.query(WorkLogEntry)
+    if work_order_id:
+        q = q.filter_by(work_order_id=work_order_id)
+    return q.order_by(WorkLogEntry.entry_date, WorkLogEntry.created_at).all()
+
+
+def delete_work_log_entry(session: Session, entry_id: str) -> bool:
+    """Удаление записи ОЖР. Подписанные записи удалять нельзя — только черновики."""
+    entry = session.get(WorkLogEntry, entry_id)
+    if entry is None:
+        return False
+    if entry.sign_status == WorkLogSignStatus.SIGNED:
+        return False  # подписанное УКЭП не удаляем
+    session.delete(entry)
+    session.commit()
+    return True
+
+
+def get_unprinted_work_log(session: Session) -> list[WorkLogEntry]:
+    return (
+        session.query(WorkLogEntry)
+        .filter(WorkLogEntry.journal_row_number.is_(None))
+        .order_by(WorkLogEntry.entry_date, WorkLogEntry.created_at)
+        .all()
+    )
+
+
+def get_last_worklog_row_number(session: Session) -> int:
+    last = (
+        session.query(WorkLogEntry)
+        .filter(WorkLogEntry.journal_row_number.isnot(None))
+        .order_by(WorkLogEntry.journal_row_number.desc())
+        .first()
+    )
+    return last.journal_row_number if last else 0
+
+
+def print_new_work_log_entries(session: Session) -> list[WorkLogEntry]:
+    """Допечатать новые записи ОЖР партией со сквозной нумерацией."""
+    unprinted = get_unprinted_work_log(session)
+    if not unprinted:
+        return []
+    next_num = get_last_worklog_row_number(session) + 1
+    now = datetime.utcnow()
+    for e in unprinted:
+        e.journal_row_number = next_num
+        e.printed_at = now
+        next_num += 1
+    session.commit()
+    return unprinted
+
+
+def sign_work_log_entry(
+    session: Session, entry_id: str, signed_by: str, cert_serial: str, content_hash: str,
+) -> bool:
+    """Проставляет подпись УКЭП на запись ОЖР. Вызывается ПОСЛЕ того, как клиент
+    (КриптоПро browser plug-in) реально подписал содержимое — сюда приходят готовые
+    ФИО подписавшего, серийник сертификата и хеш подписанного содержимого. Сервер
+    подпись не создаёт, только фиксирует. Заглушка потока — реальный обработчик
+    подключится, когда настроим плагин; функция уже готова принять результат."""
+    entry = session.get(WorkLogEntry, entry_id)
+    if entry is None:
+        return False
+    entry.sign_status = WorkLogSignStatus.SIGNED
+    entry.signed_by = signed_by
+    entry.signed_at = datetime.utcnow()
+    entry.sign_cert_serial = cert_serial
+    entry.content_hash = content_hash
+    session.commit()
+    return True
 
 
 def sign_work_order_member(session: Session, work_order_id: str, employee_id: str) -> bool:
@@ -834,6 +977,105 @@ def _xl_border_range(ws, r1: int, c1: int, r2: int, c2: int) -> None:
     for r in range(r1, r2 + 1):
         for c in range(c1, c2 + 1):
             ws.cell(row=r, column=c).border = _XL_BORDER
+
+
+def generate_wo_journal_xlsx(
+    orders: list[WorkOrder], org_name: str, output_dir: str = "/tmp",
+) -> str:
+    """Журнал учёта работ по наряду-допуску (Приложение №5 к 782н), xlsx.
+    Графы формы: № наряда, место и наименование работы, ответственный исполнитель
+    (с группой), члены бригады (с группами), кто выдал наряд, даты. Печатается
+    партией уже пронумерованных нарядов."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Журнал нарядов"
+    ws.page_setup.orientation = "landscape"
+
+    _xl_cell(ws, 1, 1, "ЖУРНАЛ УЧЁТА РАБОТ ПО НАРЯДУ-ДОПУСКУ", bold=True, border=False)
+    _xl_cell(ws, 2, 1, org_name, small=True, border=False)
+    _xl_cell(ws, 3, 1, "Приложение № 5 к Правилам по охране труда при работе на высоте (Приказ Минтруда 782н)",
+             small=True, border=False)
+
+    headers = ["№ строки", "№ наряда", "Место и наименование работы",
+               "Ответственный исполнитель (ФИО, группа)", "Члены бригады (ФИО, группа)",
+               "Наряд выдал (ФИО)", "Начало работ", "Окончание работ"]
+    hr = 5
+    for i, h in enumerate(headers, 1):
+        _xl_cell(ws, hr, i, h, bold=True, small=True)
+    widths = [8, 12, 30, 26, 34, 20, 14, 14]
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[chr(64 + i)].width = w
+
+    r = hr + 1
+    for wo in orders:
+        ex = getattr(wo, "responsible_executor", None)
+        ex_grp = getattr(ex, "height_safety_group", "") or ""
+        ex_name = (getattr(ex, "full_name", "") or "") + (f", {ex_grp}" if ex_grp else "")
+        sup = getattr(wo, "responsible_supervisor", None)
+        members = getattr(wo, "members", []) or []
+        crew = "; ".join(
+            (getattr(getattr(m, "employee", None), "full_name", "") or "")
+            + (f" ({getattr(getattr(m, 'employee', None), 'height_safety_group', '') or ''})"
+               if getattr(getattr(m, "employee", None), "height_safety_group", "") else "")
+            for m in members
+        )
+        place = f"{wo.location} — {wo.work_description}"
+        start = f"{wo.valid_from:%d.%m.%Y}" if wo.valid_from else ""
+        end = f"{wo.valid_to:%d.%m.%Y}" if wo.valid_to else ""
+        row = [str(wo.journal_row_number or ""), wo.number or "", place, ex_name, crew,
+               getattr(sup, "full_name", "") or wo.issued_by or "", start, end]
+        for i, val in enumerate(row, 1):
+            _xl_cell(ws, r, i, val, small=True, left=(i in (3, 4, 5)))
+        r += 1
+
+    _xl_cell(ws, r + 1, 1, f"Внесено записей: {len(orders)}", bold=True, border=False)
+    path = f"{output_dir}/journal_naryadov.xlsx"
+    wb.save(path)
+    return path
+
+
+def generate_work_log_xlsx(
+    entries: list[WorkLogEntry], org_name: str, output_dir: str = "/tmp",
+) -> str:
+    """Общий журнал работ (ОЖР), xlsx. Каждая строка — день работ по наряду:
+    дата, № наряда, место/работа (из наряда), что сделано за день, погода,
+    подпись (статус УКЭП). Печатается партией пронумерованных записей."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Общий журнал работ"
+    ws.page_setup.orientation = "landscape"
+
+    _xl_cell(ws, 1, 1, "ОБЩИЙ ЖУРНАЛ РАБОТ", bold=True, border=False)
+    _xl_cell(ws, 2, 1, org_name, small=True, border=False)
+
+    headers = ["№ строки", "Дата", "№ наряда", "Место и работа (по наряду)",
+               "Выполнено за день", "Погодные условия", "Внёс", "Подпись (УКЭП)"]
+    hr = 4
+    for i, h in enumerate(headers, 1):
+        _xl_cell(ws, hr, i, h, bold=True, small=True)
+    widths = [8, 12, 12, 30, 40, 18, 18, 22]
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[chr(64 + i)].width = w
+
+    r = hr + 1
+    for e in entries:
+        wo = getattr(e, "work_order", None)
+        place = f"{getattr(wo, 'location', '')} — {getattr(wo, 'work_description', '')}" if wo else ""
+        wo_num = getattr(wo, "number", "") if wo else ""
+        if e.sign_status == WorkLogSignStatus.SIGNED:
+            sign = f"Подписано: {e.signed_by or ''} {e.signed_at:%d.%m.%Y}" if e.signed_at else "Подписано"
+        else:
+            sign = "черновик (не подписано)"
+        row = [str(e.journal_row_number or ""), f"{e.entry_date:%d.%m.%Y}", wo_num, place,
+               e.work_done or "", e.weather or "", e.created_by or "", sign]
+        for i, val in enumerate(row, 1):
+            _xl_cell(ws, r, i, val, small=True, left=(i in (4, 5)))
+        r += 1
+
+    _xl_cell(ws, r + 1, 1, f"Внесено записей: {len(entries)}", bold=True, border=False)
+    path = f"{output_dir}/obshchiy_zhurnal_rabot.xlsx"
+    wb.save(path)
+    return path
 
 
 def generate_instruction_journal_xlsx(
