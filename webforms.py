@@ -1569,6 +1569,21 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
     def order_row(o) -> str:
         members = db.query(WorkOrderMember).filter_by(work_order_id=o.id).all()
         signed = sum(1 for m in members if m.signed_at is not None)
+        member_ids_set = {m.employee_id for m in members}
+        # Дозаполнение состава уже созданного наряда (узкое редактирование): чекбоксы
+        # табельных сотрудников, текущие члены отмечены; сохранение заменяет состав.
+        member_cbs = "".join(
+            f'<label style="display:block;margin:2px 0"><input type="checkbox" name="member_ids" '
+            f'value="{e.id}"{" checked" if e.id in member_ids_set else ""}> {html.escape(e.full_name)}</label>'
+            for e in workers
+        )
+        edit_members = (
+            f'<details style="margin-top:8px"><summary style="cursor:pointer">👷 Состав бригады '
+            f'({len(members)})</summary>'
+            f'<form method="post" action="/production/work-orders/{o.id}/members" style="margin-top:8px">'
+            f'<fieldset><legend>Отметьте членов бригады</legend>{member_cbs}</fieldset>'
+            f'<button type="submit">Сохранить состав</button></form></details>'
+        )
         return (
             f'<div class="card">№{o.number} — {o.work_description}<br>'
             f'<span class="muted">{o.location} · {o.valid_from:%d.%m}–{o.valid_to:%d.%m.%Y}</span><br>'
@@ -1577,7 +1592,8 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
             f'<span class="badge neutral">Подписали: {signed}/{len(members)}</span> '
             f'<a class="btn secondary" href="/production/work-orders/{o.id}/print">Печатный бланк</a> '
             f'<form method="post" action="/production/work-orders/{o.id}/close" style="display:inline">'
-            f'<button type="submit" class="btn secondary">Закрыть наряд</button></form></div>'
+            f'<button type="submit" class="btn secondary">Закрыть наряд</button></form>'
+            f'{edit_members}</div>'
         )
 
     rows = "".join(order_row(o) for o in orders)
@@ -1602,7 +1618,7 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
 <label>Действует с: <input type="date" id="validFrom" name="valid_from" value="{_valid_from_default}" onchange="_applyValidTo()" required></label>
 <label>Действует по: <input type="date" id="validTo" name="valid_to" value="{_valid_to_default}" required></label>
 <label>Выбрать готовую бригаду (необязательно):
-<select id="brigadeSelect"><option value="">— вручную —</option>{brigade_options}</select></label>
+<select id="brigadeSelect" onchange="_applyBrigade()"><option value="">— вручную —</option>{brigade_options}</select></label>
 <button type="button" class="secondary" onclick="_applyBrigade()">Применить состав</button>
 <fieldset><legend>Члены бригады</legend>{emp_checkboxes}</fieldset>
 <fieldset><legend>Дополнительно (необязательно)</legend>
@@ -1737,6 +1753,27 @@ def work_order_create(
 """
         return _render("Наряд: замечания", body, active="production",
                        role=request.session.get("role", ""))
+    return RedirectResponse("/production/work-orders", status_code=303)
+
+
+@app.post("/production/work-orders/{work_order_id}/members")
+def work_order_set_members(
+    work_order_id: str,
+    request: Request,
+    member_ids: list[str] = Form(default=[]),
+    db: Session = Depends(get_db),
+):
+    """Замена состава бригады уже созданного наряда (дозаполнение черновика).
+    Полностью заменяет членов: снимает прежних, добавляет отмеченных."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    order = db.get(WorkOrder, work_order_id)
+    if order is None:
+        raise HTTPException(404, "Наряд не найден.")
+    db.query(WorkOrderMember).filter_by(work_order_id=work_order_id).delete()
+    for eid in member_ids:
+        db.add(WorkOrderMember(work_order_id=work_order_id, employee_id=eid))
+    db.commit()
     return RedirectResponse("/production/work-orders", status_code=303)
 
 
