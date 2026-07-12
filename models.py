@@ -504,6 +504,14 @@ class WorkType(Base):
     content: Mapped[str | None] = mapped_column(Text, nullable=True)          # содержание работ
     conditions: Mapped[str | None] = mapped_column(Text, nullable=True)       # условия проведения
     hazards: Mapped[str | None] = mapped_column(Text, nullable=True)          # ОВПФ
+    # Типовые материалы/инструменты/приспособления для пункта 1 бланка (782н).
+    # Генератор берёт их, если у наряда свои поля пусты (fallback). Заводится ALTER:
+    #   ALTER TABLE work_types ADD COLUMN materials TEXT;
+    #   ALTER TABLE work_types ADD COLUMN tools TEXT;
+    #   ALTER TABLE work_types ADD COLUMN equipment TEXT;
+    materials: Mapped[str | None] = mapped_column(Text, nullable=True)        # материалы (п.1)
+    tools: Mapped[str | None] = mapped_column(Text, nullable=True)            # инструменты (п.1)
+    equipment: Mapped[str | None] = mapped_column(Text, nullable=True)        # приспособления (п.1)
     sys_restraint: Mapped[str | None] = mapped_column(Text, nullable=True)    # удерживающие системы
     sys_fall_arrest: Mapped[str | None] = mapped_column(Text, nullable=True)  # страховочные системы
     sys_rescue: Mapped[str | None] = mapped_column(Text, nullable=True)       # эвакуационные и спасательные
