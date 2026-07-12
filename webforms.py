@@ -1517,11 +1517,29 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
     # Если ни у кого нет 3-й группы — не оставляем выпадашку пустой (иначе наряд не
     # создать вообще); показываем всех и полагаемся на проверку check_work_order_problems.
     supervisor_pool = supervisors or employees
+    # Повтор последнего наряда (по времени, статус не важен): ответственный исполнитель
+    # и состав бригады по умолчанию берутся из самого свежего наряда. Не хардкод имени —
+    # дефолт следует за реальностью: сменится исполнитель/состав, поедет и он. Если
+    # человек уволился/стал off_tabel, его нет в workers → просто не отметится.
+    _last_order = db.scalars(
+        select(WorkOrder).order_by(WorkOrder.created_at.desc())
+    ).first()
+    _last_executor_id = _last_order.responsible_executor_id if _last_order else ""
+    _last_member_ids = set()
+    if _last_order:
+        _last_member_ids = set(db.scalars(
+            select(WorkOrderMember.employee_id).where(
+                WorkOrderMember.work_order_id == _last_order.id
+            )
+        ).all())
     emp_options = "".join(f'<option value="{e.id}">{e.full_name}</option>' for e in supervisor_pool)
-    worker_options = "".join(f'<option value="{e.id}">{e.full_name}</option>' for e in workers)
+    worker_options = "".join(
+        f'<option value="{e.id}"{" selected" if e.id == _last_executor_id else ""}>{e.full_name}</option>'
+        for e in workers
+    )
     emp_checkboxes = "".join(
         f'<label style="display:block;margin:2px 0"><input type="checkbox" name="member_ids" '
-        f'id="memberCb_{e.id}" value="{e.id}"> {e.full_name}</label>'
+        f'id="memberCb_{e.id}" value="{e.id}"{" checked" if e.id in _last_member_ids else ""}> {e.full_name}</label>'
         for e in workers
     )
     brigades = prod.get_brigades(db)
