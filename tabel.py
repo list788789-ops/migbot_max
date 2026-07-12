@@ -52,6 +52,7 @@ def get_active_employees(session: Session) -> list[Employee]:
     today = date.today()
     return (
         session.query(Employee)
+        .filter(Employee.off_tabel.is_(False))
         .filter(Employee.contract_end_date.is_(None))
         .filter(Employee.contract_date.isnot(None))
         .filter(Employee.contract_date <= today)
@@ -78,6 +79,7 @@ def get_onboarding_employees(session: Session) -> list[Employee]:
     today = date.today()
     return (
         session.query(Employee)
+        .filter(Employee.off_tabel.is_(False))
         .filter(Employee.contract_end_date.is_(None))
         .filter((Employee.contract_date.is_(None)) | (Employee.contract_date > today))
         .order_by(Employee.full_name)
@@ -109,6 +111,7 @@ def get_marks_without_valid_contract(session: Session) -> list[dict]:
     today = date.today()
     candidates = (
         session.query(Employee)
+        .filter(Employee.off_tabel.is_(False))
         .filter(
             (Employee.contract_date.is_(None))
             | (Employee.contract_date > today)
