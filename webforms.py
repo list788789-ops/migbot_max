@@ -1640,6 +1640,9 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
             f'<a class="btn secondary" href="/production/work-orders/{o.id}/print">Печатный бланк</a> '
             f'<form method="post" action="/production/work-orders/{o.id}/close" style="display:inline">'
             f'<button type="submit" class="btn secondary">Закрыть наряд</button></form>'
+            f'<form method="post" action="/production/work-orders/{o.id}/delete" style="display:inline"'
+            f' onsubmit="return confirm(\'Удалить наряд №{o.number} безвозвратно? Вместе с ним удалятся состав, ежедневные допуски и изменения состава.\')">'
+            f'<button type="submit" class="btn secondary">🗑 Удалить</button></form>'
             f'{edit_members}{p7}</div>'
         )
 
@@ -1864,6 +1867,22 @@ def work_order_close(work_order_id: str, request: Request, db: Session = Depends
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
     prod.close_work_order(db, work_order_id)
+    return RedirectResponse("/production/work-orders", status_code=303)
+
+
+@app.post("/production/work-orders/{work_order_id}/delete")
+def work_order_delete(work_order_id: str, request: Request, db: Session = Depends(get_db)):
+    """Физическое удаление наряда через ORM: каскад delete-orphan снимает состав,
+    ежедневные допуски и изменения состава автоматически (в отличие от сырого
+    DELETE в psql, где внешние ключи приходится чистить вручную). Необратимо —
+    подтверждение спрашивается на кнопке. Для штатного завершения есть «Закрыть»."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    order = db.get(WorkOrder, work_order_id)
+    if order is None:
+        raise HTTPException(404, "Наряд не найден.")
+    db.delete(order)
+    db.commit()
     return RedirectResponse("/production/work-orders", status_code=303)
 
 
