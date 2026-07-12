@@ -33,6 +33,8 @@ from models import (
     WorkOrder,
     WorkOrderDailyAdmission,
     WorkOrderMember,
+    WorkOrderMemberChange,
+    MemberChangeType,
     WorkOrderStatus,
     WorkType,
 )
@@ -185,6 +187,10 @@ def create_work_order(
         safety_systems=safety_systems,
         special_conditions=special_conditions,
         work_type_id=work_type_id,
+        # Размер бригады на выпуске — база для правила 782н о половине. Если наряд
+        # создаётся пустым черновиком, оставляем None; зафиксируется при первом
+        # заполнении состава (см. роут /members в webforms.py).
+        initial_member_count=(len(member_employee_ids) or None),
     )
     session.add(order)
     session.flush()  # получить order.id до commit
@@ -203,6 +209,114 @@ def create_work_order(
 
     session.commit()
     return order
+
+
+# ============================================================================
+# Пункт 7 наряда-допуска: изменения состава бригады (782н)
+# ============================================================================
+# Правило 782н: суммарное изменение состава МЕНЕЕ чем на половину первоначального
+# разрешено ответственному руководителю по согласованию. Изменение БОЛЕЕ чем
+# наполовину (строго больше половины), смена ответственных или условий работы →
+# наряд аннулируется, нужен новый. Здесь считаем только члены бригады; смена
+# ответственных в наряде не предусмотрена (это всегда новый наряд).
+
+def work_order_change_stats(session: Session, work_order_id: str) -> dict:
+    """Статистика изменений состава по наряду для правила половины.
+    Возвращает: initial (первоначальный размер), changes (суммарно вводы+выводы),
+    limit (макс. допустимое число изменений), exceeded (превышен ли предел),
+    at_limit (достигнут ли предел — следующее изменение превысит)."""
+    order = session.get(WorkOrder, work_order_id)
+    if order is None:
+        return {"initial": 0, "changes": 0, "limit": 0, "exceeded": False, "at_limit": True}
+    initial = order.initial_member_count
+    if not initial:
+        # Старый наряд без зафиксированного размера — fallback на текущий состав.
+        initial = (
+            session.query(WorkOrderMember)
+            .filter_by(work_order_id=work_order_id)
+            .count()
+        )
+    changes = (
+        session.query(WorkOrderMemberChange)
+        .filter_by(work_order_id=work_order_id)
+        .count()
+    )
+    # Разрешено, пока суммарное изменение НЕ превышает половину: changes*2 <= initial.
+    # limit — наибольшее число изменений, при котором ещё не «более чем наполовину».
+    limit = initial // 2
+    exceeded = (changes * 2) > initial
+    # at_limit: ещё одно изменение сделает (changes+1)*2 > initial.
+    at_limit = ((changes + 1) * 2) > initial
+    return {
+        "initial": initial,
+        "changes": changes,
+        "limit": limit,
+        "exceeded": exceeded,
+        "at_limit": at_limit,
+    }
+
+
+def add_member_change(
+    session: Session,
+    work_order_id: str,
+    employee_id: str,
+    change_type: MemberChangeType,
+    ordered_by: str,
+    created_by: str | None = None,
+) -> tuple[bool, str]:
+    """Оформляет изменение состава (ввод/вывод) по пункту 7 с проверкой правила
+    половины. Возвращает (успех, сообщение). При превышении половины НЕ вносит
+    изменение и возвращает (False, требование нового наряда).
+
+    Помимо записи в журнал изменений, фактически меняет состав:
+    - added:   добавляет WorkOrderMember, если его ещё нет;
+    - removed: удаляет WorkOrderMember этого сотрудника."""
+    order = session.get(WorkOrder, work_order_id)
+    if order is None:
+        return False, "Наряд не найден."
+
+    stats = work_order_change_stats(session, work_order_id)
+    # Это изменение — ещё +1 к суммарному. Проверяем, не превысит ли половину.
+    if ((stats["changes"] + 1) * 2) > stats["initial"]:
+        return False, (
+            f"Изменение состава превысит половину первоначального "
+            f"({stats['initial']} чел.). По Правилам 782н наряд-допуск в этом "
+            f"случае аннулируется — оформите НОВЫЙ наряд-допуск."
+        )
+
+    # Фактическое изменение состава.
+    existing = (
+        session.query(WorkOrderMember)
+        .filter_by(work_order_id=work_order_id, employee_id=employee_id)
+        .first()
+    )
+    if change_type == MemberChangeType.ADDED:
+        if existing is None:
+            session.add(WorkOrderMember(work_order_id=work_order_id, employee_id=employee_id))
+    else:  # REMOVED
+        if existing is not None:
+            session.delete(existing)
+
+    session.add(WorkOrderMemberChange(
+        work_order_id=work_order_id,
+        employee_id=employee_id,
+        change_type=change_type,
+        ordered_by=ordered_by,
+        created_by=created_by,
+    ))
+    session.commit()
+    action = "введён в состав" if change_type == MemberChangeType.ADDED else "выведен из состава"
+    return True, f"Работник {action}. Изменение зафиксировано в пункте 7 наряда."
+
+
+def get_member_changes(session: Session, work_order_id: str) -> list[WorkOrderMemberChange]:
+    """Записи изменений состава по наряду (для пункта 7 бланка и истории в UI)."""
+    return (
+        session.query(WorkOrderMemberChange)
+        .filter_by(work_order_id=work_order_id)
+        .order_by(WorkOrderMemberChange.changed_at)
+        .all()
+    )
 
 
 def sign_work_order_member(session: Session, work_order_id: str, employee_id: str) -> bool:
@@ -1454,8 +1568,17 @@ def generate_height_work_order_docx(work_order: WorkOrder, members: list[WorkOrd
 
     _p()
     _p("7. Изменения в составе бригады:", bold=True)
+    change_rows = []
+    for ch in getattr(work_order, "member_changes", None) or []:
+        nm = getattr(getattr(ch, "employee", None), "full_name", None) or _HWO_DASH
+        added = nm if ch.change_type == MemberChangeType.ADDED else ""
+        removed = nm if ch.change_type == MemberChangeType.REMOVED else ""
+        when = ch.changed_at.strftime("%d.%m.%Y %H:%M") if ch.changed_at else ""
+        change_rows.append([added, removed, when, ch.ordered_by or ""])
+    if not change_rows:
+        change_rows = [["", "", "", ""] for _ in range(3)]  # пустые строки под ручную запись
     _grid(["Введён в состав (ФИО)", "Выведен из состава (ФИО)", "Дата, время", "Разрешил (ФИО, подпись)"],
-          [["", "", "", ""] for _ in range(3)])
+          change_rows)
 
     _p()
     _p("8. Регистрация целевого инструктажа при первичном допуске:", bold=True)
