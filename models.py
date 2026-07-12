@@ -308,6 +308,16 @@ class MemberChangeType(str, enum.Enum):
     REMOVED = "removed"  # выведен из состава
 
 
+class WorkLogSignStatus(str, enum.Enum):
+    """Статус подписи записи общего журнала работ (ОЖР).
+    DRAFT — черновик, ещё не подписано; SIGNED — подписано УКЭП.
+    Реальная подпись ставится на клиенте через КриптоПро ЭЦП Browser plug-in
+    (CSP + токен на устройстве); сервер принимает и хранит готовую подпись.
+    Пока провайдер не подключён — записи остаются DRAFT."""
+    DRAFT = "draft"
+    SIGNED = "signed"
+
+
 class InstructionType(str, enum.Enum):
     """Виды инструктажей по охране труда — все нужны и учитываются отдельно
     (2026-07, модуль «Производство»)."""
@@ -422,6 +432,13 @@ class WorkOrder(Base):
     # для них правило считается от текущего состава как fallback. Заводится ALTER:
     #   ALTER TABLE work_orders ADD COLUMN initial_member_count INTEGER;
     initial_member_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Журнал учёта работ по наряду-допуску (Приложение №5 к 782н) — допечатка
+    # партиями со сквозной нумерацией, как у инструктажей. NULL = ещё не в журнале.
+    #   ALTER TABLE work_orders ADD COLUMN journal_row_number INTEGER;
+    #   ALTER TABLE work_orders ADD COLUMN journal_printed_at TIMESTAMP;
+    journal_row_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    journal_printed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     materials: Mapped[str | None] = mapped_column(Text, nullable=True)
     tools: Mapped[str | None] = mapped_column(Text, nullable=True)
     equipment: Mapped[str | None] = mapped_column(Text, nullable=True)  # приспособления
@@ -522,6 +539,50 @@ class WorkOrderMemberChange(Base):
 
     work_order: Mapped["WorkOrder"] = relationship(back_populates="member_changes")
     employee: Mapped["Employee"] = relationship()
+
+
+class WorkLogEntry(Base):
+    """Запись общего журнала работ (ОЖР) — внутренний журнал ИП, электронный.
+    Одна запись = один день работ по одному наряду-допуску. Заполняется ПО НАРЯДУ:
+    место, работа, даты, состав и ответственные тянутся из связанного WorkOrder,
+    вручную вносится только фактически сделанное за день, погода, примечания.
+
+    Погодные условия важны для зимнего бетонирования (СП 70.13330 р.5.11): в общих
+    указаниях КЖ-комплектов объекта при среднесут. t < +5°C особый режим ухода.
+
+    Подпись — УКЭП через КриптоПро (CSP + browser plug-in, подпись на клиенте).
+    Поля sign_* пустые, пока не подключён провайдер; статус DRAFT до подписания.
+    content_hash фиксирует содержимое на момент подписи — чтобы подписанную запись
+    нельзя было незаметно изменить (проверяется при показе/выгрузке).
+
+    Создаётся автоматически через create_all (новая таблица), ALTER не требуется."""
+
+    __tablename__ = "work_log_entries"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    work_order_id: Mapped[str] = mapped_column(ForeignKey("work_orders.id"), nullable=False)
+    entry_date: Mapped[date] = mapped_column(Date, nullable=False)  # день, за который запись
+    work_done: Mapped[str] = mapped_column(Text, nullable=False)     # что сделано за день
+    weather: Mapped[str | None] = mapped_column(String, nullable=True)     # погодные условия
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)          # примечания
+
+    created_by: Mapped[str | None] = mapped_column(String, nullable=True)  # кто внёс (User.id/ФИО)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    # Подпись УКЭП (КриптоПро). Пусто до подключения провайдера; статус DRAFT.
+    sign_status: Mapped[WorkLogSignStatus] = mapped_column(
+        Enum(WorkLogSignStatus), default=WorkLogSignStatus.DRAFT, nullable=False
+    )
+    signed_by: Mapped[str | None] = mapped_column(String, nullable=True)       # ФИО подписавшего
+    signed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    sign_cert_serial: Mapped[str | None] = mapped_column(String, nullable=True)  # серийник сертификата
+    content_hash: Mapped[str | None] = mapped_column(String, nullable=True)      # хеш содержимого на момент подписи
+
+    # Допечатка журнала партиями (как у инструктажей): сквозная нумерация строк.
+    journal_row_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    printed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    work_order: Mapped["WorkOrder"] = relationship()
 
 
 class WorkType(Base):
