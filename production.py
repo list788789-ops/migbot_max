@@ -367,6 +367,67 @@ def print_new_wo_journal_entries(session: Session) -> list[WorkOrder]:
 # ОБЩИЙ ЖУРНАЛ РАБОТ (ОЖР) — внутренний, электронный, заполняется по наряду
 # ============================================================================
 
+# Координаты стройплощадки (село Белокаменка, западный берег Кольского залива).
+# Погода одинакова в радиусе нескольких км, точности села достаточно для журнала.
+_BELOKAMENKA_LAT = 69.08
+_BELOKAMENKA_LON = 33.17
+
+
+def fetch_weather_belokamenka(entry_date: date) -> str | None:
+    """Погода на дату по координатам Белокаменки через Open-Meteo (без ключа).
+    Формат: температура цифрами + осадки словами, напр. «-8°C (мин -12), снег».
+    Минимальная температура показывается всегда — от неё зависит режим зимнего
+    бетонирования (СП 70.13330: мин. суточная < 0°C → особый уход).
+
+    Любая ошибка (нет сети, сервис недоступен, дата вне архива) → None: погода
+    это удобство, не блокер — запись журнала создаётся и без неё."""
+    import json
+    import urllib.request
+    import urllib.parse
+
+    today = datetime.utcnow().date()
+    # Прошлые даты — архивный API; сегодня/будущее — прогнозный.
+    if entry_date < today:
+        base = "https://archive-api.open-meteo.com/v1/archive"
+    else:
+        base = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": _BELOKAMENKA_LAT,
+        "longitude": _BELOKAMENKA_LON,
+        "start_date": entry_date.isoformat(),
+        "end_date": entry_date.isoformat(),
+        "daily": "temperature_2m_mean,temperature_2m_min,temperature_2m_max,precipitation_sum,snowfall_sum",
+        "timezone": "Europe/Moscow",
+    }
+    url = base + "?" + urllib.parse.urlencode(params)
+    try:
+        with urllib.request.urlopen(url, timeout=8) as r:
+            data = json.load(r)
+        daily = data.get("daily", {})
+        def _first(key):
+            v = daily.get(key)
+            return v[0] if isinstance(v, list) and v else None
+        t_mean = _first("temperature_2m_mean")
+        t_min = _first("temperature_2m_min")
+        rain = _first("precipitation_sum")
+        snow = _first("snowfall_sum")
+        if t_mean is None:
+            return None
+        if snow and snow > 0:
+            precip = "снег"
+        elif rain and rain > 0:
+            precip = "дождь"
+        else:
+            precip = "без осадков"
+        s = f"{round(t_mean):+d}°C"
+        if t_min is not None:
+            s += f" (мин {round(t_min):+d})"
+        s += f", {precip}"
+        return s
+    except Exception:
+        return None
+
+
 def create_work_log_entry(
     session: Session, work_order_id: str, entry_date: date, work_done: str,
     weather: str | None = None, note: str | None = None, created_by: str | None = None,
