@@ -1490,11 +1490,22 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
     employees = db.scalars(
         select(Employee).where(Employee.contract_end_date.is_(None)).order_by(Employee.full_name)
     ).all()
-    emp_options = "".join(f'<option value="{e.id}">{e.full_name}</option>' for e in employees)
+    # Разведение по ролям 782н:
+    #  - руководитель — только с 3-й группой по высоте (по объекту это Буц; список
+    #    сам расширится, если кто-то ещё пройдёт обучение на 3-ю группу);
+    #  - исполнитель и члены бригады — табельные (off_tabel=False), т.к. руководитель
+    #    и исполнитель по Правилам не могут быть одним лицом.
+    supervisors = [e for e in employees if e.height_safety_group and "3-я гр." in e.height_safety_group]
+    workers = [e for e in employees if not e.off_tabel]
+    # Если ни у кого нет 3-й группы — не оставляем выпадашку пустой (иначе наряд не
+    # создать вообще); показываем всех и полагаемся на проверку check_work_order_problems.
+    supervisor_pool = supervisors or employees
+    emp_options = "".join(f'<option value="{e.id}">{e.full_name}</option>' for e in supervisor_pool)
+    worker_options = "".join(f'<option value="{e.id}">{e.full_name}</option>' for e in workers)
     emp_checkboxes = "".join(
         f'<label style="display:block;margin:2px 0"><input type="checkbox" name="member_ids" '
         f'id="memberCb_{e.id}" value="{e.id}"> {e.full_name}</label>'
-        for e in employees
+        for e in workers
     )
     brigades = prod.get_brigades(db)
     brigade_options = "".join(f'<option value="{b.id}">{b.name}</option>' for b in brigades)
@@ -1547,7 +1558,7 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
 <label>Ответственный руководитель работ:
 <select name="responsible_supervisor_id" required>{emp_options}</select></label>
 <label>Ответственный исполнитель работ (бригадир):
-<select name="responsible_executor_id" required>{emp_options}</select></label>
+<select name="responsible_executor_id" required>{worker_options}</select></label>
 <label>Действует с: <input type="date" name="valid_from" required></label>
 <label>Действует по: <input type="date" name="valid_to" required></label>
 <label>Выбрать готовую бригаду (необязательно):
@@ -2122,10 +2133,14 @@ def brigades_page(request: Request, db: Session = Depends(get_db)):
     employees = db.scalars(
         select(Employee).where(Employee.contract_end_date.is_(None)).order_by(Employee.full_name)
     ).all()
+    # off_tabel-сотрудники (ИП-руководитель) не входят в состав бригады-исполнителей
+    # по Правилам 782н. Пул выбора — без них; имена уже сохранённых членов берём из
+    # полного employees, чтобы состав не пропадал из сводки.
+    workers = [e for e in employees if not e.off_tabel]
     emp_checkboxes = "".join(
         f'<label style="display:block;margin:2px 0"><input type="checkbox" name="member_ids" '
         f'value="{e.id}"> {e.full_name}</label>'
-        for e in employees
+        for e in workers
     )
 
     def brigade_row(b) -> str:
@@ -2135,7 +2150,7 @@ def brigades_page(request: Request, db: Session = Depends(get_db)):
         edit_checkboxes = "".join(
             f'<label style="display:block;margin:2px 0"><input type="checkbox" name="member_ids" '
             f'value="{e.id}"{" checked" if e.id in member_ids else ""}> {html.escape(e.full_name)}</label>'
-            for e in employees
+            for e in workers
         )
         return (
             f'<div class="card">{html.escape(b.name)}<br>'
