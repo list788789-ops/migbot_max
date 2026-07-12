@@ -1597,6 +1597,17 @@ def work_log_page(request: Request, db: Session = Depends(get_db)):
 <p class="muted">Внутренний электронный журнал: одна запись — один день работ по наряду. Место, работа и
 состав берутся из наряда. Погодные условия важны для зимнего бетонирования. Подпись УКЭП (КриптоПро)
 подключается отдельно — пока записи в статусе «черновик».</p>
+<details style="margin:8px 0"><summary style="cursor:pointer;color:#555">ℹ️ О законности электронного ведения</summary>
+<div class="muted" style="margin-top:6px;font-size:0.92em;line-height:1.5">
+<p>Это <b>внутренний</b> журнал ИП для собственного учёта и как основание для актов/отчётов. Вести его
+электронно вы вправе свободно — это ваш документ, он не обязан соответствовать государственному формату.</p>
+<p>Он <b>не заменяет</b> официальный Общий журнал работ по Градостроительному кодексу (форма и порядок —
+приказ Минстроя № 1026/пр, электронное ведение — № 344/пр, действуют с 01.09.2023). Официальный ОЖР ведёт
+<b>генподрядчик</b>, ответственный за строительство объекта, а не субподрядчик; его электронная форма требует
+XML-схемы Минстроя, УКЭП на каждой записи и выгрузки в нередактируемые файлы.</p>
+<p>УКЭП в этом журнале — <b>ваше решение</b> для юридической значимости записей перед заказчиком/генподрядчиком,
+а не обязательное требование закона к внутреннему журналу.</p>
+</div></details>
 
 <section class="grid">
 <h2>Записи журнала ({len(entries)})</h2>
@@ -1616,7 +1627,7 @@ def work_log_page(request: Request, db: Session = Depends(get_db)):
 <label>Наряд-допуск: <select name="work_order_id" required>{wo_options}</select></label>
 <label>Дата: <input type="date" name="entry_date" required></label>
 <label>Выполнено за день:<br><textarea name="work_done" rows="3" required style="width:100%"></textarea></label>
-<input type="text" name="weather" placeholder="Погодные условия (температура, осадки)">
+<input type="text" name="weather" placeholder="Погода (пусто = подтянуть автоматически по Белокаменке)">
 <input type="text" name="note" placeholder="Примечания (необязательно)">
 <button type="submit">Добавить запись</button>
 </form>
@@ -1644,9 +1655,14 @@ def work_log_create(
     except ValueError:
         raise HTTPException(400, "Неверная дата.")
     actor = _actor_name(request, db)
+    # Погода: ручной ввод в приоритете; если поле пустое — тянем из Open-Meteo
+    # по координатам Белокаменки на дату записи. Не получилось — остаётся пустым.
+    weather_val = weather.strip()
+    if not weather_val:
+        weather_val = prod.fetch_weather_belokamenka(d) or ""
     prod.create_work_log_entry(
         db, work_order_id, d, work_done.strip(),
-        weather=weather.strip() or None, note=note.strip() or None, created_by=actor,
+        weather=weather_val or None, note=note.strip() or None, created_by=actor,
     )
     return RedirectResponse("/production/journals/work-log", status_code=303)
 
