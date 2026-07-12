@@ -80,6 +80,8 @@ from models import (
     RotationReturn,
     SystemFlag,
     WorkOrderMember,
+    WorkOrderMemberChange,
+    MemberChangeType,
     WorkOrder,
     WorkType,
     InstructionType,
@@ -1584,6 +1586,51 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
             f'<fieldset><legend>Отметьте членов бригады</legend>{member_cbs}</fieldset>'
             f'<button type="submit">Сохранить состав</button></form></details>'
         )
+        # --- Пункт 7: изменения состава действующего наряда (782н) ---
+        stats = prod.work_order_change_stats(db, o.id)
+        # Ввести можно тех, кого НЕТ в составе; вывести — тех, кто В составе.
+        not_in = [e for e in workers if e.id not in member_ids_set]
+        in_crew = [e for e in workers if e.id in member_ids_set]
+        add_opts = "".join(f'<option value="{e.id}">{html.escape(e.full_name)}</option>' for e in not_in)
+        rem_opts = "".join(f'<option value="{e.id}">{html.escape(e.full_name)}</option>' for e in in_crew)
+        changes_hist = "".join(
+            f'<li class="muted">{"➕ " + html.escape(getattr(ch.employee, "full_name", "?")) if ch.change_type == MemberChangeType.ADDED else "➖ " + html.escape(getattr(ch.employee, "full_name", "?"))} · '
+            f'{ch.changed_at:%d.%m %H:%M} · разрешил: {html.escape(ch.ordered_by or "—")}</li>'
+            for ch in prod.get_member_changes(db, o.id)
+        )
+        # Счётчик и блокировка по правилу половины.
+        if stats["at_limit"]:
+            limit_note = (
+                f'<p class="badge red">Достигнут предел изменений состава '
+                f'({stats["changes"]} из {stats["limit"]}). По 782н дальнейшее изменение '
+                f'аннулирует наряд — требуется НОВЫЙ наряд-допуск.</p>'
+            )
+            change_forms = ""
+        else:
+            limit_note = (
+                f'<p class="muted">Изменено: {stats["changes"]} из {stats["limit"]} допустимых '
+                f'(первоначально {stats["initial"]} чел.). Свыше половины — новый наряд.</p>'
+            )
+            change_forms = (
+                (f'<form method="post" action="/production/work-orders/{o.id}/member-change" style="margin-top:8px">'
+                 f'<input type="hidden" name="change_type" value="added">'
+                 f'<label>Ввести работника: <select name="employee_id" required>{add_opts}</select></label>'
+                 f'<input type="text" name="ordered_by" placeholder="Кто дал указание (ФИО)" required>'
+                 f'<button type="submit">➕ Ввести в состав</button></form>' if add_opts else '')
+                +
+                (f'<form method="post" action="/production/work-orders/{o.id}/member-change" style="margin-top:8px">'
+                 f'<input type="hidden" name="change_type" value="removed">'
+                 f'<label>Вывести работника: <select name="employee_id" required>{rem_opts}</select></label>'
+                 f'<input type="text" name="ordered_by" placeholder="Кто дал указание (ФИО)" required>'
+                 f'<button type="submit">➖ Вывести из состава</button></form>' if rem_opts else '')
+            )
+        p7 = (
+            f'<details style="margin-top:8px"><summary style="cursor:pointer">📝 Пункт 7: изменения состава '
+            f'({stats["changes"]})</summary>'
+            f'{limit_note}'
+            f'{("<ul>" + changes_hist + "</ul>") if changes_hist else ""}'
+            f'{change_forms}</details>'
+        )
         return (
             f'<div class="card">№{o.number} — {o.work_description}<br>'
             f'<span class="muted">{o.location} · {o.valid_from:%d.%m}–{o.valid_to:%d.%m.%Y}</span><br>'
@@ -1593,7 +1640,7 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
             f'<a class="btn secondary" href="/production/work-orders/{o.id}/print">Печатный бланк</a> '
             f'<form method="post" action="/production/work-orders/{o.id}/close" style="display:inline">'
             f'<button type="submit" class="btn secondary">Закрыть наряд</button></form>'
-            f'{edit_members}</div>'
+            f'{edit_members}{p7}</div>'
         )
 
     rows = "".join(order_row(o) for o in orders)
@@ -1773,8 +1820,43 @@ def work_order_set_members(
     db.query(WorkOrderMember).filter_by(work_order_id=work_order_id).delete()
     for eid in member_ids:
         db.add(WorkOrderMember(work_order_id=work_order_id, employee_id=eid))
+    # Фиксируем первоначальный размер бригады при первом заполнении состава
+    # (момент выпуска) — база для правила 782н о половине. Позже не трогаем.
+    if not order.initial_member_count and member_ids:
+        order.initial_member_count = len(member_ids)
     db.commit()
     return RedirectResponse("/production/work-orders", status_code=303)
+
+
+@app.post("/production/work-orders/{work_order_id}/member-change")
+def work_order_member_change(
+    work_order_id: str,
+    request: Request,
+    change_type: str = Form(...),
+    employee_id: str = Form(...),
+    ordered_by: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    """Оформление изменения состава по пункту 7 (ввод/вывод) с проверкой правила
+    половины (782н). При превышении половины изменение не вносится."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    try:
+        ct = MemberChangeType(change_type)
+    except ValueError:
+        raise HTTPException(400, "Неверный тип изменения.")
+    actor = _actor_name(request, db)
+    ok, msg = prod.add_member_change(
+        db, work_order_id, employee_id, ct, ordered_by.strip(), created_by=actor
+    )
+    # Сообщение (в т.ч. блокировку «нужен новый наряд») показываем на отдельной странице.
+    body = (
+        f'<h1>{"✅" if ok else "⚠️"} Пункт 7: изменение состава</h1>'
+        f'<section class="grid"><p class="{"muted" if ok else "warning-banner"}">{html.escape(msg)}</p>'
+        f'<p><a class="btn" href="/production/work-orders">К нарядам</a></p></section>'
+    )
+    return HTMLResponse(_render("Изменение состава", body, active="production",
+                                role=request.session.get("role", "")))
 
 
 @app.post("/production/work-orders/{work_order_id}/close")
