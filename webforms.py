@@ -1559,8 +1559,8 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
 <select name="responsible_supervisor_id" required>{emp_options}</select></label>
 <label>Ответственный исполнитель работ (бригадир):
 <select name="responsible_executor_id" required>{worker_options}</select></label>
-<label>Действует с: <input type="date" name="valid_from" required></label>
-<label>Действует по: <input type="date" name="valid_to" required></label>
+<label>Действует с: <input type="date" id="validFrom" name="valid_from" onchange="_applyValidTo()" required></label>
+<label>Действует по: <input type="date" id="validTo" name="valid_to" required></label>
 <label>Выбрать готовую бригаду (необязательно):
 <select id="brigadeSelect"><option value="">— вручную —</option>{brigade_options}</select></label>
 <button type="button" class="secondary" onclick="_applyBrigade()">Применить состав</button>
@@ -1594,6 +1594,20 @@ function _applyBrigade(){{
 function _applyTitul(){{
   var s = document.getElementById('titulSelect');
   if (s.value) document.getElementById('location').value = s.value;
+}}
+function _applyValidTo(){{
+  // Автозаполнение "Действует по" = "с" + 14 дней (предельный срок наряда по
+  // 782н: не более 15 дней, т.е. дата начала + 14). Ставим ТОЛЬКО если поле ещё
+  // пустое — иначе не затираем срок, вписанный кадровиком вручную.
+  var from = document.getElementById('validFrom');
+  var to = document.getElementById('validTo');
+  if (!from.value || to.value) return;
+  var d = new Date(from.value + 'T00:00:00');
+  d.setDate(d.getDate() + 14);
+  var y = d.getFullYear();
+  var m = String(d.getMonth() + 1).padStart(2, '0');
+  var day = String(d.getDate()).padStart(2, '0');
+  to.value = y + '-' + m + '-' + day;
 }}
 </script>
 """
