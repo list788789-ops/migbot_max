@@ -1625,6 +1625,15 @@ function _applyValidTo(){{
   var day = String(d.getDate()).padStart(2, '0');
   to.value = y + '-' + m + '-' + day;
 }}
+// При загрузке применяем автоподстановки к значениям, которые браузер восстановил
+// сам (bfcache/автозаполнение формы) — для них событие change НЕ срабатывает, и без
+// этого поля остались бы пустыми, хотя селект уже показывает выбор. Вызываем только
+// функции с guard на пустоту (не затирают заполненное вручную). _applyTitul НЕ здесь:
+// он всегда перезаписывает «место работ», на загрузке это стёрло бы ручной ввод.
+document.addEventListener('DOMContentLoaded', function(){{
+  _applyWorkType();
+  _applyValidTo();
+}});
 </script>
 """
     return _render("Наряды-допуски", body, active="production", role=request.session.get("role", ""))
