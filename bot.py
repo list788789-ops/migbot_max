@@ -1043,6 +1043,11 @@ async def on_callback(event: MessageCallback):
 
     if payload.startswith("reasoncode:") and payload.endswith(":force"):
         _, employee_id, code, _force = payload.split(":", 3)
+        # Убираем сообщение «Причина?» с кнопками — оно отработало, чтобы не копилось в чате.
+        try:
+            await event.message.delete()
+        except Exception:
+            log.exception("reasoncode:force — не удалось удалить сообщение с кнопками причины")
         with Session(engine) as session:
             employee = session.get(Employee, employee_id)
             full_name = employee.full_name if employee is not None else "—"
@@ -1058,6 +1063,11 @@ async def on_callback(event: MessageCallback):
 
     if payload.startswith("reasoncode:"):
         _, employee_id, code = payload.split(":", 2)
+        # Убираем сообщение «Причина?» с кнопками — оно отработало, чтобы не копилось в чате.
+        try:
+            await event.message.delete()
+        except Exception:
+            log.exception("reasoncode — не удалось удалить сообщение с кнопками причины")
         with Session(engine) as session:
             employee = session.get(Employee, employee_id)
             if employee is None:
