@@ -1101,17 +1101,23 @@ value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
         _med_done = False
     # Форму загрузки справки показываем, пока СКАНА СПРАВКИ НЕТ — независимо от статуса медкомиссии
     # (иначе тупик: медкомиссия «пройдена», а скана нет и загрузить негде; пакет требует справку).
+    if emp.registration_status == RegistrationStatus.PRIOR:
+        _med_html = ('<b style="color:#1a7f37">Грин-карта с прошлого въезда</b> '
+                     '<span class="muted">— медкомиссия и справка не требуются (повторный въезд)</span>')
     _cert_uploaded = False
     try:
         _cert_uploaded = bool((_s3_list_for_employee(emp.id).get("medical_certificate") or {}).get("present"))
     except Exception:
         _cert_uploaded = False
+    # Повторный въезд (PRIOR): грин-карта с прошлого раза, медкомиссия и дактилоскопия
+    # заново не проходятся — сканы справок для пакета не требуются (правило согласовано 2026-07).
+    _is_prior = emp.registration_status == RegistrationStatus.PRIOR
     # Подсказка: медкомиссия пройдена, но скана справки нет — он нужен для пакета Госуслуг.
     _cert_hint = ""
-    if _med_done and not _cert_uploaded:
+    if _med_done and not _cert_uploaded and not _is_prior:
         _cert_hint = '<br><span style="color:#c47f00;font-size:13px">⚠ Медкомиссия пройдена, но скан справки не загружен — он нужен для пакета Госуслуг. Загрузите ниже.</span>'
     _med_upload = ""
-    if not _cert_uploaded:
+    if not _cert_uploaded and not _is_prior:
         _med_upload = f'''<form method="post" action="/employees/{emp.id}/scan/upload" enctype="multipart/form-data" style="margin-top:8px">
 <input type="hidden" name="scan_type" value="medical_certificate">
 <input type="file" name="files" accept="application/pdf,image/*" multiple required style="display:block;width:100%;margin:6px 0;padding:8px;border:1px solid #d9dde3;border-radius:8px;background:#fff;font-size:15px">
@@ -1143,6 +1149,9 @@ value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
         _dact_html = (
             '<b style="color:#c47f00">Дактилоскопия не сделана</b>' + _dact_seq + '<br>' + _dact_form
         )
+    if emp.registration_status == RegistrationStatus.PRIOR:
+        _dact_html = ('<b style="color:#1a7f37">Грин-карта с прошлого въезда</b> '
+                      '<span class="muted">— дактилоскопия не требуется (повторный въезд)</span>')
     _medzone_section = f'''
 <fieldset>
 <legend>Медкомиссия и дактилоскопия</legend>
