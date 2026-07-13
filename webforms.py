@@ -526,8 +526,8 @@ body.login-page{margin:0;min-height:100dvh;display:flex;flex-direction:column;ju
 .auth a.btn{display:inline-block;margin-top:14px;color:var(--accent);text-decoration:underline;font-size:14px}
 @media(min-width:520px){ .auth button{flex:0 0 auto} }
 @media(min-width:768px){
-  body.login-page{justify-content:center;background-position:right bottom;background-size:min(46vw,600px) auto}
-  .auth{padding:0 24px}
+  body.login-page{justify-content:center;align-items:flex-start;background-position:center bottom;background-size:min(70vw,820px) auto}
+  .auth{margin:0;padding:0 24px 0 clamp(24px,6vw,96px)}
 }
 </style></head>
 <body class="login-page">
