@@ -868,6 +868,38 @@ class NotificationSubscriber(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class EventDeletionLog(Base):
+    """Аудит удаления событий из карточки сотрудника (2026-07, кнопка «Удалить
+    событие» у ADMIN). Удаление НЕ физическое: obligations помечаются is_current=False
+    /CANCELLED, даты-триггеры обнуляются, но всё, что нужно для отката, сохраняется
+    здесь в snapshot. UI-восстановления пока нет — откат делается вручную по snapshot
+    (SQL), поэтому важно, чтобы снимок был полным.
+
+    event_kind:
+      'obligation' — удалено одно обязательство (target = ObligationType.value).
+      'date'       — обнулена дата-триггер (target = имя поля: entry_date/contract_date/
+                     address_since/dactyloscopy_date); при этом каскадно затронуты
+                     связанные obligations (для триггеров — отменены; для dactyloscopy_date
+                     — DACTYLOSCOPY возвращена в PENDING). Все затронутые записи с их
+                     ПРЕЖНИМ состоянием лежат в snapshot['affected'].
+
+    snapshot — JSON-строка. Для 'obligation': {obligation_id, type, prev_status,
+    prev_is_current, trigger_date, deadline_date}. Для 'date': {field, old_value,
+    affected:[{obligation_id, type, prev_status, prev_is_current}, ...]}.
+
+    Создаётся через create_all (новая таблица), ALTER не требуется."""
+
+    __tablename__ = "event_deletion_log"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    employee_id: Mapped[str] = mapped_column(ForeignKey("employees.id"), nullable=False)
+    actor: Mapped[str] = mapped_column(String, nullable=False)  # ФИО/логин админа, кто удалил
+    event_kind: Mapped[str] = mapped_column(String, nullable=False)  # 'obligation' | 'date'
+    target: Mapped[str] = mapped_column(String, nullable=False)  # тип обязательства / имя поля даты
+    snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON для отката
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class User(Base):
     """Пользователь системы (прораб/кадровик/админ). Логин — номер телефона (уникальный).
     Пароль хранится ТОЛЬКО хэшем (bcrypt через passlib), открытый пароль нигде не сохраняется.
