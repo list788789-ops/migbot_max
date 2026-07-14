@@ -2661,10 +2661,15 @@ def orders_page(request: Request, db: Session = Depends(get_db)):
 
     _category_label = {
         OrderCategory.PERSONNEL: "Кадровый", OrderCategory.PRODUCTION: "Производственный",
-        OrderCategory.OTHER: "Прочее",
+        OrderCategory.LABOR_PROTECTION: "Охрана труда", OrderCategory.TRAINING: "Обучение и инструктажи",
+        OrderCategory.HEIGHT_WORK: "Работы на высоте", OrderCategory.FIRE_SAFETY: "Пожарная безопасность",
+        OrderCategory.ELECTRICAL: "Электробезопасность", OrderCategory.OTHER: "Прочее",
     }
     _category_badge = {
-        OrderCategory.PERSONNEL: "orange", OrderCategory.PRODUCTION: "green", OrderCategory.OTHER: "neutral",
+        OrderCategory.PERSONNEL: "orange", OrderCategory.PRODUCTION: "green",
+        OrderCategory.LABOR_PROTECTION: "green", OrderCategory.TRAINING: "neutral",
+        OrderCategory.HEIGHT_WORK: "amber", OrderCategory.FIRE_SAFETY: "red",
+        OrderCategory.ELECTRICAL: "neutral", OrderCategory.OTHER: "neutral",
     }
 
     def order_row(o) -> str:
@@ -2678,6 +2683,19 @@ def orders_page(request: Request, db: Session = Depends(get_db)):
         )
 
     rows = "".join(order_row(o) for o in orders)
+    # Опции генератора приказов по ОТ — сгруппированы по разделам (optgroup) из справочника
+    # prod.OT_ORDERS. topic (2-й элемент кортежа) — подпись; ключ приказа — value.
+    _ot_groups = {}
+    for _key in prod.OT_ORDER_KEYS:
+        _cat, _topic = prod.OT_ORDERS[_key][0], prod.OT_ORDERS[_key][1]
+        _ot_groups.setdefault(_cat, []).append((_key, _topic))
+    _ot_options = ""
+    for _cat, _items in _ot_groups.items():
+        _ot_options += f'<optgroup label="{html.escape(prod.OT_SECTIONS[_cat])}">'
+        for _key, _topic in _items:
+            _ot_options += f'<option value="{_key}">{html.escape(_topic)}</option>'
+        _ot_options += '</optgroup>'
+    _today_iso = datetime.now(MSK).date().isoformat()
     # Предзаполнение первой записи данными уже готового приказа №20-ПСМ/2026 —
     # только пока реестр пуст, чтобы не подставлять эти значения повторно для
     # следующих приказов.
@@ -2694,7 +2712,19 @@ def orders_page(request: Request, db: Session = Depends(get_db)):
 <h1>📑 Приказы</h1>
 <section class="grid"><h2>Реестр ({len(orders)})</h2>{rows or '<p class="muted">Пока пусто.</p>'}</section>
 <section>
-<h2>Новый приказ</h2>
+<h2>Сгенерировать приказ по охране труда</h2>
+<p class="muted">Готовые шаблоны приказов по ОТ (реквизиты ИП Буц подставляются автоматически).
+Выберите приказ, укажите номер и дату — система сформирует .docx для печати. Подписанный скан
+загрузите обратно через форму ниже.</p>
+<form method="post" action="/production/orders/generate">
+<label>Приказ:<br><select name="order_key" required>{_ot_options}</select></label>
+<label>Номер: <input type="text" name="number" placeholder="например: 01-ОТ/2026" required></label>
+<label>Дата: <input type="date" name="order_date" value="{_today_iso}" required></label>
+<button type="submit">Сгенерировать .docx</button>
+</form>
+</section>
+<section>
+<h2>Новый приказ (в реестр)</h2>
 <form method="post" action="/production/orders/new" enctype="multipart/form-data">
 <input type="text" name="number" id="orderNumber" placeholder="Номер (например: 20-ПСМ/2026)" value="{_pf_number}" required>
 <label>Дата: <input type="date" name="order_date" id="orderDate" value="{_pf_date}" required></label>
@@ -2770,7 +2800,42 @@ async def order_create(
     return RedirectResponse("/production/orders", status_code=303)
 
 
-@app.get("/production/orders/{order_id}/download")
+@app.post("/production/orders/generate")
+def order_generate(
+    request: Request,
+    order_key: str = Form(...),
+    number: str = Form(...),
+    order_date: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    """Генерирует приказ по ОТ из справочника prod.OT_ORDERS и отдаёт .docx для печати.
+    В реестр запись НЕ создаётся автоматически — после печати и подписи пользователь
+    загружает подписанный скан через форму «Новый приказ» (номер/тема заполнятся из имени)."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    if order_key not in prod.OT_ORDERS:
+        raise HTTPException(400, "Неизвестный приказ.")
+    try:
+        d = datetime.strptime(order_date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(400, "Неверная дата.")
+    import tempfile, os
+    tmpdir = tempfile.mkdtemp()
+    path = prod.generate_ot_order_docx(order_key, number, d, tmpdir)
+    with open(path, "rb") as f:
+        data = f.read()
+    topic = prod.OT_ORDERS[order_key][1]
+    safe_topic = topic[:40].replace("/", "-").replace(" ", "_")
+    fn = f"Приказ_{number.replace('/', '-')}_{safe_topic}.docx"
+    try:
+        os.remove(path); os.rmdir(tmpdir)
+    except OSError:
+        pass
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": _content_disposition(fn)},
+    )
 def order_download(order_id: str, request: Request, db: Session = Depends(get_db)):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
