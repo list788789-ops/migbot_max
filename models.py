@@ -729,6 +729,12 @@ class InternalOrder(Base):
     )
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
     scan_key: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Привязка записи реестра к шаблону приказа по ОТ (ключ из production.OT_ORDERS: suot,
+    # responsible_height, ...). Проставляется при генерации приказа. По нему контроль в списке
+    # приказов знает, какой из 13 обязательных приказов уже заведён и есть ли у него скан.
+    # NULL — приказ не из справочника ОТ (кадровый, произвольный). Миграция:
+    #   ALTER TABLE internal_orders ADD COLUMN order_key VARCHAR;
+    order_key: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
