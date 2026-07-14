@@ -1557,6 +1557,45 @@ def wo_journal_print(request: Request, db: Session = Depends(get_db)):
 
 # --- Общий журнал работ (ОЖР) -------------------------------------------------
 
+# JS тестового прогона КриптоПро — вынесен из f-string (фигурные скобки JS иначе ломают
+# подстановку). Подключается cadesplugin_api.js; кнопка обращается к плагину, показывает
+# сертификаты на токене и НИЧЕГО не подписывает. Нужен файл cadesplugin_api.js в статике
+# (из дистрибутива «КриптоПро ЭЦП Browser plug-in»); без него кнопка честно скажет
+# «плагин не обнаружен».
+_CP_TEST_JS = """
+<script src="/cadesplugin_api.js"></script>
+<script>
+function _cpShow(t){var el=document.getElementById('cpResult');el.style.display='block';el.textContent=t;}
+function _cpTest(){
+  _cpShow('Обращаюсь к плагину…');
+  if (typeof cadesplugin === 'undefined'){
+    _cpShow('❌ Плагин не обнаружен.\\nПроверьте: установлен «КриптоПро ЭЦП Browser plug-in», включено расширение браузера, и подключён файл cadesplugin_api.js.');
+    return;
+  }
+  cadesplugin.then(function(){
+    cadesplugin.async_spawn(function*(){
+      try{
+        var oStore = yield cadesplugin.CreateObjectAsync("CAdESCOM.Store");
+        yield oStore.Open(2, "My", 0);
+        var certs = yield oStore.Certificates;
+        var count = yield certs.Count;
+        if (!count){ _cpShow('⚠ Плагин работает, но сертификатов не найдено. Вставьте токен или установите сертификат.'); yield oStore.Close(); return; }
+        var lines = ['✅ Плагин и ключ доступны. Сертификатов найдено: ' + count, ''];
+        for (var i=1; i<=count; i++){
+          var c = yield certs.Item(i);
+          var subj = yield c.SubjectName;
+          lines.push('• ' + subj);
+        }
+        _cpShow(lines.join('\\n'));
+        yield oStore.Close();
+      }catch(e){ _cpShow('❌ Ошибка обращения к хранилищу: ' + e); }
+    });
+  }, function(err){ _cpShow('❌ Плагин не инициализирован: ' + err); });
+}
+</script>
+"""
+
+
 @app.get("/production/journals/work-log", response_class=HTMLResponse)
 def work_log_page(request: Request, db: Session = Depends(get_db)):
     if not _logged_in(request):
@@ -1578,18 +1617,29 @@ def work_log_page(request: Request, db: Session = Depends(get_db)):
             f'<span class="badge neutral">Подписано ({html.escape(e.signed_by or "")})</span>'
             if signed else '<span class="badge orange">Черновик — не подписано</span>'
         )
-        del_btn = (
-            "" if signed else
-            f'<form method="post" action="/production/journals/work-log/{e.id}/delete" style="display:inline"'
-            f' onsubmit="return confirm(\'Удалить запись журнала?\')">'
-            f'<button type="submit" class="btn secondary">🗑 Удалить</button></form>'
-        )
+        # ТЕСТОВЫЙ набор кнопок. На проде: убрать «Редактировать» и «Снять подпись»,
+        # оставить только постановку подписи (необратимо) — см. пометки в production.py.
+        if signed:
+            btns = (
+                f'<form method="post" action="/production/journals/work-log/{e.id}/unsign" style="display:inline"'
+                f' onsubmit="return confirm(\'Снять подпись (тест)? Запись вернётся в черновик.\')">'
+                f'<button type="submit" class="btn secondary">↩ Снять подпись (тест)</button></form>'
+            )
+        else:
+            btns = (
+                f'<a class="btn secondary" href="/production/journals/work-log/{e.id}/edit">✏ Редактировать</a> '
+                f'<form method="post" action="/production/journals/work-log/{e.id}/sign-test" style="display:inline">'
+                f'<button type="submit" class="btn">🖊 Подписать (тест)</button></form> '
+                f'<form method="post" action="/production/journals/work-log/{e.id}/delete" style="display:inline"'
+                f' onsubmit="return confirm(\'Удалить запись журнала?\')">'
+                f'<button type="submit" class="btn secondary">🗑 Удалить</button></form>'
+            )
         rows += (
             f'<div class="card"><b>{e.entry_date:%d.%m.%Y}</b> · {place}<br>'
             f'<span>{html.escape(e.work_done)}</span><br>'
             f'{f"<span class=\"muted\">Погода: {html.escape(e.weather)}</span><br>" if e.weather else ""}'
             f'{f"<span class=\"muted\">{html.escape(e.note)}</span><br>" if e.note else ""}'
-            f'{sign_badge} {del_btn}</div>'
+            f'{sign_badge} {btns}</div>'
         )
 
     body = f"""
@@ -1632,9 +1682,18 @@ XML-схемы Минстроя, УКЭП на каждой записи и вы
 <button type="submit">Добавить запись</button>
 </form>
 </section>
+<section>
+<h2>Проверка ключа (КриптоПро)</h2>
+<p class="muted">Тестовый прогон подписи: вставьте токен и нажмите. Браузер обратится к
+«КриптоПро ЭЦП Browser plug-in» и покажет найденные сертификаты. Ничего не подписывает
+и на сервер не отправляет — только проверка, что связка браузер↔плагин↔ключ работает.</p>
+<button type="button" class="btn secondary" onclick="_cpTest()">🔑 Проверить ключ</button>
+<pre id="cpResult" style="white-space:pre-wrap;margin-top:8px;font-size:13px;color:#333;background:#f7f8fa;padding:8px;border-radius:8px;display:none"></pre>
+</section>
 <p><a class="btn secondary" href="/production/journals">← Журналы</a></p>
 """
-    return _render("Общий журнал работ", body, active="production", role=request.session.get("role", ""))
+    return _render("Общий журнал работ", body + _CP_TEST_JS, active="production", role=request.session.get("role", ""))
+
 
 
 @app.post("/production/journals/work-log/new")
@@ -1672,6 +1731,89 @@ def work_log_delete(entry_id: str, request: Request, db: Session = Depends(get_d
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
     prod.delete_work_log_entry(db, entry_id)
+    return RedirectResponse("/production/journals/work-log", status_code=303)
+
+
+# --- ТЕСТОВЫЙ блок работы с подписью ОЖР (на проде убрать edit и unsign) -------
+
+@app.get("/production/journals/work-log/{entry_id}/edit", response_class=HTMLResponse)
+def work_log_edit_form(entry_id: str, request: Request, db: Session = Depends(get_db)):
+    """ТЕСТ: форма редактирования черновика ОЖР. Подписанные не редактируются."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    e = db.get(WorkLogEntry, entry_id)
+    if e is None:
+        raise HTTPException(404, "Запись не найдена")
+    if e.sign_status == WorkLogSignStatus.SIGNED:
+        return RedirectResponse("/production/journals/work-log", status_code=303)
+    wo = e.work_order
+    place = f"№{wo.number} · {html.escape(wo.location)}" if wo else "—"
+    body = f"""
+<h1>✏ Редактирование записи ОЖР</h1>
+<p class="muted">Наряд: {place}. Тестовый режим — на проде подписанные записи не редактируются.</p>
+<form method="post" action="/production/journals/work-log/{e.id}/edit">
+<label>Дата: <input type="date" name="entry_date" value="{e.entry_date.isoformat()}" required></label>
+<label>Выполнено за день:<br><textarea name="work_done" rows="3" required style="width:100%">{html.escape(e.work_done)}</textarea></label>
+<input type="text" name="weather" value="{html.escape(e.weather or '')}" placeholder="Погода">
+<input type="text" name="note" value="{html.escape(e.note or '')}" placeholder="Примечания">
+<button type="submit">Сохранить</button>
+</form>
+<p><a class="btn secondary" href="/production/journals/work-log">← Назад к журналу</a></p>
+"""
+    return _render("Редактирование ОЖР", body, active="production", role=request.session.get("role", ""))
+
+
+@app.post("/production/journals/work-log/{entry_id}/edit")
+def work_log_edit_submit(
+    entry_id: str,
+    request: Request,
+    entry_date: str = Form(...),
+    work_done: str = Form(...),
+    weather: str = Form(""),
+    note: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    """ТЕСТ: сохранение отредактированного черновика."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    from datetime import date as _date
+    try:
+        d = _date.fromisoformat(entry_date)
+    except ValueError:
+        raise HTTPException(400, "Неверная дата.")
+    prod.update_work_log_entry(
+        db, entry_id, entry_date=d, work_done=work_done.strip(),
+        weather=weather.strip() or None, note=note.strip() or None,
+    )
+    return RedirectResponse("/production/journals/work-log", status_code=303)
+
+
+@app.post("/production/journals/work-log/{entry_id}/sign-test")
+def work_log_sign_test(entry_id: str, request: Request, db: Session = Depends(get_db)):
+    """ТЕСТ-подпись: помечает запись подписанной БЕЗ реальной криптографии. Серийник = «ТЕСТ»,
+    хеш = sha256 содержимого. Реальная подпись придёт с клиента (КриптоПро) в ту же
+    prod.sign_work_log_entry, когда подключим плагин — здесь только имитация потока."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    e = db.get(WorkLogEntry, entry_id)
+    if e is None:
+        raise HTTPException(404, "Запись не найдена")
+    import hashlib
+    payload = f"{e.entry_date.isoformat()}|{e.work_done}|{e.weather or ''}|{e.note or ''}"
+    content_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    prod.sign_work_log_entry(
+        db, entry_id, signed_by=_actor_name(request, db),
+        cert_serial="ТЕСТ", content_hash=content_hash,
+    )
+    return RedirectResponse("/production/journals/work-log", status_code=303)
+
+
+@app.post("/production/journals/work-log/{entry_id}/unsign")
+def work_log_unsign(entry_id: str, request: Request, db: Session = Depends(get_db)):
+    """ТЕСТ: снять подпись, вернуть в черновик. На проде убрать — подпись необратима."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    prod.unsign_work_log_entry(db, entry_id)
     return RedirectResponse("/production/journals/work-log", status_code=303)
 
 
