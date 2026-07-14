@@ -693,6 +693,19 @@ def get_active_work_orders(session: Session) -> list[WorkOrder]:
     )
 
 
+def get_past_work_orders(session: Session) -> list[WorkOrder]:
+    """Архив — наряды, срок действия которых уже истёк (valid_to < сегодня).
+    Нужны для просмотра/печати прошлого периода (в т.ч. восстановленного задним
+    числом), в раздел «Активные» они не попадают по valid_to."""
+    today = date.today()
+    return (
+        session.query(WorkOrder)
+        .filter(WorkOrder.valid_to < today)
+        .order_by(WorkOrder.valid_from.desc(), WorkOrder.number)
+        .all()
+    )
+
+
 def close_work_order(session: Session, work_order_id: str) -> bool:
     order = session.get(WorkOrder, work_order_id)
     if order is None:
