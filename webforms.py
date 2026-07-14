@@ -2944,8 +2944,9 @@ def brigades_page(request: Request, db: Session = Depends(get_db)):
     # полного employees, чтобы состав не пропадал из сводки.
     workers = [e for e in employees if not e.off_tabel]
     emp_checkboxes = "".join(
-        f'<label style="display:block;margin:2px 0"><input type="checkbox" name="member_ids" '
-        f'value="{e.id}"> {e.full_name}</label>'
+        f'<label class="brig-mem" data-search="{html.escape((e.full_name or "").lower(), quote=True)}" '
+        f'style="display:block;margin:2px 0"><input type="checkbox" name="member_ids" '
+        f'value="{e.id}"> {html.escape(e.full_name)}</label>'
         for e in workers
     )
 
@@ -2954,7 +2955,8 @@ def brigades_page(request: Request, db: Session = Depends(get_db)):
         names = [e.full_name for e in employees if e.id in member_ids]
         # Чекбоксы редактирования: текущие члены отмечены.
         edit_checkboxes = "".join(
-            f'<label style="display:block;margin:2px 0"><input type="checkbox" name="member_ids" '
+            f'<label class="brig-mem" data-search="{html.escape((e.full_name or "").lower(), quote=True)}" '
+            f'style="display:block;margin:2px 0"><input type="checkbox" name="member_ids" '
             f'value="{e.id}"{" checked" if e.id in member_ids else ""}> {html.escape(e.full_name)}</label>'
             for e in workers
         )
@@ -2966,7 +2968,10 @@ def brigades_page(request: Request, db: Session = Depends(get_db)):
             f'<form method="post" action="/production/brigades/{b.id}/update" style="margin-top:8px">'
             f'<input type="text" name="name" value="{html.escape(b.name)}" required '
             f'style="display:block;margin-bottom:6px">'
-            f'<fieldset><legend>Состав</legend>{edit_checkboxes}</fieldset>'
+            f'<fieldset><legend>Состав</legend>'
+            f'<input type="text" placeholder="Фильтр по фамилии…" oninput="_brigFilter(this)" '
+            f'style="width:100%;padding:8px;margin:0 0 6px;border:1px solid #b8c0cc;border-radius:8px">'
+            f'{edit_checkboxes}</fieldset>'
             f'<button type="submit">Сохранить изменения</button>'
             f'</form></details>'
             f'<form method="post" action="/production/brigades/{b.id}/delete" style="display:inline;margin-top:6px"'
@@ -2982,12 +2987,29 @@ def brigades_page(request: Request, db: Session = Depends(get_db)):
 <h2>Новая бригада</h2>
 <form method="post" action="/production/brigades/new">
 <input type="text" name="name" placeholder="Название (например: Бригада бетонщиков №1)" required>
-<fieldset><legend>Состав</legend>{emp_checkboxes}</fieldset>
+<fieldset><legend>Состав</legend>
+<input type="text" placeholder="Фильтр по фамилии…" oninput="_brigFilter(this)" style="width:100%;padding:8px;margin:0 0 6px;border:1px solid #b8c0cc;border-radius:8px">
+{emp_checkboxes}</fieldset>
 <button type="submit">Сохранить</button>
 </form>
 </section>
 <p><a class="btn secondary" href="/production">← Производство</a></p>
-"""
+<script>
+function _brigFilter(inp){{
+  var q = (inp.value || '').toLowerCase().trim();
+  // Фильтруем только внутри своего fieldset — фильтры разных бригад не мешают друг другу.
+  var box = inp.closest('fieldset') || document;
+  box.querySelectorAll('.brig-mem').forEach(function(lbl){{
+    var key = lbl.getAttribute('data-search') || '';
+    // По ПЕРВЫМ БУКВАМ ФАМИЛИИ (первое слово ФИО). Отмеченных не прячем, чтобы выбранный
+    // состав всегда был виден при фильтрации.
+    var surname = key.split(' ')[0] || '';
+    var checked = lbl.querySelector('input') && lbl.querySelector('input').checked;
+    var match = q === '' || surname.indexOf(q) === 0 || checked;
+    lbl.style.display = match ? '' : 'none';
+  }});
+}}
+</script>"""
     return _render("Бригады", body, active="production", role=request.session.get("role", ""))
 
 
