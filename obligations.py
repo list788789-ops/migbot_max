@@ -202,6 +202,32 @@ def create_obligations_for_employee(session: Session, employee: Employee) -> Non
             )
             continue
 
+        # DEPARTURE_NOTICE (снятие с миграционного учёта при убытии) создаётся ТОЛЬКО если
+        # работник реально стоял на учёте — есть действующая (is_current, не CANCELLED)
+        # REGISTRATION. Нельзя снять с учёта того, кого на учёт не ставили: без этой проверки
+        # система вешала уведомление об убытии на каждого уволенного, даже не подававшегося,
+        # и задача висела впустую (разбирали вручную по 7 уволенным). Постановки не было —
+        # уведомление об убытии не требуется (ст.23 №109-ФЗ применяется к стоявшим на учёте).
+        if rule["type"] == ObligationType.DEPARTURE_NOTICE:
+            has_active_registration = (
+                session.query(Obligation)
+                .filter(
+                    Obligation.employee_id == employee.id,
+                    Obligation.type == ObligationType.REGISTRATION,
+                    Obligation.is_current.is_(True),
+                    Obligation.status != ObligationStatus.CANCELLED,
+                )
+                .first()
+                is not None
+            )
+            if not has_active_registration:
+                log.info(
+                    "employee_id=%s не стоял на учёте (нет действующей REGISTRATION) — "
+                    "DEPARTURE_NOTICE не создаётся, снимать нечего",
+                    employee.id,
+                )
+                continue
+
         already_exists = (
             session.query(Obligation)
             .filter_by(employee_id=employee.id, type=rule["type"], trigger_date=trigger_date)
