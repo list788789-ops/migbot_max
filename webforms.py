@@ -2696,6 +2696,45 @@ def orders_page(request: Request, db: Session = Depends(get_db)):
             _ot_options += f'<option value="{_key}">{html.escape(_topic)}</option>'
         _ot_options += '</optgroup>'
     _today_iso = datetime.now(MSK).date().isoformat()
+    # Контроль обязательных приказов по ОТ (все 13): missing / no_scan / ready. Показывает,
+    # что не сгенерировано и что сгенерировано, но скан не загружен (на случай «забыли
+    # распечатать/подписать/приложить»). Готовность = наличие скана.
+    _ot_status = prod.get_ot_orders_status(db)
+    _n_missing = sum(1 for s in _ot_status if s["status"] == "missing")
+    _n_no_scan = sum(1 for s in _ot_status if s["status"] == "no_scan")
+    _n_ready = sum(1 for s in _ot_status if s["status"] == "ready")
+    _ctrl_rows = ""
+    for s in _ot_status:
+        if s["status"] == "ready":
+            mark = '<span class="badge green">✓ скан загружен</span>'
+            action = ""
+        elif s["status"] == "no_scan":
+            mark = '<span class="badge amber">⚠ ждёт скан</span>'
+            rec = s["record"]
+            action = (f'<form method="post" action="/production/orders/{rec.id}/upload-scan" '
+                      f'enctype="multipart/form-data" style="margin-top:4px">'
+                      f'<input type="file" name="scan_file" accept="application/pdf,image/*,.doc,.docx" '
+                      f'required style="display:block;width:100%;margin:4px 0;padding:6px;'
+                      f'border:1px solid #d9dde3;border-radius:6px;background:#fff;font-size:14px">'
+                      f'<button type="submit" class="btn secondary">Загрузить скан</button></form>')
+        else:  # missing
+            mark = '<span class="badge red">✗ не сгенерирован</span>'
+            action = ('<span class="muted" style="font-size:13px">Сгенерируйте ниже '
+                      'в блоке «Сгенерировать приказ»</span>')
+        _ctrl_rows += (f'<div style="margin:6px 0;padding:8px;border:1px solid #eee;border-radius:8px">'
+                       f'<span class="muted" style="font-size:12px">{html.escape(s["section"])}</span><br>'
+                       f'{html.escape(s["topic"])} {mark}<br>{action}</div>')
+    _all_ready = (_n_missing == 0 and _n_no_scan == 0)
+    _summary = (f'<span class="badge green">Все приказы готовы</span>' if _all_ready else
+                f'<span class="badge red">Не готово: {_n_missing + _n_no_scan} из {len(_ot_status)}</span> '
+                f'<span class="muted">(не сгенерировано: {_n_missing}, ждёт скан: {_n_no_scan}, готово: {_n_ready})</span>')
+    _control_block = (
+        f'<section><h2>Контроль приказов по охране труда</h2>'
+        f'<p>{_summary}</p>'
+        f'<details{" open" if not _all_ready else ""}>'
+        f'<summary style="cursor:pointer">Показать статус всех {len(_ot_status)} приказов</summary>'
+        f'{_ctrl_rows}</details></section>'
+    )
     # Предзаполнение первой записи данными уже готового приказа №20-ПСМ/2026 —
     # только пока реестр пуст, чтобы не подставлять эти значения повторно для
     # следующих приказов.
@@ -2710,6 +2749,7 @@ def orders_page(request: Request, db: Session = Depends(get_db)):
     )
     body = f"""
 <h1>📑 Приказы</h1>
+{_control_block}
 <section class="grid"><h2>Реестр ({len(orders)})</h2>{rows or '<p class="muted">Пока пусто.</p>'}</section>
 <section>
 <h2>Сгенерировать приказ по охране труда</h2>
@@ -2819,12 +2859,18 @@ def order_generate(
         d = datetime.strptime(order_date, "%Y-%m-%d").date()
     except ValueError:
         raise HTTPException(400, "Неверная дата.")
+    # Заводим приказ-заготовку в реестр (привязка order_key, без скана — статус «ждёт скан»),
+    # если такого ещё нет. Так контроль в списке видит, что приказ сгенерирован, но скан не
+    # загружен. Дубли не плодим: если запись с этим order_key уже есть — оставляем её.
+    category, topic = prod.OT_ORDERS[order_key][0], prod.OT_ORDERS[order_key][1]
+    existing = prod.get_order_by_key(db, order_key)
+    if existing is None:
+        prod.create_order(db, number, d, topic, category=category, order_key=order_key)
     import tempfile, os
     tmpdir = tempfile.mkdtemp()
     path = prod.generate_ot_order_docx(order_key, number, d, tmpdir)
     with open(path, "rb") as f:
         data = f.read()
-    topic = prod.OT_ORDERS[order_key][1]
     safe_topic = topic[:40].replace("/", "-").replace(" ", "_")
     fn = f"Приказ_{number.replace('/', '-')}_{safe_topic}.docx"
     try:
@@ -2836,6 +2882,35 @@ def order_generate(
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": _content_disposition(fn)},
     )
+
+
+@app.post("/production/orders/{order_id}/upload-scan")
+async def order_upload_scan(
+    order_id: str, request: Request,
+    scan_file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """Загрузка подписанного скана к существующей записи приказа (заготовке из генерации).
+    Закрывает контроль «ждёт скан» → приказ становится готовым."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    order = db.get(InternalOrder, order_id)
+    if order is None:
+        raise HTTPException(404, "Приказ не найден.")
+    if scan_file.filename:
+        from s3_storage import _s3_upload, _scan_key
+        scan_type = f"order_{order.id}"
+        content = await scan_file.read()
+        content_type = scan_file.content_type or "application/octet-stream"
+        try:
+            _s3_upload(scan_type, None, content, content_type)
+            prod.set_order_scan_key(db, order.id, _scan_key(scan_type, None))
+        except RuntimeError as e:
+            log.warning("order_upload_scan: загрузка не удалась: %s", e)
+    return RedirectResponse("/production/orders", status_code=303)
+
+
+@app.get("/production/orders/{order_id}/download")
 def order_download(order_id: str, request: Request, db: Session = Depends(get_db)):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
