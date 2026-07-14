@@ -523,6 +523,45 @@ def sign_work_log_entry(
     return True
 
 
+def update_work_log_entry(
+    session: Session, entry_id: str,
+    entry_date: date | None = None, work_done: str | None = None,
+    weather: str | None = None, note: str | None = None,
+) -> bool:
+    """ТЕСТОВОЕ редактирование черновика ОЖР (для отладочного цикла — крутить один документ,
+    а не плодить новые). Меняет только записи в статусе DRAFT: подписанное не трогаем.
+    На ПРОДЕ эту возможность закрываем — черновик правится до подписи, подпись фиксирует
+    содержимое окончательно. entry_date/work_done меняются, если переданы; weather/note
+    перезаписываются переданными значениями (в т.ч. на None = очистить)."""
+    entry = session.get(WorkLogEntry, entry_id)
+    if entry is None or entry.sign_status == WorkLogSignStatus.SIGNED:
+        return False
+    if entry_date is not None:
+        entry.entry_date = entry_date
+    if work_done is not None:
+        entry.work_done = work_done
+    entry.weather = weather
+    entry.note = note
+    session.commit()
+    return True
+
+
+def unsign_work_log_entry(session: Session, entry_id: str) -> bool:
+    """ТЕСТОВАЯ отмена подписи: SIGNED → DRAFT, обнуляет реквизиты подписи (ФИО, серийник,
+    хеш, дату). Нужна ТОЛЬКО для отладочного цикла, чтобы гонять один документ туда-сюда.
+    На ПРОДЕ убрать вместе с кнопкой — подпись УКЭП необратима."""
+    entry = session.get(WorkLogEntry, entry_id)
+    if entry is None:
+        return False
+    entry.sign_status = WorkLogSignStatus.DRAFT
+    entry.signed_by = None
+    entry.signed_at = None
+    entry.sign_cert_serial = None
+    entry.content_hash = None
+    session.commit()
+    return True
+
+
 def sign_work_order_member(session: Session, work_order_id: str, employee_id: str) -> bool:
     """Подтверждение ознакомления членом бригады (подпись)."""
     member = (
