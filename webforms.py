@@ -1947,6 +1947,7 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
     orders = prod.get_active_work_orders(db)
+    past_orders = prod.get_past_work_orders(db)  # архив — истёкшие по сроку
     # Автонумерация наряда: формат «{порядковый}-{год}» со сбросом по годам.
     # Берём максимальный порядковый среди ВСЕХ нарядов текущего года (включая
     # закрытые — чтобы не переиспользовать номер), +1. Старые номера без «-ГГГГ»
@@ -2106,9 +2107,18 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
         )
 
     rows = "".join(order_row(o) for o in orders)
+    past_rows = "".join(order_row(o) for o in past_orders)
+    _archive_block = (
+        f'<section><details><summary style="cursor:pointer;font-size:1.1em;font-weight:600">'
+        f'📁 Архив — прошедшие наряды ({len(past_orders)})</summary>'
+        f'<p class="muted" style="margin-top:8px">Наряды с истёкшим сроком действия '
+        f'(в том числе восстановленный прошлый период). Доступны для просмотра и печати.</p>'
+        f'{past_rows or "<p class=\"muted\">Архив пуст.</p>"}</details></section>'
+    ) if past_orders else ""
     body = f"""
 <h1>📋 Наряды-допуски</h1>
 <section class="grid"><h2>Активные ({len(orders)})</h2>{rows or '<p class="muted">Нет активных нарядов.</p>'}</section>
+{_archive_block}
 <section>
 <h2>Новый наряд</h2>
 <form method="post" action="/production/work-orders/new">
