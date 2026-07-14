@@ -154,6 +154,11 @@ def employees_list(request: Request, db: Session = Depends(get_db)):
 
     def _med_chip(e: Employee) -> str:
         """Краткий чип статуса медкомиссии для списка. Пусто, если работник ещё не прибыл."""
+        # Дактилоскопия стоит → медкомиссия де-факто пройдена (её не делают без медкомиссии).
+        # В списке скан из S3 НЕ проверяем (дорого на каждую строку) — опираемся на дату
+        # дактилоскопии, которая уже в объекте. Полная проверка (вкл. скан) — в карточке.
+        if e.dactyloscopy_date is not None:
+            return '<span class="badge green">мед: пройдена</span>'
         r = _ref_by_emp.get(e.id)
         if r is None:
             if e.entry_date and (today - e.entry_date).days >= 5:
@@ -1262,6 +1267,15 @@ value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
     # Повторный въезд (PRIOR): грин-карта с прошлого раза, медкомиссия и дактилоскопия
     # заново не проходятся — сканы справок для пакета не требуются (правило согласовано 2026-07).
     _is_prior = emp.registration_status == RegistrationStatus.PRIOR
+    # Медкомиссия засчитывается ПРОЙДЕННОЙ, если выполнено любое из: завершённое направление
+    # (уже учтено выше), ИЛИ загружен скан справки, ИЛИ стоит дата дактилоскопии. Дактилоскопию
+    # физически не делают без пройденной медкомиссии (подтверждено заказчиком), а скан справки —
+    # прямое доказательство. Без этого карточка гоняла на направление, хотя медэтап де-факто
+    # пройден (Жанен, Маман, Шахмет и др.). PRIOR не трогаем — у него своя ветка «грин-карта».
+    if not _is_prior and not _med_done and (_cert_uploaded or emp.dactyloscopy_date is not None):
+        _reason = "по дактилоскопии" if emp.dactyloscopy_date is not None else "по загруженной справке"
+        _med_html = f'<b style="color:#1a7f37">Медкомиссия пройдена</b> <span class="muted">({_reason})</span>'
+        _med_done = True
     # Подсказка: медкомиссия пройдена, но скана справки нет — он нужен для пакета Госуслуг.
     _cert_hint = ""
     if _med_done and not _cert_uploaded and not _is_prior:
