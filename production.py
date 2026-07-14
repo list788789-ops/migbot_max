@@ -350,6 +350,17 @@ def get_last_wo_journal_row_number(session: Session) -> int:
     return last.journal_row_number if last else 0
 
 
+def get_journaled_work_orders(session: Session) -> list[WorkOrder]:
+    """Наряды, уже внесённые в журнал (есть journal_row_number) — для просмотра
+    содержимого журнала на странице, по порядку строк."""
+    return (
+        session.query(WorkOrder)
+        .filter(WorkOrder.journal_row_number.isnot(None))
+        .order_by(WorkOrder.journal_row_number)
+        .all()
+    )
+
+
 def print_new_wo_journal_entries(session: Session) -> list[WorkOrder]:
     """Допечатать новые наряды в журнал: присваивает сквозные номера строк,
     помечает journal_printed_at. Уже напечатанные наряды не трогает."""
