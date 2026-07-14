@@ -58,6 +58,10 @@ class Category(str, enum.Enum):
     PATENT = "patent"      # безвизовые не-ЕАЭС — патент, 7 (Узбекистан/Таджикистан — 15) дней
     VISA = "visa"          # визовые страны — разрешение на работу, 7 рабочих дней
     HQS = "hqs"            # высококвалифицированные специалисты
+    RF = "rf"              # гражданин РФ — миграционный учёт не требуется (см. Employee.is_rf).
+                           # Отличается от RegistrationStatus.PRIOR: PRIOR — про ИНОСТРАНЦА с
+                           # грин-картой (миграционка частично), RF — про россиянина (миграционка
+                           # отключена целиком). Это разные поля и разные механизмы, не смешивать.
 
 
 class RegistrationStatus(str, enum.Enum):
@@ -283,6 +287,15 @@ class Employee(Base):
 
     created_by: Mapped[str | None] = mapped_column(String, nullable=True)  # кто завёл (кадровик/прораб)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    @property
+    def is_rf(self) -> bool:
+        """Гражданин РФ (Category.RF) — миграционный учёт не применяется ЦЕЛИКОМ:
+        не создаются registration/medical_exam/dactyloscopy/contract_notice, в карточке
+        и списке не показываются миграционные окна/пометки. Создаётся только efs1_report
+        (см. obligations._create_rf_obligations). НЕ путать с RegistrationStatus.PRIOR —
+        тот про иностранца с грин-картой, где миграционка отключена лишь частично."""
+        return self.category == Category.RF
 
     consents: Mapped[list["Consent"]] = relationship(back_populates="employee", cascade="all, delete-orphan")
     obligations: Mapped[list["Obligation"]] = relationship(back_populates="employee", cascade="all, delete-orphan")
