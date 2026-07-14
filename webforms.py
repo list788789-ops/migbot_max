@@ -429,10 +429,17 @@ label{{font-size:13px;color:var(--sub)}}
 .badge.neutral{{background:var(--neutral-bg);color:var(--neutral-ink)}}
 .muted{{color:var(--sub);font-size:13px}}
 .warning-banner{{background:var(--amber-bg);border:1px solid #f0c674;border-left:4px solid var(--amber-ink);border-radius:12px;padding:12px 14px;margin-bottom:14px;font-weight:600;color:#7a4a00}}
-nav{{margin-bottom:16px;background:#fff;border:1px solid var(--line);border-radius:12px;padding:4px 8px;display:flex;flex-wrap:wrap;gap:2px}}
-nav a{{color:var(--sub);text-decoration:none;font-size:15px;padding:10px 12px 8px;white-space:nowrap;font-weight:600;border-radius:8px 8px 0 0;border-bottom:2px solid transparent}}
-nav a.active{{color:var(--ink);border-bottom-color:var(--accent)}}
+nav{{margin-bottom:16px;background:#fff;border:1px solid var(--line);border-radius:14px;padding:8px;display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center}}
+.nav-grp{{display:flex;flex-wrap:wrap;gap:4px;align-items:center}}
+.nav-grp + .nav-grp{{border-left:1px solid var(--line-2);padding-left:10px}}
+.nav-end{{margin-left:auto;border-left:none;padding-left:0}}
+nav a{{color:var(--sub);text-decoration:none;font-size:15px;padding:8px 12px;white-space:nowrap;font-weight:600;border-radius:10px;display:inline-flex;align-items:center;gap:6px;transition:background .12s}}
+nav a .ic{{font-size:15px;line-height:1}}
+nav a.active{{color:var(--accent-ink);background:#eaf2fb}}
 nav a:hover{{color:var(--ink);background:#f5f7f9}}
+nav a.nav-logout{{color:#aab0b7;font-weight:500}}
+nav a.nav-logout:hover{{color:#c0392b;background:#faeceb}}
+@media(max-width:520px){{ .nav-grp + .nav-grp{{border-left:none;padding-left:0}} .nav-end{{margin-left:0}} }}
 form.inline{{display:inline}}
 fieldset{{border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:14px}}
 fieldset legend{{font-size:12px;color:var(--accent-ink);text-transform:uppercase;letter-spacing:.04em;font-weight:700;padding:0 6px}}
@@ -481,27 +488,37 @@ PAGE_FOOT = """
 </script>
 </body></html>"""
 def _nav(active: str = "", role: str = "") -> str:
-    """active: 'home' | 'employees' | 'medical' | 'admin' — подсвечивает корневой раздел.
-    role: роль пользователя — 'admin' добавляет пункт «Пользователи» (управление доступом)."""
-    items = [
-        ("home", "/", "Рабочий стол"),
-        ("tabel", "/tabel", "Табель"),
-        ("employees", "/employees", "Сотрудники"),
-        ("medical", "/medical", "Медкомиссия"),
-        ("production", "/production", "Производство"),
-        ("reports", "/reports", "Отчёты"),
+    """active: 'home' | 'employees' | 'medical' | ... — подсвечивает раздел.
+    Меню сгруппировано: ежедневная работа / производство и документы / служебное.
+    Роли: «Общие документы» — кадровику и админу; «Пользователи» — только админу."""
+    primary = [
+        ("home", "/", "Рабочий стол", "🏠"),
+        ("tabel", "/tabel", "Табель", "📋"),
+        ("employees", "/employees", "Сотрудники", "👥"),
+        ("medical", "/medical", "Медкомиссия", "🩺"),
     ]
-    # Общие документы (паспорт директора, основание на адрес) — кадровику и админу, не прорабу.
+    work = [
+        ("production", "/production", "Производство", "🏗"),
+        ("reports", "/reports", "Отчёты", "📊"),
+    ]
     if role in ("admin", "kadrovik"):
-        items.append(("common", "/common-docs", "Общие документы"))
+        work.append(("common", "/common-docs", "Общие документы", "📁"))
+    service = []
     if role == "admin":
-        items.append(("admin", "/admin/users", "Пользователи"))
-    items.append(("", "/logout", "Выйти"))
-    links = "".join(
-        f'<a href="{href}"{" class=\"active\"" if key and key == active else ""}>{label}</a>'
-        for key, href, label in items
-    )
-    return f"<nav>{links}</nav>"
+        service.append(("admin", "/admin/users", "Пользователи", "⚙️"))
+
+    def _grp(group):
+        return "".join(
+            f'<a href="{href}"{" class=\"active\"" if key and key == active else ""}>'
+            f'<span class="ic">{icon}</span>{label}</a>'
+            for key, href, label, icon in group
+        )
+
+    html_groups = f'<div class="nav-grp">{_grp(primary)}</div><div class="nav-grp">{_grp(work)}</div>'
+    if service:
+        html_groups += f'<div class="nav-grp">{_grp(service)}</div>'
+    logout = '<div class="nav-grp nav-end"><a href="/logout" class="nav-logout">Выйти →</a></div>'
+    return f"<nav>{html_groups}{logout}</nav>"
 
 
 def _render(title: str, body: str, active: str = "", role: str = "") -> str:
