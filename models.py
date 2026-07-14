@@ -468,10 +468,19 @@ class WorkOrder(Base):
     # справочника на момент генерации; в БД заведено:
     #   ALTER TABLE work_orders ADD COLUMN work_type_id VARCHAR REFERENCES work_types(id);
     work_type_id: Mapped[str | None] = mapped_column(ForeignKey("work_types.id"), nullable=True)
+    # Объект работ (титул) — жёсткая связь наряда с объектом из справочника (2026-07).
+    # Раньше место работ хранилось только текстом в location; для проверки этапности ОЖР
+    # («есть ли по этому объекту записи армирования/опалубки перед бетоном») нужна связь
+    # по id, а не по совпадению текста. location остаётся (человекочитаемое место в бланке),
+    # titul_id — для группировки нарядов одного объекта. NULL — объект вписан вручную, не из
+    # справочника (тогда межнарядная проверка по нему не работает). Заводится ALTER:
+    #   ALTER TABLE work_orders ADD COLUMN titul_id VARCHAR REFERENCES tituly(id);
+    titul_id: Mapped[str | None] = mapped_column(ForeignKey("tituly.id"), nullable=True)
 
     responsible_supervisor: Mapped["Employee"] = relationship(foreign_keys=[responsible_supervisor_id])
     responsible_executor: Mapped["Employee"] = relationship(foreign_keys=[responsible_executor_id])
     work_type: Mapped["WorkType | None"] = relationship(foreign_keys=[work_type_id])
+    titul: Mapped["Titul | None"] = relationship(foreign_keys=[titul_id])
     members: Mapped[list["WorkOrderMember"]] = relationship(
         back_populates="work_order", cascade="all, delete-orphan"
     )
@@ -579,6 +588,13 @@ class WorkLogEntry(Base):
     weather: Mapped[str | None] = mapped_column(String, nullable=True)     # погодные условия
     note: Mapped[str | None] = mapped_column(Text, nullable=True)          # примечания
 
+    # Отмеченные за этот день операции вида работ (2026-07, этапность ОЖР). JSON-список
+    # строк операций (из WorkType.content, разбитого по «;»). Нужен, чтобы знать прогресс
+    # по наряду — какие операции уже сделаны в прошлых записях, и предлагать следующие.
+    # NULL/пусто — старые записи или запись без разметки операций.
+    #   ALTER TABLE work_log_entries ADD COLUMN done_operations TEXT;
+    done_operations: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     created_by: Mapped[str | None] = mapped_column(String, nullable=True)  # кто внёс (User.id/ФИО)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -632,6 +648,13 @@ class WorkType(Base):
     process_measures: Mapped[str | None] = mapped_column(Text, nullable=True)  # раздел 3, по строке на пункт
     norms: Mapped[str | None] = mapped_column(Text, nullable=True)            # нормативные ссылки
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
+    # Этап монолитного цикла (2026-07) для логики заполнения ОЖР по последовательности работ.
+    # По СП 435.1325800.2018 (бетон — после приёмки опалубки и арматуры): 1 — опалубка+
+    # армирование (связанный этап), 2 — бетонирование (приёмка смеси/укладка), 3 — уход/
+    # электропрогрев, 4 — распалубка. NULL — вне цикла (напр. «Работы на высоте (общие)»):
+    # такой вид не участвует в проверке последовательности. Заводится ALTER + UPDATE по видам:
+    #   ALTER TABLE work_types ADD COLUMN stage_order INTEGER;
+    stage_order: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class Instruction(Base):
