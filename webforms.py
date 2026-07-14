@@ -1543,6 +1543,34 @@ def wo_journal_page(request: Request, db: Session = Depends(get_db)):
         return RedirectResponse("/login", status_code=303)
     unprinted = len(prod.get_unprinted_work_orders(db))
     last_num = prod.get_last_wo_journal_row_number(db)
+    journaled = prod.get_journaled_work_orders(db)
+    # Таблица уже внесённых записей журнала (Приложение №5 к 782н)
+    if journaled:
+        _jrows = "".join(
+            f'<tr><td style="padding:6px;border:1px solid #e6e9ee;text-align:center">{o.journal_row_number}</td>'
+            f'<td style="padding:6px;border:1px solid #e6e9ee">{html.escape(o.number or "—")}</td>'
+            f'<td style="padding:6px;border:1px solid #e6e9ee;white-space:nowrap">{o.valid_from:%d.%m.%Y}–{o.valid_to:%d.%m.%Y}</td>'
+            f'<td style="padding:6px;border:1px solid #e6e9ee">{html.escape(o.location or "—")}</td>'
+            f'<td style="padding:6px;border:1px solid #e6e9ee">{html.escape(o.responsible_supervisor.full_name if o.responsible_supervisor else "—")}</td>'
+            f'<td style="padding:6px;border:1px solid #e6e9ee">{html.escape(o.responsible_executor.full_name if o.responsible_executor else "—")}</td>'
+            f'<td style="padding:6px;border:1px solid #e6e9ee"><a href="/production/work-orders/{o.id}/print">бланк</a></td></tr>'
+            for o in journaled
+        )
+        _journal_view = (
+            f'<section><h2>Записи журнала ({len(journaled)})</h2>'
+            f'<div style="overflow-x:auto"><table style="border-collapse:collapse;width:100%;font-size:14px">'
+            f'<tr style="background:#f5f7f9">'
+            f'<th style="padding:6px;border:1px solid #e6e9ee">№</th>'
+            f'<th style="padding:6px;border:1px solid #e6e9ee">Наряд</th>'
+            f'<th style="padding:6px;border:1px solid #e6e9ee">Срок</th>'
+            f'<th style="padding:6px;border:1px solid #e6e9ee">Место</th>'
+            f'<th style="padding:6px;border:1px solid #e6e9ee">Руководитель</th>'
+            f'<th style="padding:6px;border:1px solid #e6e9ee">Исполнитель</th>'
+            f'<th style="padding:6px;border:1px solid #e6e9ee">Печать</th></tr>'
+            f'{_jrows}</table></div></section>'
+        )
+    else:
+        _journal_view = '<section><p class="muted">В журнал пока ничего не внесено.</p></section>'
     body = f"""
 <h1>📋 Журнал учёта нарядов</h1>
 <p class="muted">Учёт работ по наряду-допуску (Приложение №5 к 782н). Строится по выпущенным нарядам.
@@ -1555,6 +1583,7 @@ def wo_journal_page(request: Request, db: Session = Depends(get_db)):
 <button type="submit" class="btn"{' disabled' if not unprinted else ''}>Допечатать новые записи ({unprinted})</button></form>
 </div>
 </section>
+{_journal_view}
 <p><a class="btn secondary" href="/production/journals">← Журналы</a></p>
 """
     return _render("Журнал нарядов", body, active="production", role=request.session.get("role", ""))
