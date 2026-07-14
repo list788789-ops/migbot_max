@@ -685,7 +685,25 @@ onsubmit="return confirm(&#39;{_confirm_js}&#39;)">
 <button type="submit" class="secondary">Удалить</button></form>
 </div>'''
 
-        if _del_rows:
+        # 3) Полный сброс («чистый лист») — если есть что сбрасывать.
+        _has_active_obs = any(o.is_current and o.status != ObligationStatus.CANCELLED
+                              for o in emp.obligations)
+        _can_full_reset = bool(emp.entry_date) or emp.consent_status == ConsentStatus.CONFIRMED or _has_active_obs
+        _full_reset_row = ""
+        if _can_full_reset:
+            _full_reset_row = f'''<div style="margin:12px 0 2px;padding:10px;border:1px solid #b00;border-radius:8px;background:#fff0f0">
+<b style="color:#b00">Полный сброс сотрудника («чистый лист»)</b>
+<p class="muted" style="margin:4px 0 8px">Согласие → черновик, дата въезда снимается, все
+обязательства снимаются, миграционные сканы уходят в корзину. Для повторного оформления
+с нуля.</p>
+<form method="post" action="/employees/{emp.id}/event/delete"
+onsubmit="return confirm(&#39;ПОЛНЫЙ СБРОС: согласие, дата въезда и ВСЕ обязательства будут сняты, сканы — в корзину. Сотрудник вернётся в исходное состояние. Продолжить?&#39;)">
+<input type="hidden" name="event_kind" value="full_reset">
+<input type="hidden" name="target" value="full_reset">
+<button type="submit" class="secondary" style="border-color:#b00;color:#b00">Полный сброс</button></form>
+</div>'''
+
+        if _del_rows or _full_reset_row:
             _admin_delete_section = f'''
 <fieldset style="border-color:#e0a0a0">
 <legend style="color:#b00">⚠ Удаление событий (админ)</legend>
@@ -695,7 +713,24 @@ onsubmit="return confirm(&#39;{_confirm_js}&#39;)">
 журнале для отката. Даты обнуляются, обязательства помечаются снятыми. Действие только для
 администратора.</p>
 {_del_rows}
+{_full_reset_row}
 </details>
+</fieldset>'''
+
+    # Сброс согласия ПД — рабочий инструмент кадровика (и админа). Отдельно от админского
+    # блока удаления: доступен всем пишущим, но только когда согласие подтверждено.
+    _consent_reset_section = ""
+    if can_write and emp.consent_status == ConsentStatus.CONFIRMED:
+        _consent_reset_section = f'''
+<fieldset>
+<legend>Сброс согласия ПД</legend>
+<p class="muted">Вернуть согласие в статус «черновик» (например, при ошибочном подтверждении).
+Запись о согласии остаётся в журнале; при повторном подтверждении фиксируется заново.</p>
+<form method="post" action="/employees/{emp.id}/event/delete"
+onsubmit="return confirm(&#39;Сбросить согласие ПД в черновик?&#39;)">
+<input type="hidden" name="event_kind" value="consent">
+<input type="hidden" name="target" value="consent">
+<button type="submit" class="secondary">Сбросить согласие</button></form>
 </fieldset>'''
 
     # Секция сканов для пакета Госуслуг — только для пишущих (кадровик/админ), паспортные
@@ -1321,6 +1356,7 @@ value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
 {_medzone_section}
 {_snils_section}
 {_obligations_section}
+{_consent_reset_section}
 {_admin_delete_section}
 {_scans_section}
 <a class="btn secondary" href="/employees">← Ко всем сотрудникам</a>
@@ -2459,21 +2495,35 @@ def employee_event_delete(
     target: str = Form(...),
     db: Session = Depends(get_db),
 ):
-    """Удаление события из карточки — ТОЛЬКО ADMIN. Мягкое: obligations помечаются
-    is_current=False/CANCELLED, даты-триггеры обнуляются; из базы ничего не стирается,
-    всё для отката пишется в EventDeletionLog (snapshot).
+    """Удаление/сброс события из карточки. Мягкое: obligations помечаются
+    is_current=False/CANCELLED, даты-триггеры обнуляются, согласие → DRAFT; из базы
+    ничего не стирается, всё для отката пишется в EventDeletionLog (snapshot).
 
-    event_kind='obligation' → снять одно обязательство (target = Obligation.id).
-    event_kind='date'       → обнулить дату-триггер (target = имя поля) + каскад:
+    Права по типу события:
+      event_kind='consent'    → кадровик + админ (рабочий инструмент);
+      всё остальное           → только админ.
+
+    event_kind='obligation'   → снять одно обязательство (target = Obligation.id).
+    event_kind='date'         → обнулить дату-триггер (target = имя поля) + каскад:
       entry_date        → ВСЕ активные obligations сотрудника → CANCELLED (вариант A);
       contract_date     → efs1_report + contract_notice (по этой дате) → CANCELLED;
       address_since     → registration (по этой дате) → CANCELLED;
-      dactyloscopy_date → dactyloscopy ВОЗВРАЩАЕТСЯ в PENDING (дата закрывала обязанность,
-                          снятие закрытия, а не отмена).
+      dactyloscopy_date → dactyloscopy ВОЗВРАЩАЕТСЯ в PENDING (снятие закрытия, не отмена).
+    event_kind='consent'      → сброс согласия ПД: consent_status → DRAFT (запись Consent
+                                НЕ удаляется, остаётся следом; при повторном подтверждении
+                                создастся новая). target игнорируется.
+    event_kind='full_reset'   → «чистый лист» (только админ): согласие → DRAFT + дата въезда
+                                → NULL + ВСЕ активные obligations → CANCELLED + миграционные
+                                сканы в корзину. Один снимок в аудит.
     """
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
-    _require_role(request, db, UserRole.ADMIN)
+    # Гейт по типу события: сброс согласия — рабочий инструмент кадровика; удаление
+    # обязательств/дат и полный сброс — только админ.
+    if event_kind == "consent":
+        _require_role(request, db, UserRole.KADROVIK)   # ADMIN проходит внутри _require_role
+    else:
+        _require_role(request, db, UserRole.ADMIN)
 
     emp = db.get(Employee, employee_id)
     if emp is None:
@@ -2578,6 +2628,64 @@ def employee_event_delete(
         db.commit()
         log.info("ADMIN %s обнулил дату %s (было %s), обязательств: %d, сканов в корзину: %d, employee_id=%s",
                  actor, target, old_value, len(affected), len(_moved), employee_id)
+        return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+    if event_kind == "consent":
+        # Сброс согласия ПД (кадровик/админ). CONFIRMED → DRAFT. Запись Consent НЕ удаляем —
+        # остаётся следом; при повторном подтверждении создастся новая. Обязательства при этом
+        # НЕ снимаются (для этого есть отдельные кнопки/полный сброс) — сбрасывается только гейт.
+        prev = emp.consent_status.value if emp.consent_status else None
+        if emp.consent_status != ConsentStatus.CONFIRMED:
+            return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+        emp.consent_status = ConsentStatus.DRAFT
+        db.add(emp)
+        db.add(EventDeletionLog(
+            employee_id=employee_id, actor=actor, event_kind="consent",
+            target="consent",
+            snapshot=json.dumps({"prev_consent_status": prev}, ensure_ascii=False),
+        ))
+        db.commit()
+        log.info("%s сбросил согласие ПД (было %s) у employee_id=%s", actor, prev, employee_id)
+        return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+    if event_kind == "full_reset":
+        # «Чистый лист» (только админ): согласие → DRAFT + дата въезда → NULL + ВСЕ активные
+        # obligations → CANCELLED + миграционные сканы (маппинг entry_date) в корзину. Один
+        # снимок в аудит. Возвращает сотрудника в исходное состояние до заведения.
+        prev_consent = emp.consent_status.value if emp.consent_status else None
+        prev_entry = emp.entry_date.isoformat() if emp.entry_date else None
+        affected = []
+        for o in emp.obligations:
+            if o.is_current and o.status != ObligationStatus.CANCELLED:
+                affected.append({
+                    "obligation_id": o.id, "type": o.type.value,
+                    "prev_status": o.status.value, "prev_is_current": o.is_current,
+                })
+                o.is_current = False
+                o.status = ObligationStatus.CANCELLED
+                db.add(o)
+        emp.entry_date = None
+        emp.consent_status = ConsentStatus.DRAFT
+        db.add(emp)
+        _moved = []
+        for _st in _SCANS_BY_DATE.get("entry_date", []):
+            _dk = _soft_delete_scan(employee_id, _st)
+            if _dk:
+                _moved.append({"scan_type": _st, "deleted_key": _dk})
+        db.add(EventDeletionLog(
+            employee_id=employee_id, actor=actor, event_kind="full_reset",
+            target="full_reset",
+            snapshot=json.dumps({
+                "prev_consent_status": prev_consent,
+                "prev_entry_date": prev_entry,
+                "affected": affected,
+                "moved_scans": _moved,
+            }, ensure_ascii=False),
+        ))
+        db.commit()
+        log.info("ADMIN %s ПОЛНЫЙ СБРОС employee_id=%s: согласие %s→draft, въезд %s→null, "
+                 "снято обязательств: %d, сканов в корзину: %d",
+                 actor, employee_id, prev_consent, prev_entry, len(affected), len(_moved))
         return RedirectResponse(f"/employees/{employee_id}", status_code=303)
 
     raise HTTPException(400, "Неизвестный тип события")
