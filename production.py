@@ -2018,12 +2018,47 @@ def generate_height_work_order_docx(work_order: WorkOrder, members: list[WorkOrd
 
 def create_order(session: Session, number: str, order_date: date, topic: str,
                   category: OrderCategory = OrderCategory.OTHER,
-                  note: str | None = None) -> InternalOrder:
+                  note: str | None = None, order_key: str | None = None) -> InternalOrder:
     order = InternalOrder(number=number, order_date=order_date, topic=topic,
-                           category=category, note=note)
+                           category=category, note=note, order_key=order_key)
     session.add(order)
     session.commit()
     return order
+
+
+def get_order_by_key(session: Session, order_key: str) -> "InternalOrder | None":
+    """Запись реестра, привязанная к шаблону приказа ОТ (по order_key). Нужна, чтобы генерация
+    не плодила дубли: если приказ уже заведён — переиспользуем запись, а не создаём вторую."""
+    return (
+        session.query(InternalOrder)
+        .filter_by(order_key=order_key)
+        .order_by(InternalOrder.created_at.desc())
+        .first()
+    )
+
+
+def get_ot_orders_status(session: Session) -> list[dict]:
+    """Контроль обязательных приказов по ОТ (все из OT_ORDER_KEYS). Для каждого — статус:
+    'missing'   — не сгенерирован (нет записи в реестре);
+    'no_scan'   — заведён, но скан не загружен (не распечатан/не подписан) — на это и контроль;
+    'ready'     — есть запись со сканом.
+    Возвращает список по порядку OT_ORDER_KEYS для показа в списке приказов."""
+    result = []
+    for key in OT_ORDER_KEYS:
+        category, topic, _preamble, _points = OT_ORDERS[key]
+        rec = get_order_by_key(session, key)
+        if rec is None:
+            status = "missing"
+        elif not rec.scan_key:
+            status = "no_scan"
+        else:
+            status = "ready"
+        result.append({
+            "key": key, "topic": topic, "category": category,
+            "section": OT_SECTIONS.get(category, ""), "status": status,
+            "record": rec,
+        })
+    return result
 
 
 def get_orders(session: Session) -> list[InternalOrder]:
