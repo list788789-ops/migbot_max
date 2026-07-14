@@ -233,13 +233,17 @@ function _filterEmployees(){
   var shown = 0;
   rows.forEach(function(r){
     var key = r.getAttribute('data-search') || '';
-    var match = q === '' || key.indexOf(q) !== -1;
+    // Совпадение по ПЕРВЫМ БУКВАМ ФАМИЛИИ (первое слово) или по началу табельного номера.
+    // data-search = "фамилия имя отчество табельный" в нижнем регистре.
+    var words = key.split(' ').filter(function(w){ return w !== ''; });
+    var surname = words[0] || '';
+    var tab = words.length > 1 ? words[words.length - 1] : '';
+    var match = q === '' || surname.indexOf(q) === 0 || (tab !== '' && tab.indexOf(q) === 0);
     r.style.display = match ? '' : 'none';
     if(match) shown++;
   });
   var empty = document.getElementById('empSearchEmpty');
   if(empty) empty.style.display = (shown === 0 && q !== '') ? 'block' : 'none';
-  // скрыть заголовки секций, если в них никого не осталось
   document.querySelectorAll('.grid').forEach(function(sec){
     var vis = sec.querySelectorAll('.emp-row:not([style*="display: none"])').length;
     sec.style.display = (q !== '' && vis === 0) ? 'none' : '';
