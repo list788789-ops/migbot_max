@@ -892,6 +892,11 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
     all_employees = db.scalars(select(Employee).order_by(Employee.full_name)).all()
 
     def missing_badges(e: Employee) -> list[str]:
+        # Граждане РФ и ИП-руководитель (off_tabel) не подлежат миграционному учёту: дата
+        # въезда, статус учёта и согласие мигранта им не требуются. Не выставляем им эти
+        # претензии (иначе сам ИП Буц вечно «требует внимания» — див. категория RF).
+        if getattr(e, "category", None) == Category.RF or getattr(e, "off_tabel", False):
+            return []
         badges = []
         if e.entry_date is None:
             badges.append('<span class="badge red">нет даты въезда</span>')
