@@ -1110,6 +1110,20 @@ _toggleBasisNote();
 </form>"""
 
     # Левая колонка: пишущим — форма сохранения; прорабу — те же данные текстом (только чтение).
+    # Бледный вид + подсказка для полей, значение которых В БАЗЕ пусто: адрес и «дата, с которой
+    # действует адрес». У даты форма подставляет сегодняшнюю как ЗАГОТОВКУ (выглядит заполненной,
+    # хотя не сохранена) — поэтому приглушаем и подписываем. Если значение реально сохранено —
+    # поле обычное, без подписи (сохранённое видно ярко, заготовка бледно).
+    _addr_empty = not (emp.address or "").strip()
+    _since_empty = emp.address_since is None
+    _muted_input_style = 'color:#9aa0a8;background:#fafbfc'
+    _addr_style = f' style="{_muted_input_style}"' if _addr_empty else ''
+    _since_style = f' style="{_muted_input_style}"' if _since_empty else ''
+    _not_saved_hint = ('<p class="muted" style="margin:2px 0 8px;font-size:13px">Пока не сохранено. '
+                       'Это подставленная заготовка — введите нужное значение и нажмите кнопку '
+                       'сохранения внизу.</p>')
+    _addr_hint = _not_saved_hint if _addr_empty else ''
+    _since_hint = _not_saved_hint if _since_empty else ''
     if can_write:
         left_col = f"""
 <p class="muted">Заполни известные поля и нажми одну кнопку внизу. Пустые поля не трогаются.</p>
@@ -1125,9 +1139,11 @@ value="{emp.entry_date.isoformat() if emp.entry_date else ''}">
 <legend>Место пребывания</legend>
 <p class="muted">Текущий адрес: {emp.address or "не указан"}</p>
 <label>Адрес</label>
-<input type="text" name="address" data-orig="{emp.address or ''}" value="{emp.address or ''}">
+<input type="text" name="address" data-orig="{emp.address or ''}" value="{emp.address or ''}"{_addr_style}>
+{_addr_hint}
 <label>Дата, с которой действует этот адрес</label>
-<input type="date" name="address_since" max="{today_s}" value="{emp.address_since.isoformat() if emp.address_since else today_s}">
+<input type="date" name="address_since" max="{today_s}" value="{emp.address_since.isoformat() if emp.address_since else today_s}"{_since_style}>
+{_since_hint}
 <label>Срок регистрации до (из уведомления Госуслуг)</label>
 <input type="date" name="registration_valid_until" value="{emp.registration_valid_until.isoformat() if emp.registration_valid_until else ''}">
 <p class="muted">Дата окончания срока пребывания — та, что стоит в отрывной части уведомления
