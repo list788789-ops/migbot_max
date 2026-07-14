@@ -1429,7 +1429,21 @@ value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
   upd();
 })();
 </script>"""
-    return _render(emp.full_name, body + SAVE_FORM_JS + _down_btn, active="employees", role=request.session.get("role",""))
+    # Единый стиль карточки сотрудника (scoped через .emp-card, другие формы не затрагивает):
+    # подписи полей — полужирные, читаются как заголовки; значения в полях — спокойнее и чуть
+    # мельче по акценту, чтобы дата в блоке не «перекрикивала» название поля.
+    _card_style = """
+<style>
+.emp-card label{display:block;font-weight:600;font-size:14px;color:#2b3038;margin:12px 0 4px;letter-spacing:.01em}
+.emp-card input[type=text],.emp-card input[type=date],.emp-card input[type=tel],
+.emp-card input[type=number],.emp-card select,.emp-card textarea{font-size:15px;font-weight:400;color:#1c1f24}
+.emp-card legend{font-weight:700}
+</style>"""
+    return _render(
+        emp.full_name,
+        _card_style + '<div class="emp-card">' + body + '</div>' + SAVE_FORM_JS + _down_btn,
+        active="employees", role=request.session.get("role", ""),
+    )
 
 
 @app.post("/employees/{employee_id}/entry_date")
