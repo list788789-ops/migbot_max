@@ -689,6 +689,15 @@ class OrderCategory(str, enum.Enum):
     """Раздел, к которому относится приказ — для сортировки/фильтрации реестра."""
     PERSONNEL = "personnel"      # кадровые (приём, увольнение, назначения)
     PRODUCTION = "production"    # производственные (наряды, инструктажи, ОТ)
+    # Разделы под приказы по охране труда (2026-07, генератор приказов ОТ). Значения
+    # добавляются в enum на проде: ALTER TYPE ordercategory ADD VALUE 'LABOR_PROTECTION'; и т.д.
+    # (SQLAlchemy хранит ИМЕНА членов — заглавными). Названия разделов для UI — в SECTIONS
+    # генератора (production.py).
+    LABOR_PROTECTION = "labor_protection"  # охрана труда (СУОТ, ответственные, инструкции, СИЗ)
+    TRAINING = "training"                  # обучение и инструктажи
+    HEIGHT_WORK = "height_work"            # работы на высоте
+    FIRE_SAFETY = "fire_safety"            # пожарная безопасность
+    ELECTRICAL = "electrical"              # электробезопасность
     OTHER = "other"              # прочие
 
 
