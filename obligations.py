@@ -47,6 +47,7 @@ from sqlalchemy.orm import Session
 
 from models import (
     Category,
+    DeadlineUnit,
     Employee,
     Obligation,
     ObligationStatus,
@@ -59,9 +60,103 @@ from deadlines import DEADLINE_RULES, compute_deadline, calendar_days_add
 log = logging.getLogger("obligations")
 
 
+def _find_efs1_rule():
+    """Ищет правило EFS1_REPORT в DEADLINE_RULES любой категории. ЕФС-1 — федеральная
+    обязанность (СФР), срок один для всех (следующий рабочий день после договора/приказа),
+    поэтому берём первое найденное правило, не привязываясь к конкретной категории.
+    Возвращает (deadline_value, deadline_unit, trigger_field) или None, если правила нет."""
+    for cat_rules in DEADLINE_RULES.values():
+        for r in cat_rules:
+            if r["type"] == ObligationType.EFS1_REPORT:
+                return r["deadline_value"], r["deadline_unit"], r["trigger_field"]
+    return None
+
+
+def _create_rf_obligations(session: Session, employee: Employee) -> None:
+    """Гражданин РФ (Category.RF): миграционных обязательств НЕТ (ни registration, ни
+    medical_exam, ни dactyloscopy, ни contract_notice, ни RegistrationPeriod). Создаётся
+    ТОЛЬКО ЕФС-1 в СФР — по дате договора. Договор как ДОКУМЕНТ создаётся отдельно в
+    карточке; отдельной Obligation под него нет (в модели такого типа не существует).
+
+    Согласие (152-ФЗ на обработку ПД) — тот же gate, что и для иностранцев: функция
+    вызывается только после consent_status=confirmed, поэтому здесь повторно не проверяем.
+
+    Срок ЕФС-1 берём из существующего правила EFS1_REPORT в DEADLINE_RULES (одинаков для
+    всех категорий); fallback — 1 рабочий день, если правило почему-то не найдено. Так
+    РФ-ветка самодостаточна и не требует отдельной записи для RF в deadlines.py."""
+    if employee.contract_date is None:
+        log.info(
+            "РФ employee_id=%s: дата договора не задана — ЕФС-1 пока не создаётся "
+            "(создастся при появлении contract_date)",
+            employee.id,
+        )
+        return
+
+    trigger_date = employee.contract_date
+
+    found = _find_efs1_rule()
+    if found is not None:
+        deadline_value, deadline_unit, _ = found
+    else:
+        log.warning(
+            "Правило EFS1_REPORT не найдено в DEADLINE_RULES — использую fallback "
+            "1 рабочий день (employee_id=%s)",
+            employee.id,
+        )
+        deadline_value, deadline_unit = 1, DeadlineUnit.WORKING_DAY
+
+    already_exists = (
+        session.query(Obligation)
+        .filter_by(
+            employee_id=employee.id,
+            type=ObligationType.EFS1_REPORT,
+            trigger_date=trigger_date,
+        )
+        .first()
+    )
+    if already_exists is not None:
+        log.info(
+            "ЕФС-1 для РФ employee_id=%s с trigger_date=%s уже существует — пропускаю",
+            employee.id, trigger_date,
+        )
+        return
+
+    deadline_date = compute_deadline(trigger_date, deadline_value, deadline_unit)
+
+    superseded = (
+        session.query(Obligation)
+        .filter_by(employee_id=employee.id, type=ObligationType.EFS1_REPORT, is_current=True)
+        .all()
+    )
+    for old in superseded:
+        old.is_current = False
+        session.add(old)
+
+    obligation = Obligation(
+        employee_id=employee.id,
+        type=ObligationType.EFS1_REPORT,
+        trigger_date=trigger_date,
+        deadline_value=deadline_value,
+        deadline_unit=deadline_unit,
+        deadline_date=deadline_date,
+        status=ObligationStatus.PENDING,
+        is_current=True,
+    )
+    session.add(obligation)
+    session.commit()
+
+
 def create_obligations_for_employee(session: Session, employee: Employee) -> None:
     """Вызывается ТОЛЬКО после consent_status=confirmed. Без согласия obligations не создаются —
     это тот самый gate, который обсуждался как обязательное условие."""
+    # Гражданин РФ — миграционного учёта нет вообще. Ветка стоит ДО чтения rules и ДО
+    # проверки registration_status: у РФ нет правил в DEADLINE_RULES (вернулось бы [] →
+    # ранний return) и не заполняется registration_status (тоже ранний return) — без этой
+    # ветки obligations для РФ молча не создались бы ни одного. Создаём только ЕФС-1.
+    if employee.is_rf:
+        _create_rf_obligations(session, employee)
+        return
+
     rules = DEADLINE_RULES.get(employee.category, [])
     if not rules:
         log.warning(
