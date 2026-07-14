@@ -10,6 +10,7 @@ bot.py/webforms.py дают только пункты меню/ссылки на
 """
 
 from datetime import date, datetime, timedelta
+import json
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -169,6 +170,7 @@ def create_work_order(
     equipment: str | None = None, special_machinery: str | None = None,
     technological_card_ref: str | None = None, safety_systems: str | None = None,
     special_conditions: str | None = None, work_type_id: str | None = None,
+    titul_id: str | None = None,
 ) -> WorkOrder:
     order = WorkOrder(
         number=number,
@@ -189,6 +191,7 @@ def create_work_order(
         safety_systems=safety_systems,
         special_conditions=special_conditions,
         work_type_id=work_type_id,
+        titul_id=titul_id,
         # Размер бригады на выпуске — база для правила 782н о половине. Если наряд
         # создаётся пустым черновиком, оставляем None; зафиксируется при первом
         # заполнении состава (см. роут /members в webforms.py).
@@ -431,10 +434,12 @@ def fetch_weather_belokamenka(entry_date: date) -> str | None:
 def create_work_log_entry(
     session: Session, work_order_id: str, entry_date: date, work_done: str,
     weather: str | None = None, note: str | None = None, created_by: str | None = None,
+    done_operations: str | None = None,
 ) -> WorkLogEntry:
     """Создаёт запись ОЖР по наряду. Место/работа/состав НЕ дублируются в запись —
     они берутся из связанного наряда при отображении/печати. Статус — черновик
-    (подпись УКЭП ставится отдельно, когда подключён КриптоПро)."""
+    (подпись УКЭП ставится отдельно, когда подключён КриптоПро). done_operations —
+    JSON-список отмеченных операций вида работ (для прогресса и сборки текста)."""
     entry = WorkLogEntry(
         work_order_id=work_order_id,
         entry_date=entry_date,
@@ -442,11 +447,66 @@ def create_work_log_entry(
         weather=weather,
         note=note,
         created_by=created_by,
+        done_operations=done_operations,
         sign_status=WorkLogSignStatus.DRAFT,
     )
     session.add(entry)
     session.commit()
     return entry
+
+
+# --- Этапность ОЖР: операции вида работ, прогресс, проверка последовательности ----
+
+def parse_operations(content: str | None) -> list[str]:
+    """Операции вида работ из WorkType.content — разбивка по «;». Порядок сохраняется:
+    в справочнике операции записаны в технологической последовательности (приёмка →
+    заготовка → сборка → установка), это и есть микроэтапность внутри вида."""
+    if not content:
+        return []
+    return [op.strip() for op in content.split(";") if op.strip()]
+
+
+def get_done_operations_for_order(session: Session, work_order_id: str) -> set[str]:
+    """Операции, уже отмеченными в ПРОШЛЫХ записях ОЖР этого наряда (из done_operations).
+    По ним экран заполнения понимает прогресс и предлагает следующие невыполненные."""
+    done: set[str] = set()
+    for e in session.query(WorkLogEntry).filter_by(work_order_id=work_order_id).all():
+        if e.done_operations:
+            try:
+                done.update(json.loads(e.done_operations))
+            except Exception:
+                pass
+    return done
+
+
+def stage1_documented_for_object(session: Session, titul_id: str | None) -> bool:
+    """Критерий (в): по объекту (titul_id) есть хоть одна запись ОЖР этапа 1 (stage_order==1 —
+    опалубка/армирование). titul_id пустой → True (объект вписан вручную, межнарядную проверку
+    не делаем — не мешаем). Используется для мягкого предупреждения СП 435 перед бетоном."""
+    if not titul_id:
+        return True
+    q = (
+        session.query(WorkLogEntry)
+        .join(WorkOrder, WorkLogEntry.work_order_id == WorkOrder.id)
+        .join(WorkType, WorkOrder.work_type_id == WorkType.id)
+        .filter(WorkOrder.titul_id == titul_id, WorkType.stage_order == 1)
+    )
+    return q.first() is not None
+
+
+def build_work_done_text(work_type, done_ops: list[str], tools: str | None = None) -> str:
+    """Собирает «выполнено за день» из названия вида работ, отмеченных операций и инструментов.
+    Инструмент берётся из переданного значения или из WorkType.tools."""
+    parts = []
+    if work_type is not None and getattr(work_type, "name", None):
+        parts.append(work_type.name + ":")
+    if done_ops:
+        parts.append("; ".join(done_ops))
+    text = " ".join(parts).strip() if parts else "; ".join(done_ops or [])
+    t = tools if tools is not None else (getattr(work_type, "tools", None) if work_type else None)
+    if t and t.strip():
+        text = (text + f"\nИнструмент: {t.strip()}").strip()
+    return text
 
 
 def get_work_log_entries(session: Session, work_order_id: str | None = None) -> list[WorkLogEntry]:
