@@ -2229,9 +2229,11 @@ async def morning_job():
 
 
 async def main():
-    scheduler = AsyncIOScheduler(timezone=MSK)
-    scheduler.add_job(morning_job, CronTrigger(hour=9, minute=0))
-    scheduler.start()
+    # Планировщик вынесен в отдельный модуль scheduler.py (2026-07). Задачи:
+    # morning_job (эта, бот-рассылка) + погода из production.update_weather.
+    # Запускается здесь, в бот-процессе — единственном always-on (нет дублей).
+    from scheduler import start_scheduler
+    start_scheduler(engine, morning_job=morning_job)
     await dp.start_polling(bot)
 
 
