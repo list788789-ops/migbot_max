@@ -11,6 +11,9 @@ bot.py/webforms.py дают только пункты меню/ссылки на
 
 from datetime import date, datetime, timedelta
 import json
+import logging
+
+log = logging.getLogger("migbot.production")
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -2376,3 +2379,76 @@ def generate_ot_order_docx(order_key: str, number: str, order_date: date, output
     out_path = os.path.join(output_dir, f"prikaz_{order_key}.docx")
     doc.save(out_path)
     return out_path
+
+
+# ================= Погода (Open-Meteo) =================
+# Координаты объекта (Белокаменка, западный берег Кольского залива).
+WEATHER_LAT = 69.09
+WEATHER_LON = 33.30
+_WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+
+
+def _weather_code_to_text(code: int) -> str:
+    """Код погоды WMO → краткое описание (для ОЖР)."""
+    if code == 0:
+        return "ясно"
+    if code in (1, 2, 3):
+        return "переменная облачность"
+    if code in (45, 48):
+        return "туман"
+    if 51 <= code <= 67:
+        return "дождь"
+    if 71 <= code <= 77:
+        return "снег"
+    if 80 <= code <= 82:
+        return "ливень"
+    if 95 <= code <= 99:
+        return "гроза"
+    return "н/д"
+
+
+def update_weather(session: Session, past_days: int = 3, forecast_days: int = 1) -> int:
+    """Тянет погоду из Open-Meteo и пишет/обновляет записи в таблице weather.
+    По умолчанию берёт последние 3 дня + сегодня (чтобы закрыть пропуски, если
+    планировщик не отработал). Возвращает число обновлённых дат. Плановый вызов —
+    раз в день через APScheduler. Сеть: исходящий HTTPS к api.open-meteo.com
+    (проверено — DPI на сервере не режет)."""
+    import urllib.request
+    import urllib.parse
+    params = {
+        "latitude": WEATHER_LAT,
+        "longitude": WEATHER_LON,
+        "daily": "temperature_2m_mean,weather_code",
+        "timezone": "Europe/Moscow",
+        "past_days": past_days,
+        "forecast_days": forecast_days,
+    }
+    url = _WEATHER_URL + "?" + urllib.parse.urlencode(params)
+    try:
+        with urllib.request.urlopen(url, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:  # noqa: BLE001 — сеть/парсинг; не роняем планировщик
+        log.warning("update_weather: не удалось получить погоду: %s", e)
+        return 0
+    daily = data.get("daily") or {}
+    dates = daily.get("time") or []
+    temps = daily.get("temperature_2m_mean") or []
+    codes = daily.get("weather_code") or []
+    updated = 0
+    for d_str, t, c in zip(dates, temps, codes):
+        if t is None:
+            continue
+        try:
+            wd = datetime.strptime(d_str, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        desc = _weather_code_to_text(int(c)) if c is not None else None
+        row = session.query(Weather).filter_by(weather_date=wd).first()
+        if row is None:
+            session.add(Weather(weather_date=wd, temperature=round(float(t), 1), description=desc))
+        else:
+            row.temperature = round(float(t), 1)
+            row.description = desc
+        updated += 1
+    session.commit()
+    return updated
