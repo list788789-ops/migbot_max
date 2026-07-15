@@ -1751,7 +1751,8 @@ def generate_work_order_docx(work_order: WorkOrder, members: list[WorkOrderMembe
     doc.add_paragraph("Ответственный руководитель работ: _________________________  (подпись, расшифровка)")
     doc.add_paragraph("Ответственный исполнитель работ: _________________________  (подпись, расшифровка)")
 
-    path = f"{output_dir}/naryad_{work_order.number}_{work_order.id[:8]}.docx"
+    _safe_num = "".join(c if c not in '/\\:*?"<>|' else "-" for c in (work_order.number or "no"))
+    path = f"{output_dir}/naryad_{_safe_num}_{work_order.id[:8]}.docx"
     doc.save(path)
     return path
 
@@ -2082,7 +2083,8 @@ def generate_height_work_order_docx(work_order: WorkOrder, members: list[WorkOrd
     _p("Ответственный руководитель работ: ____________ (дата, подпись)     "
        "Лицо, выдавшее наряд-допуск: ____________ (дата, подпись)")
 
-    path = f"{output_dir}/naryad_vysota_{work_order.number}_{work_order.id[:8]}.docx"
+    _safe_num = "".join(c if c not in '/\\:*?"<>|' else "-" for c in (work_order.number or "no"))
+    path = f"{output_dir}/naryad_vysota_{_safe_num}_{work_order.id[:8]}.docx"
     doc.save(path)
     return path
 
