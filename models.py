@@ -35,6 +35,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     Enum,
+    Float,
     ForeignKey,
     Numeric,
     String,
@@ -1098,3 +1099,20 @@ class Invoice(Base):
     invoice_document: Mapped[str | None] = mapped_column(String, nullable=True)  # file_id сгенерированного счёта
 
     referral: Mapped["Referral"] = relationship(back_populates="invoices")
+
+
+class Weather(Base):
+    """Погода по объекту (Белокаменка, Кольский залив) по дням — для подстановки в
+    ОЖР (Общий журнал работ). Одна запись на дату, одна на весь проект. Заполняется
+    из Open-Meteo (архив прошлого периода + ежедневно через APScheduler). Таблица
+    создана вручную 2026-07; модель добавлена для использования из кода:
+      CREATE TABLE weather (id VARCHAR PRIMARY KEY, weather_date DATE UNIQUE NOT NULL,
+        temperature REAL, description VARCHAR, created_at TIMESTAMP DEFAULT now());
+    """
+    __tablename__ = "weather"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    weather_date: Mapped[date] = mapped_column(Date, unique=True, nullable=False)
+    temperature: Mapped[float | None] = mapped_column(Float, nullable=True)
+    description: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
