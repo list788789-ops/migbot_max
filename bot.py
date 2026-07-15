@@ -69,6 +69,7 @@ from models import (
     ConsentMethod,
     ConsentStatus,
     Employee,
+    InstructionType,
     NotificationSubscriber,
     Obligation,
     ObligationStatus,
@@ -214,6 +215,7 @@ def _build_main_menu(role: str | None = None) -> InlineKeyboardBuilder:
         builder.row(CallbackButton(text="🧹 Действия с сотрудником", payload="menu:empaction"))
         builder.row(CallbackButton(text="📄 Наряды-допуски", payload="menu:section:workorders"))
         builder.row(CallbackButton(text="📋 Приказы ОТ/ТБ", payload="menu:section:otorders"))
+        builder.row(CallbackButton(text="📓 Журналы инструктажей", payload="menu:section:instrjournals"))
     builder.row(CallbackButton(text="👥 Сотрудники", payload="menu:section:employees"))
     if role in ("kadrovik", "admin"):
         builder.row(CallbackButton(text="⚠️ Требует внимания", payload="menu:section:attention"))
@@ -948,6 +950,86 @@ async def _send_ot_order_pdf(responder: "_Responder", order_key: str) -> None:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+# Типы инструктажей, доступные для журнала в боте (заводятся задним числом по датам приезда).
+_INSTR_JOURNAL_TYPES = [
+    InstructionType.INTRODUCTORY,
+    InstructionType.PRIMARY_WORKPLACE,
+]
+
+
+async def _deliver_instr_journals_menu(responder: "_Responder") -> None:
+    """Список журналов инструктажей по типам. Тап печатает журнал (ijget:<type>)."""
+    builder = InlineKeyboardBuilder()
+    for itype in _INSTR_JOURNAL_TYPES:
+        label = prod.INSTRUCTION_LABELS.get(itype, itype.value)
+        builder.row(CallbackButton(text=f"📓 {label}"[:60], payload=f"ijget:{itype.value}"))
+    builder.row(CallbackButton(text="⬅️ Назад", payload="menu:main"))
+    header = ("📓 Журналы инструктажей под подписи.\n"
+              "Тап формирует журнал: незанумерованные записи получают номера, "
+              "приходит полный журнал PDF.")
+    await responder.show_menu(header, [builder.as_markup()])
+
+
+async def _send_instruction_journal_pdf(responder: "_Responder", type_value: str) -> None:
+    """Печать журнала инструктажей в бот. Присваивает номера новым записям (как веб —
+    сквозная нумерация по типу), затем отдаёт ПОЛНЫЙ журнал PDF (не только свежую партию),
+    чтобы на объекте была полная подписная ведомость без веба."""
+    try:
+        itype = InstructionType(type_value)
+    except ValueError:
+        await responder.send("Неизвестный тип инструктажа.")
+        return
+
+    tmp_dir = tempfile.mkdtemp(prefix="ij_")
+    try:
+        with Session(engine) as session:
+            # 1) присвоить номера новым записям (no-op, если все уже пронумерованы)
+            prod.print_new_journal_entries(session, itype)
+            # 2) собрать полный журнал из пронумерованных записей
+            entries = prod.get_journaled_instructions(session, itype)
+            if not entries:
+                label = prod.INSTRUCTION_LABELS.get(itype, itype.value)
+                await responder.send(
+                    f"По журналу «{label}» нет записей. Сначала заведите инструктажи "
+                    f"(в вебе — «Заполнить всем», датируется по приезду), затем печать здесь."
+                )
+                return
+            order_ref = prod.get_latest_order_ref(session)
+            started_at = prod.get_journal_started_at(session, itype)
+            label = prod.INSTRUCTION_LABELS.get(itype, itype.value)
+            try:
+                xlsx_path = prod.generate_instruction_journal_xlsx(
+                    entries, itype, org_name=ORG_NAME, order_ref=order_ref,
+                    started_at=started_at, output_dir=tmp_dir,
+                )
+            except Exception:
+                log.exception("Не удалось сгенерировать журнал инструктажа %s", type_value)
+                await responder.send("Не удалось сформировать журнал. Попробуйте позже.")
+                return
+
+        try:
+            pdf_path = await asyncio.to_thread(_docx_to_pdf, xlsx_path, tmp_dir)
+        except RuntimeError as e:
+            await responder.send(f"Не удалось получить PDF: {e}")
+            return
+
+        safe_label = label.replace(" ", "_").replace("/", "-")
+        nice_name = f"Журнал_{safe_label}.pdf"
+        nice_path = os.path.join(tmp_dir, nice_name)
+        try:
+            if nice_path != pdf_path:
+                os.replace(pdf_path, nice_path)
+            await responder.send(
+                text=f"Журнал инструктажа: {label} (записей: {len(entries)})",
+                attachments=[InputMedia(path=nice_path)],
+            )
+        except Exception:
+            log.exception("Не удалось отправить журнал инструктажа %s", type_value)
+            await responder.send("Ошибка отправки файла. Попробуйте ещё раз.")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 @dp.message_callback()
 async def on_callback(event: MessageCallback):
     """Единая точка входа для всех кнопок: главное меню (payload='menu:...') и выбор
@@ -1022,6 +1104,13 @@ async def on_callback(event: MessageCallback):
                 return
             # плоский список приказов — сразу, без промежуточного подменю
             await _deliver_ot_orders_list(responder)
+            return
+        if section == "instrjournals":
+            if role not in ("prorab", "kadrovik", "admin"):
+                await responder.send("Журналы инструктажей доступны только зарегистрированным "
+                                      "пользователям. Выполните /login.")
+                return
+            await _deliver_instr_journals_menu(responder)
             return
         await responder.show_menu(title, [_build_section_menu(section, role).as_markup()])
         return
@@ -1678,6 +1767,18 @@ async def on_callback(event: MessageCallback):
                                   "Выполните /login.")
             return
         await _send_ot_order_pdf(responder, order_key)
+        return
+
+    if payload.startswith("ijget:"):
+        # печать журнала инструктажа: ijget:<instruction_type_value>
+        type_value = payload.split(":", 1)[1]
+        with Session(engine) as session:
+            role = _role_for_max_id(session, responder.user_id())
+        if role not in ("prorab", "kadrovik", "admin"):
+            await responder.send("Журналы инструктажей доступны только зарегистрированным "
+                                  "пользователям. Выполните /login.")
+            return
+        await _send_instruction_journal_pdf(responder, type_value)
         return
 
     if payload.startswith("delpick:"):
