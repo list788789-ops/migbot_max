@@ -406,6 +406,14 @@ h1{{font-family:var(--serif);font-size:24px;font-weight:700;letter-spacing:-.02e
 h2{{font-size:12px;margin:0 0 12px;color:var(--sub);text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid var(--line-2);padding-bottom:8px;font-weight:700}}
 section{{background:#fff;border:1px solid var(--line);border-radius:16px;padding:16px;margin-bottom:14px}}
 .card{{background:#fff;border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:10px;font-weight:600;color:var(--ink)}}
+.wo-card{{font-weight:400}}
+.wo-title{{font-weight:600;font-size:16px;line-height:1.35;margin-bottom:6px}}
+.wo-meta{{color:var(--sub);font-size:14px;margin-bottom:4px}}
+.wo-actions{{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}}
+.wo-actions .btn{{padding:10px 14px;min-height:auto;font-size:15px;flex:0 0 auto}}
+.wo-actions form{{margin:0}}
+.btn.ghost-danger{{background:#fff;color:#b0b6bd;border:1px solid #e0e3e8;font-weight:500;margin-left:auto}}
+.btn.ghost-danger:hover{{color:#c0392b;border-color:#e8b4ae;background:#faeceb}}
 .card:last-child{{margin-bottom:0}}
 .card .muted-line{{font-weight:400;color:var(--sub)}}
 a.btn,button{{display:inline-block;background:var(--accent);color:#fff;text-decoration:none;padding:14px 20px;min-height:48px;line-height:20px;border-radius:12px;border:none;font-size:16px;font-family:var(--sans);font-weight:600;margin:8px 8px 0 0;cursor:pointer}}
@@ -2124,18 +2132,21 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
             f'{change_forms}</details>'
         )
         return (
-            f'<div class="card">№{o.number} — {o.work_description}<br>'
-            f'<span class="muted">{o.location} · {o.valid_from:%d.%m}–{o.valid_to:%d.%m.%Y}</span><br>'
-            f'<span class="muted">Руководитель: {o.responsible_supervisor.full_name if o.responsible_supervisor else "?"} · '
-            f'Исполнитель: {o.responsible_executor.full_name if o.responsible_executor else "?"}</span><br>'
-            f'<span class="badge neutral">Подписали: {signed}/{len(members)}</span> '
-            f'<a class="btn" href="/production/work-orders/{o.id}">🔍 Открыть</a> '
-            f'<a class="btn secondary" href="/production/work-orders/{o.id}/print">Печатный бланк</a> '
+            f'<div class="card wo-card">'
+            f'<div class="wo-title">№{html.escape(o.number)} — {html.escape(o.work_description or "")}</div>'
+            f'<div class="wo-meta">{html.escape(o.location or "")} · {o.valid_from:%d.%m}–{o.valid_to:%d.%m.%Y}</div>'
+            f'<div class="wo-meta">Руководитель: {html.escape(o.responsible_supervisor.full_name if o.responsible_supervisor else "?")} · '
+            f'Исполнитель: {html.escape(o.responsible_executor.full_name if o.responsible_executor else "?")}</div>'
+            f'<div class="wo-meta"><span class="badge neutral">Подписали: {signed}/{len(members)}</span></div>'
+            f'<div class="wo-actions">'
+            f'<a class="btn" href="/production/work-orders/{o.id}">🔍 Открыть</a>'
+            f'<a class="btn secondary" href="/production/work-orders/{o.id}/print">📄 Бланк</a>'
             f'<form method="post" action="/production/work-orders/{o.id}/close" style="display:inline">'
-            f'<button type="submit" class="btn secondary">Закрыть наряд</button></form>'
+            f'<button type="submit" class="btn secondary">Закрыть</button></form>'
             f'<form method="post" action="/production/work-orders/{o.id}/delete" style="display:inline"'
             f' onsubmit="return confirm(\'Удалить наряд №{o.number}? Он уйдёт в корзину, откуда его можно восстановить.\')">'
-            f'<button type="submit" class="btn secondary">🗑 Удалить</button></form>'
+            f'<button type="submit" class="btn ghost-danger">🗑 Удалить</button></form>'
+            f'</div>'
             f'{edit_members}{p7}</div>'
         )
 
