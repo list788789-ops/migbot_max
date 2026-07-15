@@ -439,6 +439,18 @@ class WorkOrder(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
+    # Мягкое удаление (2026-07, после инцидента со случайным сносом наряда 03-Л).
+    # Наряд не стирается физически, а помечается is_deleted — уходит в «Корзину»,
+    # откуда восстанавливается. Физическое стирание из корзины — только у админа.
+    # Паттерн переиспользуемый: те же три поля добавляются на другие сущности.
+    # Все выборки активных/архивных нарядов фильтруют is_deleted=false. Миграция:
+    #   ALTER TABLE work_orders ADD COLUMN is_deleted BOOLEAN NOT NULL DEFAULT false;
+    #   ALTER TABLE work_orders ADD COLUMN deleted_at TIMESTAMP;
+    #   ALTER TABLE work_orders ADD COLUMN deleted_by VARCHAR;
+    is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    deleted_by: Mapped[str | None] = mapped_column(String, nullable=True)
+
     # Размер бригады, зафиксированный при выпуске наряда — база для правила 782н
     # «изменение состава более чем наполовину → нужен новый наряд». Считается
     # суммарно (вводы+выводы) от этого числа. NULL у старых нарядов (до 2026-07):
