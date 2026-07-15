@@ -334,6 +334,7 @@ def get_unprinted_work_orders(session: Session) -> list[WorkOrder]:
     """Наряды, ещё не попавшие в распечатанную партию журнала (journal_row_number пуст)."""
     return (
         session.query(WorkOrder)
+        .filter(WorkOrder.is_deleted.is_(False))
         .filter(WorkOrder.journal_row_number.is_(None))
         .order_by(WorkOrder.created_at)
         .all()
@@ -697,6 +698,7 @@ def get_active_work_orders(session: Session) -> list[WorkOrder]:
     today = date.today()
     return (
         session.query(WorkOrder)
+        .filter(WorkOrder.is_deleted.is_(False))
         .filter(WorkOrder.status == WorkOrderStatus.ACTIVE)
         .filter(WorkOrder.valid_to >= today)
         .order_by(WorkOrder.valid_from)
@@ -705,16 +707,60 @@ def get_active_work_orders(session: Session) -> list[WorkOrder]:
 
 
 def get_past_work_orders(session: Session) -> list[WorkOrder]:
-    """Архив — наряды, срок действия которых уже истёк (valid_to < сегодня).
-    Нужны для просмотра/печати прошлого периода (в т.ч. восстановленного задним
-    числом), в раздел «Активные» они не попадают по valid_to."""
+    """Архив — наряды с истёкшим сроком (valid_to < сегодня), не удалённые."""
     today = date.today()
     return (
         session.query(WorkOrder)
+        .filter(WorkOrder.is_deleted.is_(False))
         .filter(WorkOrder.valid_to < today)
         .order_by(WorkOrder.valid_from.desc(), WorkOrder.number)
         .all()
     )
+
+
+def get_deleted_work_orders(session: Session) -> list[WorkOrder]:
+    """Корзина — мягко удалённые наряды, доступные для восстановления."""
+    return (
+        session.query(WorkOrder)
+        .filter(WorkOrder.is_deleted.is_(True))
+        .order_by(WorkOrder.deleted_at.desc())
+        .all()
+    )
+
+
+def soft_delete_work_order(session: Session, work_order_id: str, deleted_by: str) -> bool:
+    """Мягкое удаление: помечаем is_deleted, наряд уходит в корзину (не стирается)."""
+    order = session.get(WorkOrder, work_order_id)
+    if order is None or order.is_deleted:
+        return False
+    order.is_deleted = True
+    order.deleted_at = datetime.utcnow()
+    order.deleted_by = deleted_by
+    session.commit()
+    return True
+
+
+def restore_work_order(session: Session, work_order_id: str) -> bool:
+    """Восстановление из корзины: снимаем метку удаления."""
+    order = session.get(WorkOrder, work_order_id)
+    if order is None or not order.is_deleted:
+        return False
+    order.is_deleted = False
+    order.deleted_at = None
+    order.deleted_by = None
+    session.commit()
+    return True
+
+
+def hard_delete_work_order(session: Session, work_order_id: str) -> bool:
+    """Физическое удаление (стирание из корзины) — только для админа. Каскад снимает
+    состав, ежедневные допуски и изменения состава. Необратимо."""
+    order = session.get(WorkOrder, work_order_id)
+    if order is None:
+        return False
+    session.delete(order)
+    session.commit()
+    return True
 
 
 def close_work_order(session: Session, work_order_id: str) -> bool:
