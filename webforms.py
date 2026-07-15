@@ -1977,6 +1977,8 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
         return RedirectResponse("/login", status_code=303)
     orders = prod.get_active_work_orders(db)
     past_orders = prod.get_past_work_orders(db)  # архив — истёкшие по сроку
+    deleted_orders = prod.get_deleted_work_orders(db)  # корзина — мягко удалённые
+    _is_admin = request.session.get("role", "") == "admin"
     # Автонумерация наряда: формат «{порядковый}-{год}» со сбросом по годам.
     # Берём максимальный порядковый среди ВСЕХ нарядов текущего года (включая
     # закрытые — чтобы не переиспользовать номер), +1. Старые номера без «-ГГГГ»
@@ -2130,7 +2132,7 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
             f'<form method="post" action="/production/work-orders/{o.id}/close" style="display:inline">'
             f'<button type="submit" class="btn secondary">Закрыть наряд</button></form>'
             f'<form method="post" action="/production/work-orders/{o.id}/delete" style="display:inline"'
-            f' onsubmit="return confirm(\'Удалить наряд №{o.number} безвозвратно? Вместе с ним удалятся состав, ежедневные допуски и изменения состава.\')">'
+            f' onsubmit="return confirm(\'Удалить наряд №{o.number}? Он уйдёт в корзину, откуда его можно восстановить.\')">'
             f'<button type="submit" class="btn secondary">🗑 Удалить</button></form>'
             f'{edit_members}{p7}</div>'
         )
@@ -2144,10 +2146,38 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
         f'(в том числе восстановленный прошлый период). Доступны для просмотра и печати.</p>'
         f'{past_rows or "<p class=\"muted\">Архив пуст.</p>"}</details></section>'
     ) if past_orders else ""
+    # Корзина — мягко удалённые наряды. Восстановление доступно всем; окончательное
+    # стирание — только админу (кнопка видна лишь ему).
+    if deleted_orders:
+        _trash_rows = ""
+        for o in deleted_orders:
+            _hard = (
+                f'<form method="post" action="/production/work-orders/{o.id}/hard-delete" style="display:inline" '
+                f'onsubmit="return confirm(\'Стереть наряд №{o.number} НАВСЕГДА? Это необратимо.\')">'
+                f'<button type="submit" class="btn secondary" style="color:#c0392b">🗑 Стереть навсегда</button></form>'
+            ) if _is_admin else ''
+            _trash_rows += (
+                f'<div style="margin:8px 0;padding:10px;border:1px solid #eee;border-radius:8px">'
+                f'<b>№{html.escape(o.number)}</b> — {html.escape(o.location or "")}<br>'
+                f'<span class="muted" style="font-size:13px">Удалил: {html.escape(o.deleted_by or "—")}'
+                f'{", " + o.deleted_at.strftime("%d.%m.%Y %H:%M") if o.deleted_at else ""}</span><br>'
+                f'<form method="post" action="/production/work-orders/{o.id}/restore" style="display:inline;margin-top:6px">'
+                f'<button type="submit" class="btn secondary">↩ Восстановить</button></form> {_hard}</div>'
+            )
+        _trash_block = (
+            f'<section><details><summary style="cursor:pointer;font-size:1.1em;font-weight:600">'
+            f'🗑 Корзина — удалённые наряды ({len(deleted_orders)})</summary>'
+            f'<p class="muted" style="margin-top:8px">Мягко удалённые наряды. Можно восстановить. '
+            f'{"Окончательное стирание доступно администратору." if _is_admin else "Окончательное стирание — у администратора."}</p>'
+            f'{_trash_rows}</details></section>'
+        )
+    else:
+        _trash_block = ""
     body = f"""
 <h1>📋 Наряды-допуски</h1>
 <section class="grid"><h2>Активные ({len(orders)})</h2>{rows or '<p class="muted">Нет активных нарядов.</p>'}</section>
 {_archive_block}
+{_trash_block}
 <section>
 <h2>Новый наряд</h2>
 <form method="post" action="/production/work-orders/new">
@@ -2380,17 +2410,37 @@ def work_order_close(work_order_id: str, request: Request, db: Session = Depends
 
 @app.post("/production/work-orders/{work_order_id}/delete")
 def work_order_delete(work_order_id: str, request: Request, db: Session = Depends(get_db)):
-    """Физическое удаление наряда через ORM: каскад delete-orphan снимает состав,
-    ежедневные допуски и изменения состава автоматически (в отличие от сырого
-    DELETE в psql, где внешние ключи приходится чистить вручную). Необратимо —
-    подтверждение спрашивается на кнопке. Для штатного завершения есть «Закрыть»."""
+    """Мягкое удаление наряда — уходит в «Корзину», не стирается. Доступно всем ролям.
+    Восстанавливается оттуда. Физическое стирание — только админ (см. hard-delete).
+    Так случайный тап по «Удалить» больше не сносит наряд безвозвратно (был инцидент
+    со сносом 03-Л)."""
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
-    order = db.get(WorkOrder, work_order_id)
-    if order is None:
+    who = request.session.get("role", "") or "—"
+    if not prod.soft_delete_work_order(db, work_order_id, deleted_by=who):
         raise HTTPException(404, "Наряд не найден.")
-    db.delete(order)
-    db.commit()
+    return RedirectResponse("/production/work-orders", status_code=303)
+
+
+@app.post("/production/work-orders/{work_order_id}/restore")
+def work_order_restore(work_order_id: str, request: Request, db: Session = Depends(get_db)):
+    """Восстановление наряда из корзины — доступно всем, кто видит корзину."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    prod.restore_work_order(db, work_order_id)
+    return RedirectResponse("/production/work-orders", status_code=303)
+
+
+@app.post("/production/work-orders/{work_order_id}/hard-delete")
+def work_order_hard_delete(work_order_id: str, request: Request, db: Session = Depends(get_db)):
+    """Физическое стирание наряда из корзины — ТОЛЬКО админ. Необратимо, каскадом
+    снимает состав, ежедневные допуски, изменения состава."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    if request.session.get("role", "") != "admin":
+        raise HTTPException(403, "Окончательное удаление доступно только администратору.")
+    if not prod.hard_delete_work_order(db, work_order_id):
+        raise HTTPException(404, "Наряд не найден.")
     return RedirectResponse("/production/work-orders", status_code=303)
 
 
