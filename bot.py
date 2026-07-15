@@ -213,6 +213,7 @@ def _build_main_menu(role: str | None = None) -> InlineKeyboardBuilder:
         builder.row(CallbackButton(text="🌙 Вечер (ночная смена)", payload="menu:evening"))
         builder.row(CallbackButton(text="🧹 Действия с сотрудником", payload="menu:empaction"))
         builder.row(CallbackButton(text="📄 Наряды-допуски", payload="menu:section:workorders"))
+        builder.row(CallbackButton(text="📋 Приказы ОТ/ТБ", payload="menu:section:otorders"))
     builder.row(CallbackButton(text="👥 Сотрудники", payload="menu:section:employees"))
     if role in ("kadrovik", "admin"):
         builder.row(CallbackButton(text="⚠️ Требует внимания", payload="menu:section:attention"))
@@ -876,6 +877,77 @@ async def _send_work_order_pdf(responder: "_Responder", work_order_id: str) -> N
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+# Иконки статуса приказа ОТ (из prod.get_ot_orders_status):
+#   ready → есть запись и скан (готово); no_scan → заведён без скана (распечатать/подписать/
+#   приложить скан); missing → записи нет вовсе (ещё не создан, печатать нечего).
+_OT_STATUS_ICON = {"ready": "✅", "no_scan": "🖨", "missing": "⬜"}
+
+
+async def _deliver_ot_orders_list(responder: "_Responder") -> None:
+    """Плоский список обязательных приказов ОТ/ТБ со статусом (чтобы видеть, что ещё не закрыто).
+    Тап печатает бланк (poget:<key>). missing печатать нельзя — нет номера/даты."""
+    with Session(engine) as session:
+        items = prod.get_ot_orders_status(session)
+        rows = [(it["key"], it["status"], it["topic"]) for it in items]
+
+    builder = InlineKeyboardBuilder()
+    for key, status, topic in rows:
+        icon = _OT_STATUS_ICON.get(status, "•")
+        builder.row(CallbackButton(text=f"{icon} {topic}"[:60], payload=f"poget:{key}"))
+    builder.row(CallbackButton(text="⬅️ Назад", payload="menu:main"))
+    header = ("📋 Приказы ОТ/ТБ:\n"
+              "✅ готово (со сканом) · 🖨 распечатать/подписать · ⬜ ещё не создан")
+    await responder.show_menu(header, [builder.as_markup()])
+
+
+async def _send_ot_order_pdf(responder: "_Responder", order_key: str) -> None:
+    """Генерирует бланк приказа ОТ по ключу и отправляет PDF. Печать возможна только для
+    заведённых приказов (есть номер и дата); missing → печатать нечего."""
+    tmp_dir = tempfile.mkdtemp(prefix="ot_")
+    try:
+        with Session(engine) as session:
+            rec = prod.get_order_by_key(session, order_key)
+            if rec is None:
+                await responder.send(
+                    "Этот приказ ещё не заведён в реестре — печатать нечего. "
+                    "Создайте его в вебе (нужен номер и дата), затем распечатаете здесь."
+                )
+                return
+            number = rec.number
+            order_date = rec.order_date
+            try:
+                docx_path = prod.generate_ot_order_docx(order_key, number, order_date, tmp_dir)
+            except ValueError as e:
+                await responder.send(f"Не удалось сформировать приказ: {e}")
+                return
+            except Exception:
+                log.exception("Не удалось сгенерировать docx приказа %s", order_key)
+                await responder.send("Не удалось сформировать приказ. Попробуйте позже.")
+                return
+
+        try:
+            pdf_path = await asyncio.to_thread(_docx_to_pdf, docx_path, tmp_dir)
+        except RuntimeError as e:
+            await responder.send(f"Не удалось получить PDF: {e}")
+            return
+
+        safe_num = "".join(c if c not in '/\\:*?"<>|' else "-" for c in (number or "no"))
+        nice_name = f"Приказ_№{safe_num}.pdf"
+        nice_path = os.path.join(tmp_dir, nice_name)
+        try:
+            if nice_path != pdf_path:
+                os.replace(pdf_path, nice_path)
+            await responder.send(
+                text=f"Приказ №{number}",
+                attachments=[InputMedia(path=nice_path)],
+            )
+        except Exception:
+            log.exception("Не удалось отправить PDF приказа %s", order_key)
+            await responder.send("Ошибка отправки файла. Попробуйте ещё раз.")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 @dp.message_callback()
 async def on_callback(event: MessageCallback):
     """Единая точка входа для всех кнопок: главное меню (payload='menu:...') и выбор
@@ -942,6 +1014,14 @@ async def on_callback(event: MessageCallback):
         if section == "workorders" and role not in ("prorab", "kadrovik", "admin"):
             await responder.send("Наряды-допуски доступны только зарегистрированным пользователям. "
                                   "Выполните /login.")
+            return
+        if section == "otorders":
+            if role not in ("prorab", "kadrovik", "admin"):
+                await responder.send("Приказы доступны только зарегистрированным пользователям. "
+                                      "Выполните /login.")
+                return
+            # плоский список приказов — сразу, без промежуточного подменю
+            await _deliver_ot_orders_list(responder)
             return
         await responder.show_menu(title, [_build_section_menu(section, role).as_markup()])
         return
@@ -1586,6 +1666,18 @@ async def on_callback(event: MessageCallback):
                                   "Выполните /login.")
             return
         await _send_work_order_pdf(responder, work_order_id)
+        return
+
+    if payload.startswith("poget:"):
+        # печать приказа ОТ: poget:<order_key>
+        order_key = payload.split(":", 1)[1]
+        with Session(engine) as session:
+            role = _role_for_max_id(session, responder.user_id())
+        if role not in ("prorab", "kadrovik", "admin"):
+            await responder.send("Приказы доступны только зарегистрированным пользователям. "
+                                  "Выполните /login.")
+            return
+        await _send_ot_order_pdf(responder, order_key)
         return
 
     if payload.startswith("delpick:"):
