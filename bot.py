@@ -813,12 +813,14 @@ async def _deliver_work_order_list(responder: "_Responder", scope: str) -> None:
     builder = InlineKeyboardBuilder()
     if not items:
         builder.row(CallbackButton(text="⬅️ Назад", payload="menu:section:workorders"))
-        await responder.send(text=empty, attachments=[builder.as_markup()])
+        # show_menu редактирует текущее сообщение (список открывается всегда по кнопке),
+        # чтобы не плодить параллельное меню секции. Fallback на send — внутри show_menu.
+        await responder.show_menu(empty, [builder.as_markup()])
         return
     for oid, label in items:
         builder.row(CallbackButton(text=label[:60], payload=f"wodl:{oid}"))
     builder.row(CallbackButton(text="⬅️ Назад", payload="menu:section:workorders"))
-    await responder.send(text=title, attachments=[builder.as_markup()])
+    await responder.show_menu(title, [builder.as_markup()])
 
 
 async def _send_work_order_pdf(responder: "_Responder", work_order_id: str) -> None:
