@@ -40,6 +40,8 @@
 import asyncio
 import logging
 import os
+import shutil
+import subprocess
 import tempfile
 from datetime import date, datetime, timezone, timedelta
 
@@ -73,6 +75,8 @@ from models import (
     ObligationType,
     RotationReturn,
     SystemFlag,
+    WorkOrder,
+    WorkOrderMember,
 )
 from obligations import create_obligations_for_employee
 import tabel
@@ -107,6 +111,9 @@ CONSENT_TEXT_VERSION = os.environ.get("CONSENT_TEXT_VERSION", "v1")
 HR_WHITELIST = set(
     p.strip() for p in os.environ.get("HR_PHONE_WHITELIST", "").split(",") if p.strip()
 )
+# Организация для бланка наряда-допуска — тот же источник, что в webforms.py (ORG_NAME),
+# чтобы наряд из бота и из веба печатался с идентичным юрлицом.
+ORG_NAME = os.environ.get("COMPANY_NAME", "ИП Буц Сергей Юрьевич")
 
 engine = create_engine(DATABASE_URL)
 Base.metadata.create_all(engine)
@@ -205,6 +212,7 @@ def _build_main_menu(role: str | None = None) -> InlineKeyboardBuilder:
         builder.row(CallbackButton(text="☀️ Утро (явка)", payload="menu:morning"))
         builder.row(CallbackButton(text="🌙 Вечер (ночная смена)", payload="menu:evening"))
         builder.row(CallbackButton(text="🧹 Действия с сотрудником", payload="menu:empaction"))
+        builder.row(CallbackButton(text="📄 Наряды-допуски", payload="menu:section:workorders"))
     builder.row(CallbackButton(text="👥 Сотрудники", payload="menu:section:employees"))
     if role in ("kadrovik", "admin"):
         builder.row(CallbackButton(text="⚠️ Требует внимания", payload="menu:section:attention"))
@@ -232,6 +240,9 @@ def _build_section_menu(section: str, role: str | None = None) -> InlineKeyboard
                                         payload="menu:onboarding"))
             builder.row(CallbackButton(text="❓ Уточнить дату возврата (МЖ)",
                                         payload="menu:pending_rotation"))
+    elif section == "workorders":
+        builder.row(CallbackButton(text="🟢 Активные наряды", payload="menu:wolist:active"))
+        builder.row(CallbackButton(text="🗄 Архив нарядов", payload="menu:wolist:past"))
     elif section == "reports":
         builder.row(CallbackButton(text="📅 Табель за сегодня", payload="menu:tabel_today"))
         builder.row(CallbackButton(text="🐛 Журнал патчей", payload="menu:report_changelog"))
@@ -253,6 +264,7 @@ def _role_for_max_id(session: Session, max_user_id: str) -> str | None:
 _SECTION_TITLES = {
     "employees": "👥 Сотрудники",
     "attention": "⚠️ Требует внимания",
+    "workorders": "📄 Наряды-допуски",
     "reports": "📊 Отчёты (в разработке)",
 }
 
@@ -741,6 +753,127 @@ async def _send_employee_document(responder: "_Responder", employee_id: str, sca
             pass
 
 
+def _docx_to_pdf(docx_path: str, out_dir: str) -> str:
+    """Конвертирует docx в PDF через LibreOffice headless. Синхронная (блокирующая)
+    функция — вызывать через asyncio.to_thread, иначе на 2-4 сек замирает весь бот.
+
+    -env:UserInstallation указывает LibreOffice на одноразовый профиль в /tmp: под
+    systemd-юзером migbot-bot нет пригодного HOME, и без этого soffice молча падает
+    на инициализации профиля. Профиль уникален на вызов, чтобы параллельные конвертации
+    не дрались за одну папку.
+
+    Возвращает путь к .pdf. Бросает RuntimeError, если бинарь не найден или конвертация
+    не дала файла (хвост stderr — в текст исключения, уходит в чат)."""
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if not soffice:
+        raise RuntimeError(
+            "конвертер PDF (LibreOffice) не установлен на сервере. "
+            "Установите: apt-get install -y libreoffice-writer --no-install-recommends"
+        )
+    profile_dir = tempfile.mkdtemp(prefix="lo_profile_")
+    try:
+        proc = subprocess.run(
+            [
+                soffice, "--headless", "--nologo", "--nofirststartwizard",
+                f"-env:UserInstallation=file://{profile_dir}",
+                "--convert-to", "pdf", "--outdir", out_dir, docx_path,
+            ],
+            capture_output=True, text=True, timeout=60,
+        )
+        base = os.path.splitext(os.path.basename(docx_path))[0]
+        pdf_path = os.path.join(out_dir, base + ".pdf")
+        if not os.path.exists(pdf_path):
+            tail = (proc.stderr or proc.stdout or "").strip()[-300:]
+            raise RuntimeError(f"конвертация в PDF не удалась (код {proc.returncode}). {tail}")
+        return pdf_path
+    finally:
+        shutil.rmtree(profile_dir, ignore_errors=True)
+
+
+async def _deliver_work_order_list(responder: "_Responder", scope: str) -> None:
+    """Список нарядов-допусков кнопками. scope='active' — действующие, 'past' — архив
+    (истёкший срок). Корзину (мягко удалённые) прорабу не показываем. Скачивание — wodl:<id>."""
+    with Session(engine) as session:
+        if scope == "past":
+            orders = prod.get_past_work_orders(session)
+            title = "🗄 Архив нарядов (срок истёк):"
+            empty = "В архиве нет нарядов."
+        else:
+            orders = prod.get_active_work_orders(session)
+            title = "🟢 Действующие наряды-допуски:"
+            empty = "Действующих нарядов нет."
+        # подписи собираем внутри сессии (обращаемся к полям, пока объекты привязаны)
+        items = [
+            (o.id,
+             f"№{o.number} — {o.location} "
+             f"({o.valid_from:%d.%m}–{o.valid_to:%d.%m.%Y})")
+            for o in orders
+        ]
+
+    builder = InlineKeyboardBuilder()
+    if not items:
+        builder.row(CallbackButton(text="⬅️ Назад", payload="menu:section:workorders"))
+        await responder.send(text=empty, attachments=[builder.as_markup()])
+        return
+    for oid, label in items:
+        builder.row(CallbackButton(text=label[:60], payload=f"wodl:{oid}"))
+    builder.row(CallbackButton(text="⬅️ Назад", payload="menu:section:workorders"))
+    await responder.send(text=title, attachments=[builder.as_markup()])
+
+
+async def _send_work_order_pdf(responder: "_Responder", work_order_id: str) -> None:
+    """Генерирует наряд-допуск (docx), конвертирует в PDF и отправляет файлом в чат.
+    Ветвление генератора по work_type_id — как в webforms.work_order_print:
+    есть тип работы → высотный бланк (782н), нет → общий."""
+    tmp_dir = tempfile.mkdtemp(prefix="wo_")
+    try:
+        with Session(engine) as session:
+            order = session.get(WorkOrder, work_order_id)
+            if order is None or order.is_deleted:
+                await responder.send("Наряд не найден или удалён.")
+                return
+            members = (
+                session.query(WorkOrderMember)
+                .filter_by(work_order_id=order.id)
+                .all()
+            )
+            number = order.number
+            try:
+                if order.work_type_id:
+                    docx_path = prod.generate_height_work_order_docx(
+                        order, members, org_name=ORG_NAME, output_dir=tmp_dir)
+                else:
+                    docx_path = prod.generate_work_order_docx(
+                        order, members, org_name=ORG_NAME, output_dir=tmp_dir)
+            except Exception:
+                log.exception("Не удалось сгенерировать docx наряда %s", work_order_id)
+                await responder.send("Не удалось сформировать наряд. Попробуйте позже.")
+                return
+
+        try:
+            pdf_path = await asyncio.to_thread(_docx_to_pdf, docx_path, tmp_dir)
+        except RuntimeError as e:
+            await responder.send(f"Не удалось получить PDF: {e}")
+            return
+
+        # имя файла для чата — с санацией небезопасных символов в номере (слэш ломал имя)
+        safe_num = "".join(c if c not in '/\\:*?"<>|' else "-" for c in (number or "no"))
+        nice_name = f"Наряд-допуск_№{safe_num}.pdf"
+        nice_path = os.path.join(tmp_dir, nice_name)
+        try:
+            if nice_path != pdf_path:
+                os.replace(pdf_path, nice_path)
+            await responder.send(
+                text=f"Наряд-допуск №{number}",
+                attachments=[InputMedia(path=nice_path)],
+            )
+        except Exception:
+            log.exception("Не удалось отправить PDF наряда %s", work_order_id)
+            await responder.send("Ошибка отправки файла. Попробуйте ещё раз.")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 @dp.message_callback()
 async def on_callback(event: MessageCallback):
     """Единая точка входа для всех кнопок: главное меню (payload='menu:...') и выбор
@@ -803,6 +936,10 @@ async def on_callback(event: MessageCallback):
             role = _role_for_max_id(session, responder.user_id())
         if section == "attention" and role not in ("kadrovik", "admin"):
             await responder.send("Этот раздел доступен только кадровику/админу.")
+            return
+        if section == "workorders" and role not in ("prorab", "kadrovik", "admin"):
+            await responder.send("Наряды-допуски доступны только зарегистрированным пользователям. "
+                                  "Выполните /login.")
             return
         await responder.show_menu(title, [_build_section_menu(section, role).as_markup()])
         return
@@ -1423,6 +1560,30 @@ async def on_callback(event: MessageCallback):
         # скачать конкретный документ: docget:<employee_id>:<scan_type>
         _, employee_id, scan_type = payload.split(":", 2)
         await _send_employee_document(responder, employee_id, scan_type)
+        return
+
+    if payload.startswith("menu:wolist:"):
+        # список нарядов: menu:wolist:active | menu:wolist:past
+        scope = payload.split(":", 2)[2]
+        with Session(engine) as session:
+            role = _role_for_max_id(session, responder.user_id())
+        if role not in ("prorab", "kadrovik", "admin"):
+            await responder.send("Наряды-допуски доступны только зарегистрированным пользователям. "
+                                  "Выполните /login.")
+            return
+        await _deliver_work_order_list(responder, scope)
+        return
+
+    if payload.startswith("wodl:"):
+        # скачать наряд-допуск PDF: wodl:<work_order_id>
+        work_order_id = payload.split(":", 1)[1]
+        with Session(engine) as session:
+            role = _role_for_max_id(session, responder.user_id())
+        if role not in ("prorab", "kadrovik", "admin"):
+            await responder.send("Наряды-допуски доступны только зарегистрированным пользователям. "
+                                  "Выполните /login.")
+            return
+        await _send_work_order_pdf(responder, work_order_id)
         return
 
     if payload.startswith("delpick:"):
