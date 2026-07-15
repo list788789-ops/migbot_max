@@ -922,6 +922,19 @@ def get_unprinted_instructions(session: Session, instruction_type: InstructionTy
     )
 
 
+def get_journaled_instructions(session: Session, instruction_type: InstructionType) -> list[Instruction]:
+    """Read-only выборка уже пронумерованных записей журнала (journal_row_number проставлен),
+    по порядку номера строки. Для перепечатки готового журнала (напр. в боте) БЕЗ присвоения
+    новых номеров — в отличие от print_new_journal_entries, эта функция ничего не меняет."""
+    return (
+        session.query(Instruction)
+        .filter_by(type=instruction_type)
+        .filter(Instruction.journal_row_number.isnot(None))
+        .order_by(Instruction.journal_row_number)
+        .all()
+    )
+
+
 def get_last_journal_row_number(session: Session, instruction_type: InstructionType) -> int:
     last = (
         session.query(Instruction)
