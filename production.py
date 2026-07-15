@@ -1677,6 +1677,7 @@ def generate_work_order_docx(work_order: WorkOrder, members: list[WorkOrderMembe
     doc.add_paragraph(f"Организация: {org_name}")
     if work_order.subdivision:
         doc.add_paragraph(f"Подразделение: {work_order.subdivision}")
+    doc.add_paragraph(f"Место выполнения работ: {work_order.location}")
     doc.add_paragraph(f"Выдан: «{work_order.created_at.strftime('%d')}» "
                        f"{work_order.created_at.strftime('%m.%Y')} г.")
     doc.add_paragraph(
@@ -1693,7 +1694,6 @@ def generate_work_order_docx(work_order: WorkOrder, members: list[WorkOrderMembe
     )
     doc.add_paragraph()
     doc.add_paragraph(f"На выполнение работ: {work_order.work_description}")
-    doc.add_paragraph(f"Место выполнения работ: {work_order.location}")
 
     # Материалы/инструменты/приспособления/спецтехника — только если заполнены
     # (необязательные поля, не все наряды их требуют).
@@ -1954,6 +1954,7 @@ def generate_height_work_order_docx(work_order: WorkOrder, members: list[WorkOrd
 
     _label("Организация: ", org_name)
     _label("Подразделение: ", subdivision)
+    _label("Место выполнения работ: ", work_order.location)
     _label("Выдан ", f"{work_order.valid_from.strftime('%d.%m.%Y') if work_order.valid_from else _HWO_DASH} года")
     _label("Действителен до ", f"{work_order.valid_to.strftime('%d.%m.%Y') if work_order.valid_to else _HWO_DASH} года")
     _label("Ответственному руководителю работ: ", getattr(sup, "full_name", None))
@@ -1979,7 +1980,6 @@ def generate_height_work_order_docx(work_order: WorkOrder, members: list[WorkOrd
            "Инструктаж провёл (подпись)", "Ознакомлен (подпись)"], member_rows)
 
     _p()
-    _label("Место выполнения работ: ", work_order.location)
     _label("Содержание работ: ", content_val)
     _label("Условия проведения работ: ", conditions_val)
     _label("Опасные и вредные производственные факторы, которые действуют или могут возникнуть "
