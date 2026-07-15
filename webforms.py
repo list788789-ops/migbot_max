@@ -81,6 +81,7 @@ from models import (
     RotationReturn,
     SystemFlag,
     WorkOrderMember,
+    WorkOrderDailyAdmission,
     WorkOrderMemberChange,
     WorkLogEntry,
     MemberChangeType,
@@ -2128,6 +2129,7 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
             f'<span class="muted">Руководитель: {o.responsible_supervisor.full_name if o.responsible_supervisor else "?"} · '
             f'Исполнитель: {o.responsible_executor.full_name if o.responsible_executor else "?"}</span><br>'
             f'<span class="badge neutral">Подписали: {signed}/{len(members)}</span> '
+            f'<a class="btn" href="/production/work-orders/{o.id}">🔍 Открыть</a> '
             f'<a class="btn secondary" href="/production/work-orders/{o.id}/print">Печатный бланк</a> '
             f'<form method="post" action="/production/work-orders/{o.id}/close" style="display:inline">'
             f'<button type="submit" class="btn secondary">Закрыть наряд</button></form>'
@@ -2444,6 +2446,69 @@ def work_order_hard_delete(work_order_id: str, request: Request, db: Session = D
     return RedirectResponse("/production/work-orders", status_code=303)
 
 
+@app.get("/production/work-orders/{work_order_id}", response_class=HTMLResponse)
+def work_order_view(work_order_id: str, request: Request, db: Session = Depends(get_db)):
+    """Страница просмотра наряда — все разделы по 782н на отдельной странице
+    (реквизиты, ответственные, ОВПФ, системы безопасности, состав, дни допуска,
+    изменения состава). Кнопка «Открыть» на карточке ведёт сюда."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    o = db.get(WorkOrder, work_order_id)
+    if o is None or o.is_deleted:
+        raise HTTPException(404, "Наряд не найден.")
+    members = db.query(WorkOrderMember).filter_by(work_order_id=o.id).all()
+    admissions = db.query(WorkOrderDailyAdmission).filter_by(work_order_id=o.id).order_by(WorkOrderDailyAdmission.admission_date).all()
+    changes = prod.get_member_changes(db, o.id)
+
+    def _row(label, value):
+        return (f'<tr><td style="padding:6px 12px 6px 0;color:#5b626b;vertical-align:top;white-space:nowrap">{label}</td>'
+                f'<td style="padding:6px 0">{value}</td></tr>')
+
+    _sup = o.responsible_supervisor.full_name if o.responsible_supervisor else "—"
+    _exe = o.responsible_executor.full_name if o.responsible_executor else "—"
+    _rekv = (
+        '<table style="border-collapse:collapse">'
+        + _row("Номер", f"<b>{html.escape(o.number)}</b>")
+        + _row("Статус", html.escape(str(o.status.value if hasattr(o.status, "value") else o.status)))
+        + _row("Работы", html.escape(o.work_description or "—"))
+        + _row("Место", html.escape(o.location or "—"))
+        + _row("Срок", f"{o.valid_from:%d.%m.%Y} – {o.valid_to:%d.%m.%Y}")
+        + _row("Руководитель работ", html.escape(_sup) + " <span class='muted'>(3-я гр.)</span>")
+        + _row("Ответственный исполнитель", html.escape(_exe) + " <span class='muted'>(2-я гр.)</span>")
+        + _row("ОВПФ", html.escape(o.hazards or "—"))
+        + _row("Системы безопасности", html.escape(o.safety_systems or "—"))
+        + "</table>"
+    )
+
+    _members_html = "".join(
+        f'<li>{html.escape(m.employee.full_name if m.employee else "—")}'
+        f'{" · ✍ подписал" if m.signed_at else ""}</li>'
+        for m in members
+    ) or '<li class="muted">Состав пуст</li>'
+
+    _adm_html = "".join(f'<span style="display:inline-block;margin:2px 6px 2px 0;padding:2px 8px;'
+                        f'border:1px solid #e6e9ee;border-radius:6px;font-size:13px">{a.admission_date:%d.%m}</span>'
+                        for a in admissions) or '<span class="muted">нет</span>'
+
+    _changes_html = "".join(
+        f'<li class="muted">{"➕" if ch.change_type == MemberChangeType.ADDED else "➖"} '
+        f'{html.escape(getattr(ch.employee, "full_name", "?"))} · {ch.changed_at:%d.%m %H:%M} · '
+        f'разрешил: {html.escape(ch.ordered_by or "—")}</li>'
+        for ch in changes
+    ) or '<li class="muted">изменений не было</li>'
+
+    body = f"""
+<h1>📋 Наряд №{html.escape(o.number)}</h1>
+<p><a class="btn secondary" href="/production/work-orders">← К списку</a>
+<a class="btn" href="/production/work-orders/{o.id}/print">📄 Печатный бланк</a></p>
+<section class="card"><h2>Реквизиты</h2>{_rekv}</section>
+<section class="card"><h2>Состав бригады ({len(members)})</h2><ul>{_members_html}</ul></section>
+<section class="card"><h2>Дни допуска ({len(admissions)})</h2>{_adm_html}</section>
+<section class="card"><h2>Изменения состава (п.7, 782н)</h2><ul>{_changes_html}</ul></section>
+"""
+    return _render(f"Наряд №{o.number}", body, active="production", role=request.session.get("role", ""))
+
+
 @app.get("/production/work-orders/{work_order_id}/print")
 def work_order_print(work_order_id: str, request: Request, db: Session = Depends(get_db)):
     if not _logged_in(request):
@@ -2458,7 +2523,8 @@ def work_order_print(work_order_id: str, request: Request, db: Session = Depends
         path = prod.generate_work_order_docx(order, members, org_name=ORG_NAME)
     with open(path, "rb") as f:
         data = f.read()
-    fn = f"Наряд-допуск_№{order.number}.docx"
+    _safe = "".join(c if c not in '/\\:*?"<>|' else "-" for c in (order.number or "no"))
+    fn = f"Наряд-допуск_№{_safe}.docx"
     return Response(
         content=data,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
