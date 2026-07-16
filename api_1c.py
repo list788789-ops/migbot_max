@@ -18,10 +18,10 @@ import hashlib
 import hmac
 import json
 import os
-from datetime import date
+from datetime import date, datetime
 
 from fastapi import Depends, FastAPI, Header, HTTPException
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -42,6 +42,11 @@ def _get_db():
         yield db
     finally:
         db.close()
+
+
+def token_configured() -> bool:
+    """True, если ONEC_API_TOKEN задан (без раскрытия значения)."""
+    return bool(os.environ.get("ONEC_API_TOKEN", ""))
 
 
 def _check_token(authorization: str | None = Header(default=None)) -> None:
@@ -75,7 +80,6 @@ def _serialize(e: Employee) -> dict:
         "doc_type": e.doc_type,
         "passport_series": e.passport_series,
         "passport_number": e.passport_number,
-        "iin": e.iin,
         "snils": e.snils,
         "snils_procedure": e.snils_procedure,
         "snils_appointment_date": _iso(e.snils_appointment_date),
@@ -88,6 +92,34 @@ def _serialize(e: Employee) -> dict:
             e.registration_status.name.lower() if e.registration_status else None
         ),
     }
+
+
+# Пример структуры одной записи ответа — для передачи интегратору 1С
+# (значения обезличены, реальные данные не раскрываются).
+EXAMPLE_EMPLOYEE_JSON = {
+    "id_migbot": "3f2c…-uuid",
+    "full_name": "Иванов Иван Иванович",
+    "citizenship": "Казахстан",
+    "category": "eaeu",
+    "is_rf": False,
+    "entry_date": "2026-05-01",
+    "contract_date": "2026-05-03",
+    "contract_end_date": None,
+    "is_active": True,
+    "birth_date": "1990-01-01",
+    "doc_type": "Паспорт иностранного гражданина",
+    "passport_series": "12",
+    "passport_number": "3456789",
+    "snils": "123-456-789 00",
+    "snils_procedure": None,
+    "snils_appointment_date": None,
+    "position": "Монтажник",
+    "subdivision": None,
+    "tab_number": "0042",
+    "contract_number": "БК-ПСМ-0042",
+    "phone": "+7 900 000-00-00",
+    "registration_status": "primary",
+}
 
 
 def _payload_hash(payload: dict) -> str:
@@ -126,6 +158,36 @@ def _record_exported(db: Session, rows: list[dict]) -> None:
     db.execute(stmt)
 
 
+def get_export_stats(db: Session) -> dict:
+    """Статистика выгрузки для меню бота (ничего не меняет).
+
+    total    — всего сотрудников в БД;
+    exported — по скольким уже есть запись в журнале выгрузки;
+    pending  — сколько попадёт в следующую выгрузку (новые + изменившиеся);
+    last_export_at — время последней фиксации выгрузки (или None).
+    """
+    total = db.scalar(select(func.count()).select_from(Employee)) or 0
+    exported = db.scalar(select(func.count()).select_from(OnecExportLog)) or 0
+    changed, _rows = _compute_delta(db)
+    last_export_at = db.scalar(select(func.max(OnecExportLog.exported_at)))
+    return {
+        "total": int(total),
+        "exported": int(exported),
+        "pending": len(changed),
+        "last_export_at": last_export_at,
+    }
+
+
+def reset_export_log(db: Session) -> int:
+    """Очищает журнал выгрузки (onec_export_log). Рабочие данные не трогает —
+    только служебные хеши; при следующем запросе 1С заберёт всех заново.
+    Возвращает число удалённых строк."""
+    count = db.scalar(select(func.count()).select_from(OnecExportLog)) or 0
+    db.execute(delete(OnecExportLog))
+    db.commit()
+    return int(count)
+
+
 def register_1c_routes(app: FastAPI) -> None:
     """Подключает роуты интеграции с 1С и гарантирует наличие таблицы журнала."""
 
@@ -137,7 +199,13 @@ def register_1c_routes(app: FastAPI) -> None:
         _: None = Depends(_check_token),
         db: Session = Depends(_get_db),
     ):
+        total = db.scalar(select(func.count()).select_from(Employee)) or 0
         changed, rows = _compute_delta(db)
         _record_exported(db, rows)
         db.commit()
-        return {"count": len(changed), "employees": changed}
+        return {
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "total": int(total),
+            "count": len(changed),
+            "employees": changed,
+        }
