@@ -174,6 +174,10 @@ app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, session_cookie="mig
 from api_1c import register_1c_routes
 register_1c_routes(app)
 
+# --- Интеграция с 1С: роут GET /api/1c/employees (см. api_1c.py) ---
+from api_1c import register_1c_routes
+register_1c_routes(app)
+
 
 # --- Хранилище сканов (S3-совместимое, Cloud.ru Object Storage) --------------
 # Сканы для пакета Госуслуг (паспорт, миграционная карта, выписка ЕГРН на ВЖК) хранятся в
