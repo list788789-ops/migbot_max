@@ -5,20 +5,27 @@
 1С — HTTP-клиент (плановое задание раз в сутки), migbot — сервер.
 Авторизация: Bearer-токен из переменной окружения ONEC_API_TOKEN.
 
-Первая итерация: полная выгрузка (updated_at у Employee пока нет — инкремент позже).
+Инкремент (вариант B без ack): сервер ведёт журнал выгрузки
+(onec_export_log) — хеш последнего отданного профиля по каждому сотруднику.
+При запросе отдаём только тех, у кого хеш изменился или его ещё нет,
+и тут же фиксируем новые хеши (без отдельного ack-вызова).
+
 Только синхронизация данных; кадровые документы 1С создаёт кадровик вручную.
 """
 from __future__ import annotations
 
+import hashlib
 import hmac
+import json
 import os
 from datetime import date
 
 from fastapi import Depends, FastAPI, Header, HTTPException
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session, sessionmaker
 
-from models import Employee
+from models import Employee, OnecExportLog
 
 # --- Отдельная сессия БД (чтобы не было циклического импорта из webforms) ---
 _DATABASE_URL = os.environ["DATABASE_URL"]
@@ -83,16 +90,54 @@ def _serialize(e: Employee) -> dict:
     }
 
 
+def _payload_hash(payload: dict) -> str:
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _compute_delta(db: Session):
+    """Возвращает (changed_payloads, rows_to_persist) — только новые/изменившиеся."""
+    employees = db.scalars(select(Employee).order_by(Employee.full_name)).all()
+    existing = dict(
+        db.execute(
+            select(OnecExportLog.employee_id, OnecExportLog.content_hash)
+        ).all()
+    )
+    changed = []
+    rows = []
+    for e in employees:
+        payload = _serialize(e)
+        h = _payload_hash(payload)
+        if existing.get(e.id) != h:
+            changed.append(payload)
+            rows.append({"employee_id": e.id, "content_hash": h})
+    return changed, rows
+
+
+def _record_exported(db: Session, rows: list[dict]) -> None:
+    """Фиксирует хеши отданных профилей (upsert по employee_id)."""
+    if not rows:
+        return
+    stmt = pg_insert(OnecExportLog).values(rows)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["employee_id"],
+        set_={"content_hash": stmt.excluded.content_hash, "exported_at": func.now()},
+    )
+    db.execute(stmt)
+
+
 def register_1c_routes(app: FastAPI) -> None:
-    """Подключает роуты интеграции с 1С к переданному FastAPI-приложению."""
+    """Подключает роуты интеграции с 1С и гарантирует наличие таблицы журнала."""
+
+    # Идемпотентно создаём таблицу журнала, если её ещё нет (новая таблица).
+    OnecExportLog.__table__.create(bind=_engine, checkfirst=True)
 
     @app.get("/api/1c/employees")
     def list_employees_for_1c(
         _: None = Depends(_check_token),
         db: Session = Depends(_get_db),
     ):
-        employees = db.scalars(
-            select(Employee).order_by(Employee.full_name)
-        ).all()
-        data = [_serialize(e) for e in employees]
-        return {"count": len(data), "employees": data}
+        changed, rows = _compute_delta(db)
+        _record_exported(db, rows)
+        db.commit()
+        return {"count": len(changed), "employees": changed}
