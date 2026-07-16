@@ -1116,3 +1116,24 @@ class Weather(Base):
     temperature: Mapped[float | None] = mapped_column(Float, nullable=True)
     description: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+# --- Журнал выгрузки в 1С (инкремент без updated_at): хеш последнего отданного профиля ---
+from sqlalchemy import func as _sa_func
+
+
+class OnecExportLog(Base):
+    """Хеш последнего профиля сотрудника, отданного в 1С.
+
+    Позволяет отдавать в 1С только изменившиеся записи. Новая таблица —
+    создаётся через create_all / checkfirst при старте web-приложения."""
+
+    __tablename__ = "onec_export_log"
+
+    employee_id: Mapped[str] = mapped_column(
+        String, ForeignKey("employees.id", ondelete="CASCADE"), primary_key=True
+    )
+    content_hash: Mapped[str] = mapped_column(String, nullable=False)
+    exported_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=_sa_func.now()
+    )
