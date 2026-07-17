@@ -230,6 +230,7 @@ def _build_section_menu(section: str, role: str | None = None) -> InlineKeyboard
         builder.row(CallbackButton(text="➕ Добавить сотрудника", payload="menu:add_employee"))
         builder.row(CallbackButton(text="📋 Список сотрудников", payload="menu:employees"))
         builder.row(CallbackButton(text="📎 Документы работника", payload="menu:docpick"))
+        builder.row(CallbackButton(text="🖨 Печать согласия", payload="menu:consent_print"))
     elif section == "attention":
         builder.row(CallbackButton(text="⏳ Без даты въезда", payload="menu:incomplete"))
         builder.row(CallbackButton(text="🗓 Без даты договора", payload="menu:contractdate"))
@@ -330,6 +331,7 @@ PICKER_TITLES = {
     "utroday": "☀️ Утро — отметьте, кто на месте",
     "eveningnight": "🌙 Вечер — кто заступает в ночь",
     "empaction": "🧹 Действия с сотрудником — выберите",
+    "consentprint": "Печать согласия — выберите работника",
 }
 # Префиксы табеля — там незачем показывать паспорт в подписи кнопки (не тот контекст).
 _TABEL_PREFIXES = {"utroday", "eveningnight", "empaction"}
@@ -346,6 +348,10 @@ def _picker_employees(session: Session, prefix: str) -> list[Employee]:
     if prefix == "delpick":
         return session.query(Employee).order_by(Employee.full_name).all()
     if prefix == "docpick":
+        return session.query(Employee).order_by(Employee.full_name).all()
+    if prefix == "consentprint":
+        # Печать бланка согласия для ЛЮБОГО сотрудника (не только ожидающих) — весь
+        # список по алфавиту, как docpick. Статус согласия здесь не фильтруем.
         return session.query(Employee).order_by(Employee.full_name).all()
     if prefix == "consentpick":
         return (
@@ -516,6 +522,33 @@ async def _deliver_consent_confirmation(responder: "_Responder", employee_id: st
         "Кнопка «Подтвердить (кнопкой)» — тестовый способ, юридически слабее "
         "сканированной подписи (ст. 9 152-ФЗ требует осознанного согласия, клик "
         "без верификации личности это не подтверждает).",
+        attachments=[builder.as_markup()],
+    )
+
+
+async def _deliver_consent_print_choice(responder: "_Responder", employee_id: str) -> None:
+    """Диалог печати бланка согласия для любого сотрудника (пункт «🖨 Печать согласия»).
+    В отличие от _deliver_consent_confirmation здесь НЕТ кнопки «Подтвердить» — это меню
+    только для печати, статус согласия не меняется. Печатать бланк можно для кого угодно,
+    вне зависимости от текущего статуса (генерация PDF от него не зависит)."""
+    with Session(engine) as session:
+        employee = session.get(Employee, employee_id)
+        if employee is None:
+            await responder.send("Сотрудник не найден.")
+            return
+        full_name = employee.full_name
+
+    builder = InlineKeyboardBuilder()
+    builder.row(CallbackButton(text="📄 Бланк согласия (ТСМ)", payload=f"consentblank:tsm:{employee_id}"))
+    builder.row(CallbackButton(text="📄 Бланк согласия (ИП Буц)", payload=f"consentblank:ip:{employee_id}"))
+    builder.row(CallbackButton(text="⬅️ Назад к списку", payload="menu:consent_print"))
+
+    await responder.send(
+        text=f"Печать согласия — {full_name}.\n\n"
+        "Нажмите «Бланк согласия (ТСМ)» — или «(ИП Буц)», если оператор ИП. "
+        "Бот пришлёт PDF, распечатайте и дайте работнику подписать.\n\n"
+        "Бланк печатается даже при незаполненной карточке — тогда в документе будет "
+        "пометка «черновик», а пустые места заполните от руки.",
         attachments=[builder.as_markup()],
     )
 
@@ -1776,6 +1809,20 @@ async def on_callback(event: MessageCallback):
 
     if payload == "menu:docpick":
         await _deliver_picker(responder, "docpick", edit=True)
+        return
+
+    if payload == "menu:consent_print":
+        # Печать согласия для любого сотрудника. Доступно всем ролям (решение Валерия),
+        # как и docpick в этом же разделе. Генерация PDF от статуса согласия не зависит.
+        await _deliver_picker(responder, "consentprint", edit=True)
+        return
+
+    if payload.startswith("consentprint:"):
+        # Тап по сотруднику в списке печати → диалог только с кнопками печати бланка
+        # (ТСМ / ИП Буц), БЕЗ «Подтвердить» — смена статуса согласия живёт в
+        # «Ожидают согласия», чтобы её нельзя было случайно нажать на уже подтверждённых.
+        employee_id = payload.split(":", 1)[1]
+        await _deliver_consent_print_choice(responder, employee_id)
         return
 
     if payload.startswith("docpick:"):
