@@ -114,6 +114,7 @@ from document_templates import (
     TEST_ALLOW_MISSING_FIELDS,
     check_medical_referral_fields,
     generate_medical_referral_docx,
+    generate_consent_docx,
     generate_labor_contract_docx,
     generate_duty_receipt_docx,
     generate_termination_notice_docx,
@@ -2540,6 +2541,31 @@ def work_order_print(work_order_id: str, request: Request, db: Session = Depends
         data = f.read()
     _safe = "".join(c if c not in '/\\:*?"<>|' else "-" for c in (order.number or "no"))
     fn = f"Наряд-допуск_№{_safe}.docx"
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": _content_disposition(fn)},
+    )
+
+
+@app.get("/employees/{employee_id}/consent-blank")
+def employee_consent_blank(employee_id: str, request: Request,
+                            operator: str = "tsm", db: Session = Depends(get_db)):
+    """Бланк согласия на обработку ПДн (152-ФЗ) под подпись.
+    operator: 'tsm' (ООО «ТРЕСТСТРОЙМОНТАЖ», по умолчанию) или 'ip' (ИП Буц С.Ю.)."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    if operator not in ("tsm", "ip"):
+        operator = "tsm"
+    employee = db.get(Employee, employee_id)
+    if employee is None:
+        raise HTTPException(404, "Сотрудник не найден.")
+    path = generate_consent_docx(employee, operator=operator)
+    with open(path, "rb") as f:
+        data = f.read()
+    op_label = {"tsm": "ТСМ", "ip": "ИП-Буц"}[operator]
+    _safe = "".join(c if c not in '/\\:*?"<>|' else "-" for c in (employee.full_name or "работник"))
+    fn = f"Согласие_ПДн_{op_label}_{_safe}.docx"
     return Response(
         content=data,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
