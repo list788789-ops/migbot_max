@@ -32,6 +32,14 @@ COMMON_DOC_TYPES = {
 # Пусто: персональные типы общими не бывают (для _s3_list_for_employee).
 SCAN_COMMON_TYPES = set()
 
+# Сканы, привязанные не к работнику, а к производственной сущности (подписанные документы).
+# Хранятся по конвенции "{kind}_{entity_id}/scan" — отдельной колонки в БД не требуют.
+ENTITY_SCAN_KINDS = {
+    "workorder": "Наряд-допуск",
+    "instruction": "Журнал инструктажа",
+    "order": "Приказ ОТ",
+}
+
 
 _S3_CLIENT_CACHE = None  # переиспользуемый boto3-клиент: создание клиента дорогое, не плодим
 
@@ -117,6 +125,54 @@ def _s3_delete(scan_type: str, employee_id: str | None) -> None:
         client.delete_object(Bucket=S3_BUCKET, Key=key)
     except Exception as e:
         raise RuntimeError(f"Не удалось удалить скан: {str(e)[:200]}")
+
+
+# --- Сканы производственных сущностей (наряд / инструктаж / приказ) --------------------
+# Конвенция ключа: "{kind}_{entity_id}/scan". Отдельной колонки в БД не требуют — наличие
+# проверяется head_object'ом, как у сканов работника. entity_id для инструктажа — тип
+# журнала (introductory / primary_workplace), для наряда/приказа — их id.
+
+def _entity_scan_key(kind: str, entity_id: str) -> str:
+    return f"{kind}_{entity_id}/scan"
+
+
+def _s3_upload_entity(kind: str, entity_id: str, data: bytes, content_type: str,
+                      metadata: dict | None = None) -> None:
+    """Загружает скан подписанного документа (наряд/инструктаж/приказ) в бакет."""
+    if kind not in ENTITY_SCAN_KINDS:
+        raise RuntimeError(f"Неизвестный тип сущности для скана: {kind}")
+    client = _s3_client()
+    key = _entity_scan_key(kind, entity_id)
+    try:
+        kwargs = dict(Bucket=S3_BUCKET, Key=key, Body=data, ContentType=content_type)
+        if metadata:
+            kwargs["Metadata"] = metadata
+        client.put_object(**kwargs)
+    except Exception as e:
+        raise RuntimeError(f"Не удалось загрузить скан в хранилище: {str(e)[:200]}")
+
+
+def _s3_entity_present(kind: str, entity_id: str) -> bool:
+    """True, если скан сущности уже загружен."""
+    try:
+        client = _s3_client()
+    except RuntimeError:
+        return False
+    try:
+        client.head_object(Bucket=S3_BUCKET, Key=_entity_scan_key(kind, entity_id))
+        return True
+    except Exception:
+        return False
+
+
+def _s3_download_entity(kind: str, entity_id: str):
+    """(bytes, content_type) скана сущности или RuntimeError."""
+    client = _s3_client()
+    try:
+        obj = client.get_object(Bucket=S3_BUCKET, Key=_entity_scan_key(kind, entity_id))
+        return obj["Body"].read(), obj.get("ContentType", "application/octet-stream")
+    except Exception as e:
+        raise RuntimeError(f"Скан не найден или недоступен: {str(e)[:200]}")
 
 
 def _common_key(doc_type: str) -> str:
