@@ -83,7 +83,6 @@ from obligations import create_obligations_for_employee
 import tabel
 import reports as reports_data
 import production as prod
-import api_1c
 from auth_binding import (
     bind_max_account, find_user_by_max_id, get_role_label,
     confirm_max_code, register_via_max,
@@ -221,8 +220,6 @@ def _build_main_menu(role: str | None = None) -> InlineKeyboardBuilder:
     if role in ("kadrovik", "admin"):
         builder.row(CallbackButton(text="⚠️ Требует внимания", payload="menu:section:attention"))
     builder.row(CallbackButton(text="📊 Отчёты", payload="menu:section:reports"))
-    if role in ("kadrovik", "admin"):
-        builder.row(CallbackButton(text="🔄 Интеграция 1С", payload="menu:section:onec"))
     return builder
 
 
@@ -255,10 +252,6 @@ def _build_section_menu(section: str, role: str | None = None) -> InlineKeyboard
         builder.row(CallbackButton(text="📊 Проблемные за месяц", payload="menu:report_monthly_problems"))
         builder.row(CallbackButton(text="📋 Обязательства", payload="menu:report_obligations"))
         builder.row(CallbackButton(text="🕵️ Активность в табеле", payload="menu:report_activity"))
-    elif section == "onec":
-        builder.row(CallbackButton(text="📊 Статус выгрузки", payload="onec:status"))
-        builder.row(CallbackButton(text="🧩 Пример JSON", payload="onec:example"))
-        builder.row(CallbackButton(text="♻️ Сбросить журнал выгрузки", payload="onec:reset:ask"))
     builder.row(CallbackButton(text="⬅️ Назад", payload="menu:main"))
     return builder
 
@@ -276,7 +269,6 @@ _SECTION_TITLES = {
     "attention": "⚠️ Требует внимания",
     "workorders": "📄 Наряды-допуски",
     "reports": "📊 Отчёты (в разработке)",
-    "onec": "🔄 Интеграция 1С",
 }
 
 
@@ -506,13 +498,18 @@ async def _deliver_consent_confirmation(responder: "_Responder", employee_id: st
         full_name = employee.full_name
 
     builder = InlineKeyboardBuilder()
+    builder.row(CallbackButton(text="📄 Бланк согласия (ТСМ)", payload=f"consentblank:tsm:{employee_id}"))
+    builder.row(CallbackButton(text="📄 Бланк согласия (ИП Буц)", payload=f"consentblank:ip:{employee_id}"))
     builder.row(CallbackButton(text="✅ Подтвердить (кнопкой, тест)", payload=f"consentconfirm:{employee_id}"))
     builder.row(CallbackButton(text="❌ Отмена", payload="cancel:consentpick"))
 
     await responder.send(
-        text=f"Подтвердить согласие для {full_name} кнопкой? Это тестовый способ — "
-        "юридически слабее, чем сканированная подпись (ст.9 152-ФЗ требует осознанного "
-        "согласия, клик без верификации личности это не подтверждает).",
+        text=f"Согласие для {full_name}.\n"
+        "Бланк под подпись — скачайте нужного оператора (по умолчанию ТСМ), "
+        "распечатайте, работник подписывает, скан прикрепляете.\n\n"
+        "Кнопка «Подтвердить» — тестовый способ, юридически слабее сканированной "
+        "подписи (ст. 9 152-ФЗ требует осознанного согласия, клик без верификации "
+        "личности это не подтверждает).",
         attachments=[builder.as_markup()],
     )
 
@@ -1038,6 +1035,47 @@ async def _send_instruction_journal_pdf(responder: "_Responder", type_value: str
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+async def _send_consent_pdf(responder: "_Responder", employee_id: str, operator: str) -> None:
+    """Бланк согласия на обработку ПДн (152-ФЗ) под подпись. operator: 'tsm' | 'ip'."""
+    op_label = {"tsm": "ТСМ", "ip": "ИП Буц"}.get(operator, operator)
+    tmp_dir = tempfile.mkdtemp(prefix="consent_")
+    try:
+        with Session(engine) as session:
+            employee = session.get(Employee, employee_id)
+            if employee is None:
+                await responder.send("Сотрудник не найден.")
+                return
+            full_name = employee.full_name
+            try:
+                docx_path = generate_consent_docx(employee, operator=operator, output_dir=tmp_dir)
+            except Exception:
+                log.exception("Не удалось сгенерировать согласие %s (%s)", employee_id, operator)
+                await responder.send("Не удалось сформировать бланк согласия. Попробуйте позже.")
+                return
+
+        try:
+            pdf_path = await asyncio.to_thread(_docx_to_pdf, docx_path, tmp_dir)
+        except RuntimeError as e:
+            await responder.send(f"Не удалось получить PDF: {e}")
+            return
+
+        safe_name = "".join(c if c not in '/\\:*?"<>|' else "-" for c in (full_name or "работник"))
+        nice_name = f"Согласие_ПДн_{op_label}_{safe_name}.pdf"
+        nice_path = os.path.join(tmp_dir, nice_name)
+        try:
+            if nice_path != pdf_path:
+                os.replace(pdf_path, nice_path)
+            await responder.send(
+                text=f"Согласие на обработку ПДн — {op_label}: {full_name}",
+                attachments=[InputMedia(path=nice_path)],
+            )
+        except Exception:
+            log.exception("Не удалось отправить согласие %s", employee_id)
+            await responder.send("Ошибка отправки файла. Попробуйте ещё раз.")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 @dp.message_callback()
 async def on_callback(event: MessageCallback):
     """Единая точка входа для всех кнопок: главное меню (payload='menu:...') и выбор
@@ -1121,88 +1159,6 @@ async def on_callback(event: MessageCallback):
             await _deliver_instr_journals_menu(responder)
             return
         await responder.show_menu(title, [_build_section_menu(section, role).as_markup()])
-        return
-
-    if payload == "menu:section:onec":
-        with Session(engine) as session:
-            role = _role_for_max_id(session, responder.user_id())
-        if role not in ("kadrovik", "admin"):
-            await responder.send("Интеграция 1С доступна только кадровику/админу.")
-            return
-        await responder.show_menu(
-            _SECTION_TITLES.get("onec", "Раздел"),
-            [_build_section_menu("onec", role).as_markup()],
-        )
-        return
-
-    if payload == "onec:status":
-        with Session(engine) as session:
-            role = _role_for_max_id(session, responder.user_id())
-            if role not in ("kadrovik", "admin"):
-                await responder.send("Интеграция 1С доступна только кадровику/админу.")
-                return
-            stats = api_1c.get_export_stats(session)
-        token_ok = "задан" if api_1c.token_configured() else "НЕ задан"
-        last = stats["last_export_at"]
-        last_str = last.strftime("%d.%m.%Y %H:%M") if last else "ещё не было"
-        await responder.send(
-            "🔄 Статус интеграции 1С\n"
-            f"Токен доступа: {token_ok}\n"
-            f"Всего сотрудников: {stats['total']}\n"
-            f"Уже выгружено в 1С: {stats['exported']}\n"
-            f"Ожидает выгрузки (новые/изменённые): {stats['pending']}\n"
-            f"Последняя выгрузка: {last_str}\n\n"
-            "Эндпоинт: GET /api/1c/employees (Bearer-токен). "
-            "1С забирает данные сама по расписанию."
-        )
-        return
-
-    if payload == "onec:example":
-        with Session(engine) as session:
-            role = _role_for_max_id(session, responder.user_id())
-        if role not in ("kadrovik", "admin"):
-            await responder.send("Интеграция 1С доступна только кадровику/админу.")
-            return
-        import json as _json
-        example = _json.dumps(api_1c.EXAMPLE_EMPLOYEE_JSON, ensure_ascii=False, indent=2)
-        await responder.send(
-            "🧩 Пример одной записи ответа GET /api/1c/employees "
-            "(значения обезличены):\n\n" + example
-        )
-        return
-
-    if payload == "onec:reset:ask":
-        with Session(engine) as session:
-            role = _role_for_max_id(session, responder.user_id())
-        if role not in ("kadrovik", "admin"):
-            await responder.send("Интеграция 1С доступна только кадровику/админу.")
-            return
-        builder = InlineKeyboardBuilder()
-        builder.row(CallbackButton(text="✅ Подтвердить сброс", payload="onec:reset:do"))
-        builder.row(CallbackButton(text="❌ Отмена", payload="cancel:onec"))
-        await responder.send(
-            text="Сбросить журнал выгрузки? Рабочие данные сотрудников не удаляются — "
-            "очищаются только служебные хеши, и при следующем запросе 1С заберёт всех "
-            "заново (полная пересинхронизация).",
-            attachments=[builder.as_markup()],
-        )
-        return
-
-    if payload == "onec:reset:do":
-        with Session(engine) as session:
-            role = _role_for_max_id(session, responder.user_id())
-            if role not in ("kadrovik", "admin"):
-                await responder.send("Интеграция 1С доступна только кадровику/админу.")
-                return
-            removed = api_1c.reset_export_log(session)
-        try:
-            await event.message.delete()
-        except Exception:
-            pass
-        await responder.send(
-            f"♻️ Журнал выгрузки очищен (удалено записей: {removed}). "
-            "При следующем запросе 1С получит всех сотрудников заново."
-        )
         return
 
     if payload == "menu:add_employee":
@@ -1902,6 +1858,12 @@ async def on_callback(event: MessageCallback):
     if payload.startswith("consentpick:"):
         employee_id = payload.split(":", 1)[1]
         await _deliver_consent_confirmation(responder, employee_id)
+        return
+
+    if payload.startswith("consentblank:"):
+        # бланк согласия: consentblank:<operator>:<employee_id>
+        _, operator, employee_id = payload.split(":", 2)
+        await _send_consent_pdf(responder, employee_id, operator)
         return
 
     if payload.startswith("consentconfirm:"):
