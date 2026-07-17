@@ -34,6 +34,7 @@ from models import (
     InternalOrder,
     OrderCategory,
     Titul,
+Weather,
     WorkOrder,
     WorkOrderDailyAdmission,
     WorkOrderMember,
