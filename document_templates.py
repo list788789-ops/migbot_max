@@ -171,8 +171,10 @@ def _add_test_warning_paragraph(doc: Document, missing: list[str]) -> None:
     doc.add_paragraph()
 
 
-def generate_consent_docx(employee: Employee, output_dir: str = "/tmp") -> str:
-    """Согласие на обработку персональных данных — отдельный документ (152-ФЗ)."""
+def generate_consent_docx(employee: Employee, operator: str = "tsm", output_dir: str = "/tmp") -> str:
+    """Согласие на обработку персональных данных — отдельный документ (152-ФЗ).
+    operator: 'tsm' (ООО «ТРЕСТСТРОЙМОНТАЖ», по умолчанию) или 'ip' (ИП Буц С.Ю.).
+    Реквизиты оператора — из PD_OPERATORS."""
     missing = _require_fields(employee, CONSENT_REQUIRED_FIELDS)
 
     doc = Document()
@@ -192,12 +194,13 @@ def generate_consent_docx(employee: Employee, output_dir: str = "/tmp") -> str:
     birth = _date_or_dash(employee.birth_date)
     address = _text_or_dash(employee.address)
 
+    op = PD_OPERATORS.get(operator, PD_OPERATORS[DEFAULT_PD_OPERATOR])
     body = (
         f"Я, {employee.full_name}, {birth} года рождения, "
         f"паспорт {_passport_str(employee)}, зарегистрированный(-ая) по адресу: {address}, "
         f"в соответствии со ст. 9 Федерального закона от 27.07.2006 № 152-ФЗ "
-        f"«О персональных данных» даю согласие {COMPANY_NAME} (ИНН {COMPANY_INN}, "
-        f"адрес: {COMPANY_ADDRESS}) (далее — Оператор) на обработку моих "
+        f"«О персональных данных» даю согласие {op['name']} (ИНН {op['inn']}, "
+        f"адрес: {op['address']}) (далее — Оператор) на обработку моих "
         f"персональных данных в целях исполнения трудового договора, ведения "
         f"миграционного учёта и исполнения обязанностей работодателя, "
         f"предусмотренных законодательством Российской Федерации о правовом "
@@ -227,7 +230,7 @@ def generate_consent_docx(employee: Employee, output_dir: str = "/tmp") -> str:
     doc.add_paragraph(f"Дата: {datetime.now(MSK).date().strftime('%d.%m.%Y')}")
     doc.add_paragraph(f"Подпись: _____________________ / {employee.full_name}")
 
-    filename = f"consent_{employee.id}.docx"
+    filename = f"consent_{operator}_{employee.id}.docx"
     path = os.path.join(output_dir, filename)
     doc.save(path)
     return path
@@ -276,6 +279,24 @@ EMPLOYER_LEGAL_ADDRESS = os.environ.get(
 EMPLOYER_ACTUAL_ADDRESS = os.environ.get("EMPLOYER_ACTUAL_ADDRESS", EMPLOYER_LEGAL_ADDRESS)
 EMPLOYER_PHONE = os.environ.get("EMPLOYER_PHONE", "+7 (495) 147-82-79")
 EMPLOYER_DIRECTOR_FULL = os.environ.get("EMPLOYER_DIRECTOR_FULL", "Железняка Валерия Александровича")
+
+# Реестр операторов ПДн для согласия (152-ФЗ). Статичные реквизиты — правятся здесь под ревью git.
+# Реквизиты ИП Буц взяты из договора СМР № ПСМ-ИПБ-16-00106 (раздел «Реквизиты Сторон»).
+# ОГРН/ОГРНИП в согласии не печатаются по решению — только наименование, ИНН, адрес.
+PD_OPERATORS = {
+    "tsm": {
+        "name": EMPLOYER_NAME_FULL,
+        "inn": EMPLOYER_INN,
+        "address": EMPLOYER_LEGAL_ADDRESS,
+    },
+    "ip": {
+        "name": "Индивидуальный предприниматель Буц Сергей Юрьевич",
+        "inn": "312608174376",
+        "address": "141370, Московская обл., Сергиево-Посадский р-н, "
+                   "г. Хотьково, ул. Менделеева, д. 17, кв. 62",
+    },
+}
+DEFAULT_PD_OPERATOR = "tsm"
 EMPLOYER_DIRECTOR_SHORT = os.environ.get("EMPLOYER_DIRECTOR_SHORT", "Железняк В. А.")
 # ОКВЭД и ОГРН работодателя — обязательные поля формы уведомления МВД №8 (приказ №536),
 # но в системе их не было. Оставлены пустыми (env-override): по решению — заполняются вручную
