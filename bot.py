@@ -2642,8 +2642,15 @@ async def main():
     # Запускается здесь, в бот-процессе — единственном always-on (нет дублей).
     from scheduler import start_scheduler
     start_scheduler(engine, morning_job=morning_job)
-    await dp.start_polling(bot)
-
+    while True:
+      try:
+        await dp.start_polling(bot)
+        log.warning("start_polling exited without error; restarting in 5s")
+      except asyncio.CancelledError:
+        raise
+      except Exception:
+        log.exception("main: polling crashed; restarting in 5s")
+      await asyncio.sleep(5)
 
 if __name__ == "__main__":
     asyncio.run(main())
