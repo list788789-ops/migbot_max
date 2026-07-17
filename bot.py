@@ -1858,8 +1858,15 @@ async def on_callback(event: MessageCallback):
 
     if payload.startswith("exitpicker:"):
         prefix = payload.split(":", 1)[1]
-        await event.message.delete()
         _open_pickers.pop((responder.user_id(), prefix), None)
+        # Раньше здесь было event.message.delete(): сообщение со списком удалялось, и
+        # пользователь оставался в пустоте (тупик — приходилось снова слать /start).
+        # Теперь редактируем это же сообщение в главное меню (как ветка payload=="menu:main"):
+        # список согласий заменяется главным меню на месте. Нет пустого экрана и нет
+        # висящих живых кнопок для остальных участников общего чата.
+        with Session(engine) as session:
+            role = _role_for_max_id(session, responder.user_id())
+        await responder.show_menu("Главное меню:", [_build_main_menu(role).as_markup()])
         return
 
     if payload == "menu:pending_consent":
