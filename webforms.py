@@ -187,6 +187,7 @@ from s3_storage import (
     S3_ENDPOINT, S3_BUCKET, S3_REGION, S3_ACCESS_KEY, S3_SECRET_KEY,
     SCAN_TYPES, PAYMENT_SCAN_TYPES, COMMON_DOC_TYPES, SCAN_COMMON_TYPES,
     _s3_client, _scan_key, _s3_upload, _s3_list_for_employee, _s3_download,
+    _s3_upload_entity, _s3_download_entity, _s3_entity_present,
     _s3_delete, _common_key, _s3_upload_common, _s3_list_common,
     _s3_download_common, _s3_delete_common, _s3_clear_check,
 )
@@ -2521,6 +2522,13 @@ def work_order_view(work_order_id: str, request: Request, db: Session = Depends(
 <section class="card"><h2>Состав бригады ({len(members)})</h2><ul>{_members_html}</ul></section>
 <section class="card"><h2>Дни допуска ({len(admissions)})</h2>{_adm_html}</section>
 <section class="card"><h2>Изменения состава (п.7, 782н)</h2><ul>{_changes_html}</ul></section>
+<section class="card"><h2>Скан подписанного наряда</h2>
+{('<p><a class="btn secondary" href="/production/work-orders/' + o.id + '/scan/download">Скачать скан</a></p>') if _s3_entity_present("workorder", o.id) else '<p class="muted">Скан не загружен.</p>'}
+<form method="post" action="/production/work-orders/{o.id}/scan/upload" enctype="multipart/form-data" style="margin-top:8px">
+<input type="file" name="scan_file" accept="application/pdf,image/*" style="display:block;width:100%;margin:8px 0;padding:10px;border:1px solid #d9dde3;border-radius:8px;background:#fff;font-size:16px">
+<button class="btn" type="submit">Загрузить скан</button>
+</form>
+</section>
 """
     return _render(f"Наряд №{o.number}", body, active="production", role=request.session.get("role", ""))
 
@@ -2546,6 +2554,80 @@ def work_order_print(work_order_id: str, request: Request, db: Session = Depends
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": _content_disposition(fn)},
     )
+
+
+@app.post("/production/work-orders/{work_order_id}/scan/upload")
+async def work_order_scan_upload(work_order_id: str, request: Request,
+                                  scan_file: UploadFile = File(None),
+                                  db: Session = Depends(get_db)):
+    """Загрузка скана подписанного наряда. Доступ — залогиненный пользователь."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    order = db.get(WorkOrder, work_order_id)
+    if order is None:
+        raise HTTPException(404, "Наряд не найден.")
+    if scan_file is not None and scan_file.filename:
+        content = await scan_file.read()
+        content_type = scan_file.content_type or "application/octet-stream"
+        try:
+            _s3_upload_entity("workorder", work_order_id, content, content_type)
+        except RuntimeError as e:
+            log.warning("work_order_scan_upload: загрузка не удалась: %s", e)
+    return RedirectResponse(f"/production/work-orders/{work_order_id}", status_code=303)
+
+
+@app.get("/production/work-orders/{work_order_id}/scan/download")
+def work_order_scan_download(work_order_id: str, request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    order = db.get(WorkOrder, work_order_id)
+    if order is None:
+        raise HTTPException(404, "Наряд не найден.")
+    try:
+        data, ct = _s3_download_entity("workorder", work_order_id)
+    except RuntimeError:
+        raise HTTPException(404, "Скан не загружен.")
+    _safe = "".join(c if c not in '/\\:*?"<>|' else "-" for c in (order.number or "no"))
+    fn = f"Наряд_скан_№{_safe}.{_ext_for(ct)}"
+    return Response(content=data, media_type=ct,
+                    headers={"Content-Disposition": _content_disposition(fn)})
+
+
+_INSTR_SCAN_TYPES = {"introductory", "primary_workplace"}
+
+
+@app.post("/production/instructions/{itype}/scan/upload")
+async def instruction_scan_upload(itype: str, request: Request,
+                                   scan_file: UploadFile = File(None),
+                                   db: Session = Depends(get_db)):
+    """Загрузка скана подписанного журнала инструктажа (по типу журнала)."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    if itype not in _INSTR_SCAN_TYPES:
+        raise HTTPException(400, "Неизвестный тип журнала.")
+    if scan_file is not None and scan_file.filename:
+        content = await scan_file.read()
+        content_type = scan_file.content_type or "application/octet-stream"
+        try:
+            _s3_upload_entity("instruction", itype, content, content_type)
+        except RuntimeError as e:
+            log.warning("instruction_scan_upload: загрузка не удалась: %s", e)
+    return RedirectResponse("/production/instructions", status_code=303)
+
+
+@app.get("/production/instructions/{itype}/scan/download")
+def instruction_scan_download(itype: str, request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    if itype not in _INSTR_SCAN_TYPES:
+        raise HTTPException(400, "Неизвестный тип журнала.")
+    try:
+        data, ct = _s3_download_entity("instruction", itype)
+    except RuntimeError:
+        raise HTTPException(404, "Скан не загружен.")
+    fn = f"Журнал_инструктажа_{itype}_скан.{_ext_for(ct)}"
+    return Response(content=data, media_type=ct,
+                    headers={"Content-Disposition": _content_disposition(fn)})
 
 
 @app.get("/employees/{employee_id}/consent-blank")
@@ -2602,12 +2684,21 @@ def instructions_page(request: Request, db: Session = Depends(get_db)):
     journal_rows = ""
     for t, label in prod.INSTRUCTION_LABELS.items():
         unprinted = len(prod.get_unprinted_instructions(db, t))
+        _scan_dl = (f'<a class="btn secondary" href="/production/instructions/{t.value}/scan/download">Скачать скан</a>'
+                    if _s3_entity_present("instruction", t.value) else '<span class="muted">скан не загружен</span>')
         journal_rows += (
             f'<div class="card">{label}<br>'
             f'<span class="badge {"orange" if unprinted else "neutral"}">Ждут печати: {unprinted}</span><br>'
             f'<form method="post" action="/production/instructions/print" style="display:inline">'
             f'<input type="hidden" name="instruction_type" value="{t.value}">'
-            f'<button type="submit" class="btn secondary">Допечатать новые записи</button></form></div>'
+            f'<button type="submit" class="btn secondary">Допечатать новые записи</button></form><br>'
+            f'{_scan_dl}'
+            f'<form method="post" action="/production/instructions/{t.value}/scan/upload" '
+            f'enctype="multipart/form-data" style="margin-top:6px">'
+            f'<input type="file" name="scan_file" accept="application/pdf,image/*" '
+            f'style="display:block;width:100%;margin:6px 0;padding:8px;border:1px solid #d9dde3;'
+            f'border-radius:8px;background:#fff;font-size:16px">'
+            f'<button type="submit" class="btn">Загрузить скан журнала</button></form></div>'
         )
 
     body = f"""
