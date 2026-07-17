@@ -504,12 +504,18 @@ async def _deliver_consent_confirmation(responder: "_Responder", employee_id: st
     builder.row(CallbackButton(text="❌ Отмена", payload="cancel:consentpick"))
 
     await responder.send(
-        text=f"Согласие для {full_name}.\n"
-        "Бланк под подпись — скачайте нужного оператора (по умолчанию ТСМ), "
-        "распечатайте, работник подписывает, скан прикрепляете.\n\n"
-        "Кнопка «Подтвердить» — тестовый способ, юридически слабее сканированной "
-        "подписи (ст. 9 152-ФЗ требует осознанного согласия, клик без верификации "
-        "личности это не подтверждает).",
+        text=f"Согласие для {full_name}.\n\n"
+        "Как распечатать бланк:\n"
+        "1) нажмите «Бланк согласия (ТСМ)» — или «(ИП Буц)», если оператор ИП;\n"
+        "2) бот пришлёт PDF — распечатайте его;\n"
+        "3) работник подписывает бумажный бланк;\n"
+        "4) отсканируйте/сфотографируйте подпись и прикрепите скан "
+        "(«✅ Подтвердить» → пришлите файл).\n\n"
+        "Бланк печатается даже если в карточке заполнены не все поля — тогда в "
+        "документе будет пометка «черновик», а пустые места заполните от руки.\n\n"
+        "Кнопка «Подтвердить (кнопкой)» — тестовый способ, юридически слабее "
+        "сканированной подписи (ст. 9 152-ФЗ требует осознанного согласия, клик "
+        "без верификации личности это не подтверждает).",
         attachments=[builder.as_markup()],
     )
 
@@ -1047,7 +1053,12 @@ async def _send_consent_pdf(responder: "_Responder", employee_id: str, operator:
                 return
             full_name = employee.full_name
             try:
-                docx_path = generate_consent_docx(employee, operator=operator, output_dir=tmp_dir)
+                # require_fields=False: печать бланка под подпись возможна даже при
+                # незаполненных полях (прочерки + баннер «черновик») — блокировки по
+                # полноте карточки для согласия здесь нет (см. document_templates.py).
+                docx_path = generate_consent_docx(
+                    employee, operator=operator, output_dir=tmp_dir, require_fields=False
+                )
             except Exception:
                 log.exception("Не удалось сгенерировать согласие %s (%s)", employee_id, operator)
                 await responder.send("Не удалось сформировать бланк согласия. Попробуйте позже.")
@@ -2305,9 +2316,14 @@ async def on_text(event: MessageCreated):
             return
 
         if raw_text.startswith("/send_consent_doc"):
+            # Бланк согласия печатается для любого сотрудника независимо от полноты
+            # карточки: check_func не передаём (нет предварительной блокировки), а
+            # генератору передаём require_fields=False (не бросает ValueError, ставит
+            # прочерки и баннер «черновик»). Затрагивает только согласие.
             await _handle_send_document(
-                event, raw_text, generate_consent_docx, "согласие на обработку ПД",
-                check_func=check_consent_fields,
+                event, raw_text,
+                lambda emp: generate_consent_docx(emp, require_fields=False),
+                "согласие на обработку ПД",
             )
             return
 
