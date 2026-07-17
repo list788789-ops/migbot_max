@@ -1,7 +1,7 @@
 """
 Генерация docx-документов для отправки сотруднику через бота:
-  - Согласие на обработку персональных данных (152-ФЗ)
-  - Направление на медицинский осмотр (медкомиссию, ст.13.3 115-ФЗ)
+- Согласие на обработку персональных данных (152-ФЗ)
+- Направление на медицинский осмотр (медкомиссию, ст.13.3 115-ФЗ)
 
 ВАЖНО: для согласия по 152-ФЗ обязательна идентификация оператора (работодателя) —
 без неё документ не соответствует требованию "конкретности" (ч.1 ст.9 152-ФЗ).
@@ -33,23 +33,33 @@
 (или переменная удалена) до реальной работы с сотрудниками. Один флаг на оба генератора,
 чтобы не потерять место, где включали, при отключении.
 
+2026-07: у generate_consent_docx добавлен параметр require_fields (по умолчанию True).
+require_fields=False — штатный режим ПЕЧАТИ бланка согласия под подпись: бланк можно
+распечатать даже при незаполненных полях (кадровик печатает пустографку и заполняет от
+руки/сотрудник подписывает). В этом режиме генератор НЕ поднимает ValueError, а
+подставляет прочерки и добавляет баннер "черновик". Это НЕ трогает остальные документы
+(медосмотр, трудовой договор и т.д.) — только согласие и только по явному запросу
+вызывающего кода (см. bot._send_consent_pdf / _handle_send_document для /send_consent_doc).
+Веб-формы и прочие вызовы generate_consent_docx без параметра работают как раньше (строгий
+режим), потому что по умолчанию require_fields=True.
+
 Требуемые переменные окружения:
-  COMPANY_NAME             — полное наименование юрлица-работодателя
-  COMPANY_INN              — ИНН
-  COMPANY_LEGAL_ADDRESS    — юридический адрес
-  HR_SIGNATORY_NAME        — ФИО подписанта со стороны работодателя
-  HR_SIGNATORY_POSITION    — должность подписанта
-  CLINIC_NAME              — ПОЛНОЕ наименование медицинской организации (шапка бланка)
-  CLINIC_SHORT_NAME        — короткое имя МО для блока подписи (напр. ГОАУЗ «МОМЦ»)
-  CLINIC_CONTRACT_NUMBER   — номер договора с клиникой
-  CLINIC_CONTRACT_DATE     — дата договора с клиникой, формат ДД.ММ.ГГГГ
-  CLINIC_CHIEF_DOCTOR_NAME — ФИО главного врача клиники (для блока подписи "От Исполнителя")
-  PAYER_NAME               — заказчик услуги (напр. "ИП Буц С.Ю.") — используется в п.5/8 бланка
-  PAYER_SIGNATORY_NAME     — ФИО подписанта со стороны заказчика для блока подписи
-                             (напр. "С. Ю. Буц") — если не задано, используется PAYER_NAME
-  PAYER_PHONE              — телефон заказчика
-  TEST_ALLOW_MISSING_FIELDS — "true"/"1" чтобы разрешить генерацию с прочерками вместо
-                             незаполненных полей (ТОЛЬКО для теста, см. выше)
+COMPANY_NAME — полное наименование юрлица-работодателя
+COMPANY_INN — ИНН
+COMPANY_LEGAL_ADDRESS — юридический адрес
+HR_SIGNATORY_NAME — ФИО подписанта со стороны работодателя
+HR_SIGNATORY_POSITION — должность подписанта
+CLINIC_NAME — ПОЛНОЕ наименование медицинской организации (шапка бланка)
+CLINIC_SHORT_NAME — короткое имя МО для блока подписи (напр. ГОАУЗ «МОМЦ»)
+CLINIC_CONTRACT_NUMBER — номер договора с клиникой
+CLINIC_CONTRACT_DATE — дата договора с клиникой, формат ДД.ММ.ГГГГ
+CLINIC_CHIEF_DOCTOR_NAME — ФИО главного врача клиники (для блока подписи "От Исполнителя")
+PAYER_NAME — заказчик услуги (напр. "ИП Буц С.Ю.") — используется в п.5/8 бланка
+PAYER_SIGNATORY_NAME — ФИО подписанта со стороны заказчика для блока подписи
+(напр. "С. Ю. Буц") — если не задано, используется PAYER_NAME
+PAYER_PHONE — телефон заказчика
+TEST_ALLOW_MISSING_FIELDS — "true"/"1" чтобы разрешить генерацию с прочерками вместо
+незаполненных полей (ТОЛЬКО для теста, см. выше)
 """
 
 import os
@@ -157,25 +167,43 @@ def _require_fields(employee: Employee, field_labels: dict[str, str]) -> list[st
 
 
 def _add_test_warning_paragraph(doc: Document, missing: list[str]) -> None:
-    """Явное предупреждение прямо в теле документа, если он сгенерирован в тестовом
-    режиме с прочерками. Цель — чтобы черновик нельзя было перепутать с юридически
-    валидным документом, если он случайно уйдёт клинике или сотруднику на подпись."""
+    """Явное предупреждение прямо в теле документа, если он сгенерирован с прочерками
+    (тестовый режим TEST_ALLOW_MISSING_FIELDS или согласие в режиме require_fields=False).
+    Цель — чтобы черновик нельзя было перепутать с юридически валидным документом, если
+    он случайно уйдёт клинике или сотруднику на подпись."""
     warning = doc.add_paragraph()
     run = warning.add_run(
-        "⚠ ТЕСТОВЫЙ ЧЕРНОВИК — не заполнены поля: "
+        "⚠ ЧЕРНОВИК — не заполнены поля: "
         + ", ".join(missing)
         + ". Документ не имеет юридической силы, пока эти поля не указаны в карточке "
-        "сотрудника и документ не перегенерирован."
+        "сотрудника (или вписаны от руки) и документ не перегенерирован."
     )
     run.bold = True
     doc.add_paragraph()
 
 
-def generate_consent_docx(employee: Employee, operator: str = "tsm", output_dir: str = "/tmp") -> str:
+def generate_consent_docx(
+    employee: Employee,
+    operator: str = "tsm",
+    output_dir: str = "/tmp",
+    require_fields: bool = True,
+) -> str:
     """Согласие на обработку персональных данных — отдельный документ (152-ФЗ).
     operator: 'tsm' (ООО «ТРЕСТСТРОЙМОНТАЖ», по умолчанию) или 'ip' (ИП Буц С.Ю.).
-    Реквизиты оператора — из PD_OPERATORS."""
-    missing = _require_fields(employee, CONSENT_REQUIRED_FIELDS)
+    Реквизиты оператора — из PD_OPERATORS.
+
+    require_fields (по умолчанию True): строгий режим — при незаполненных обязательных
+    полях поднимается ValueError (через _require_fields), как раньше. Веб-формы и прочие
+    вызовы без этого параметра работают как прежде.
+
+    require_fields=False: режим ПЕЧАТИ бланка под подпись — бланк формируется даже при
+    незаполненных полях (прочерки + баннер "черновик"), ValueError не поднимается. Нужен,
+    чтобы кадровик мог распечатать согласие для любого сотрудника независимо от полноты
+    карточки (см. bot._send_consent_pdf и /send_consent_doc). Затрагивает ТОЛЬКО согласие."""
+    if require_fields:
+        missing = _require_fields(employee, CONSENT_REQUIRED_FIELDS)
+    else:
+        missing = check_consent_fields(employee)
 
     doc = Document()
     _set_default_style(doc)
@@ -235,7 +263,6 @@ def generate_consent_docx(employee: Employee, operator: str = "tsm", output_dir:
     doc.save(path)
     return path
 
-
 # Реквизиты клиники и заказчика. Значения по умолчанию зашиты как fallback (по образцу
 # направления «Пирогова», договор №176), но переменная окружения их переопределяет —
 # при смене договора/главврача/телефона правь env в Railway, а не этот файл.
@@ -293,7 +320,7 @@ PD_OPERATORS = {
         "name": "Индивидуальный предприниматель Буц Сергей Юрьевич",
         "inn": "312608174376",
         "address": "141370, Московская обл., Сергиево-Посадский р-н, "
-                   "г. Хотьково, ул. Менделеева, д. 17, кв. 62",
+        "г. Хотьково, ул. Менделеева, д. 17, кв. 62",
     },
 }
 DEFAULT_PD_OPERATOR = "tsm"
@@ -310,7 +337,6 @@ WORKPLACE_ADDRESS = os.environ.get(
 )
 DISTRICT_COEFFICIENT = os.environ.get("DISTRICT_COEFFICIENT", "1,500")
 CONTRACT_NUMBER_PREFIX = os.environ.get("CONTRACT_NUMBER_PREFIX", "БК-ПСМ-")
-
 
 # --- Реквизиты госпошлины (квитанция ПД-4сб, налог). УФК по Мурманской области (УМВД).
 # Фиксированные, из платёжных реквизитов УМВД (фото от пользователя, приняты как факт).
@@ -620,7 +646,7 @@ def _fix_table_width(table, widths_mm):
             el = OxmlElement(f"w:{edge}")
             borders.append(el)
         el.set(qn("w:val"), "single")
-        el.set(qn("w:sz"), "4")       # 0.5pt
+        el.set(qn("w:sz"), "4")  # 0.5pt
         el.set(qn("w:space"), "0")
         el.set(qn("w:color"), "000000")
 
@@ -1005,7 +1031,7 @@ def generate_medical_referral_docx(employee: Employee, output_dir: str = "/tmp")
     doc.add_paragraph(f"3. Адрес (по месту проживания) {SITE_ADDRESS}")
 
     doc.add_paragraph(
-        f"4. Серия паспорта {_text_or_dash(employee.passport_series)} "
+        f"4. Серия паспорта {_text_or_dash(employee.passport_series)}  "
         f"Номер паспорта {_text_or_dash(employee.passport_number)}"
     )
 
@@ -1095,4 +1121,3 @@ def generate_employees_xlsx(employees: list[Employee], output_dir: str = "/tmp")
     path = os.path.join(output_dir, "employees.xlsx")
     wb.save(path)
     return path
-
