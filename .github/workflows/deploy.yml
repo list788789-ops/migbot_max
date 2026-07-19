@@ -3,13 +3,15 @@ on:
   push:
     branches: [main]
 jobs:
-  deploy:
+  check-syntax:
     runs-on: ubuntu-latest
     steps:
-      - name: Deploy over SSH
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
-          ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "cd /root/migbot_max && git pull origin main && systemctl restart migbot migbot-bot"
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Check Python syntax
+        run: python -m py_compile webforms.py bot.py models.py api_1c.py
+      - name: Ready for deployment
+        run: echo "✓ Code syntax check passed. Deploy manually on server."
