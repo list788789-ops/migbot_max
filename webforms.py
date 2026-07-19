@@ -530,7 +530,7 @@ def _nav(active: str = "", role: str = "") -> str:
 
     def _grp(group):
         return "".join(
-            f'<a href="{href}"{" class=\"active\"" if key and key == active else ""}>'
+            f'<a href="{href}"{" class=active" if key and key == active else ""}>'
             f'<span class="ic">{icon}</span>{label}</a>'
             for key, href, label, icon in group
         )
