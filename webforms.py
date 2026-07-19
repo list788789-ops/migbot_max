@@ -1855,8 +1855,8 @@ def work_log_page(request: Request, db: Session = Depends(get_db)):
         rows += (
             f'<div class="card"><b>{e.entry_date:%d.%m.%Y}</b> · {place}<br>'
             f'<span>{html.escape(e.work_done)}</span><br>'
-            f'{f"<span class=\"muted\">Погода: {html.escape(e.weather)}</span><br>" if e.weather else ""}'
-            f'{f"<span class=\"muted\">{html.escape(e.note)}</span><br>" if e.note else ""}'
+            f'{f"<span class=muted>Погода: {html.escape(e.weather)}</span><br>" if e.weather else ""}'
+            f'{f"<span class=muted>{html.escape(e.note)}</span><br>" if e.note else ""}'
             f'{sign_badge} {btns}</div>'
         )
 
@@ -2314,7 +2314,7 @@ def work_orders_page(request: Request, db: Session = Depends(get_db)):
         f'📁 Архив — прошедшие наряды ({len(past_orders)})</summary>'
         f'<p class="muted" style="margin-top:8px">Наряды с истёкшим сроком действия '
         f'(в том числе восстановленный прошлый период). Доступны для просмотра и печати.</p>'
-        f'{past_rows or "<p class=\"muted\">Архив пуст.</p>"}</details></section>'
+        f'{past_rows or "<p class=muted>Архив пуст.</p>"}</details></section>'
     ) if past_orders else ""
     # Корзина — мягко удалённые наряды. Восстановление доступно всем; окончательное
     # стирание — только админу (кнопка видна лишь ему).
