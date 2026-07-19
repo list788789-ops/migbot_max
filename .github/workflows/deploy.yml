@@ -13,5 +13,18 @@ jobs:
           python-version: '3.11'
       - name: Check Python syntax
         run: python -m py_compile webforms.py bot.py models.py api_1c.py
-      - name: Ready for deployment
-        run: echo "✓ Code syntax check passed. Deploy manually on server."
+
+  deploy:
+    needs: check-syntax
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy over SSH
+        env:
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "cd /root/migbot_max && git pull origin main && systemctl restart migbot migbot-bot"
