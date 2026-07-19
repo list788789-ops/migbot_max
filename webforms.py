@@ -172,7 +172,12 @@ app = FastAPI()
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, session_cookie="migbot_session")
 
 # --- Интеграция с 1С: роут GET /api/1c/employees (см. api_1c.py) ---
-from api_1c import register_1c_routes
+from api_1c import (
+    register_1c_routes,
+    get_export_stats as _onec_get_export_stats,
+    reset_export_log as _onec_reset_export_log,
+    token_configured as _onec_token_configured,
+)
 register_1c_routes(app)
 
 
@@ -518,6 +523,7 @@ def _nav(active: str = "", role: str = "") -> str:
     ]
     if role in ("admin", "kadrovik"):
         work.append(("common", "/common-docs", "Общие документы", "📁"))
+        work.append(("onec", "/onec", "Обмен с 1С", "🔄"))
     service = []
     if role == "admin":
         service.append(("admin", "/admin/users", "Пользователи", "⚙️"))
@@ -1361,6 +1367,151 @@ def tabel_mark(
 # урезанный текстовый рендер в bot.py.
 
 import reports as reports_data
+
+
+# ===================== ОБМЕН С 1С (веб-раздел) =====================
+# Весь UI обмена с 1С живёт здесь, в вебе. Раздел виден только кадровику/админу.
+# Настройки хранятся в таблице SystemFlag (key/value):
+#   onec_export_employees = "on"/"off"  — выгружать ли сотрудников (по умолчанию "on");
+#   onec_dry_run          = "on"/"off"  — безопасный режим (по умолчанию "on").
+# Этот раздел НЕ пишет в рабочую базу 1С: он показывает статус выгрузки,
+# хранит настройки и умеет сбросить служебный журнал хешей (onec_export_log).
+
+
+def _onec_flag(db: Session, key: str, default: str) -> str:
+    row = db.get(SystemFlag, key)
+    if row is None or row.value is None:
+        return default
+    return row.value
+
+
+def _onec_set_flag(db: Session, key: str, value: str) -> None:
+    row = db.get(SystemFlag, key)
+    if row is None:
+        db.add(SystemFlag(key=key, value=value))
+    else:
+        row.value = value
+    db.commit()
+
+
+def _onec_require(request: Request, db: Session):
+    """Возвращает пользователя, если он кадровик/админ, иначе None."""
+    user = _current_user(request, db)
+    if user is None:
+        return None
+    if user.role not in (UserRole.KADROVIK, UserRole.ADMIN):
+        return None
+    return user
+
+
+@app.get("/onec", response_class=HTMLResponse)
+def onec_page(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    if _onec_require(request, db) is None:
+        raise HTTPException(403, "Раздел обмена с 1С доступен только кадровику и администратору")
+
+    token_ok = _onec_token_configured()
+    stats = _onec_get_export_stats(db)
+    export_employees = _onec_flag(db, "onec_export_employees", "on")
+    dry_run = _onec_flag(db, "onec_dry_run", "on")
+
+    last = stats.get("last_export_at")
+    last_txt = last.strftime("%d.%m.%Y %H:%M") if last else "—"
+
+    token_badge = (
+        '<span class="badge green">токен настроен</span>'
+        if token_ok else
+        '<span class="badge red">токен не задан</span>'
+    )
+    emp_badge = (
+        '<span class="badge green">включено</span>'
+        if export_employees == "on" else
+        '<span class="badge">выключено</span>'
+    )
+    mode_badge = (
+        '<span class="badge orange">тест (dry-run)</span>'
+        if dry_run == "on" else
+        '<span class="badge red">боевой (запись)</span>'
+    )
+
+    emp_toggle_to = "off" if export_employees == "on" else "on"
+    emp_toggle_label = "Выключить" if export_employees == "on" else "Включить"
+    mode_toggle_to = "off" if dry_run == "on" else "on"
+    mode_toggle_label = "Переключить в боевой" if dry_run == "on" else "Вернуть в тест"
+
+    body = f"""
+<h1>🔄 Обмен с 1С</h1>
+
+<section class="card">
+  <h3 style="margin:0 0 6px">Статус обмена</h3>
+  <p class="muted" style="margin:0 0 10px">Данные для 1С отдаёт сервис по защищённому токену. Ниже — что уйдёт в следующую выгрузку.</p>
+  <table style="border-collapse:collapse;width:100%;max-width:520px">
+    <tr><td style="padding:6px 12px 6px 0;color:var(--sub)">Доступ по токену</td><td style="padding:6px 0">{token_badge}</td></tr>
+    <tr><td style="padding:6px 12px 6px 0;color:var(--sub)">Всего сотрудников</td><td style="padding:6px 0">{stats.get("total", 0)}</td></tr>
+    <tr><td style="padding:6px 12px 6px 0;color:var(--sub)">Уже выгружено (в журнале)</td><td style="padding:6px 0">{stats.get("exported", 0)}</td></tr>
+    <tr><td style="padding:6px 12px 6px 0;color:var(--sub)">К выгрузке (новые/изменённые)</td><td style="padding:6px 0"><b>{stats.get("pending", 0)}</b></td></tr>
+    <tr><td style="padding:6px 12px 6px 0;color:var(--sub)">Последняя фиксация выгрузки</td><td style="padding:6px 0">{last_txt}</td></tr>
+  </table>
+</section>
+
+<section class="card">
+  <h3 style="margin:0 0 6px">Объекты к обмену</h3>
+  <p class="muted" style="margin:0 0 10px">Сотрудники {emp_badge}</p>
+  <form method="post" action="/onec/settings" style="display:inline">
+    <input type="hidden" name="key" value="onec_export_employees">
+    <input type="hidden" name="value" value="{emp_toggle_to}">
+    <button class="btn secondary" type="submit">{emp_toggle_label} выгрузку сотрудников</button>
+  </form>
+</section>
+
+<section class="card">
+  <h3 style="margin:0 0 6px">Режим выгрузки</h3>
+  <p class="muted" style="margin:0 0 10px">Текущий режим: {mode_badge}</p>
+  <p class="muted" style="margin:0 0 10px">В тестовом режиме (dry-run) данные только читаются и логируются — рабочая база 1С не изменяется.</p>
+  <form method="post" action="/onec/settings" style="display:inline"
+        onsubmit="return confirm('Переключить режим выгрузки?');">
+    <input type="hidden" name="key" value="onec_dry_run">
+    <input type="hidden" name="value" value="{mode_toggle_to}">
+    <button class="btn secondary" type="submit">{mode_toggle_label}</button>
+  </form>
+</section>
+
+<section class="card">
+  <h3 style="margin:0 0 6px">Служебное</h3>
+  <p class="muted" style="margin:0 0 10px">Сброс журнала выгрузки очищает только служебные хеши (onec_export_log). Рабочие данные сотрудников не затрагиваются; при следующем запросе 1С заберёт всех заново.</p>
+  <form method="post" action="/onec/reset-log" style="display:inline"
+        onsubmit="return confirm('Сбросить журнал выгрузки? При следующем обмене 1С заберёт всех сотрудников заново.');">
+    <button class="btn secondary" type="submit">♻️ Сбросить журнал выгрузки</button>
+  </form>
+</section>
+"""
+    return _render("Обмен с 1С", body, active="onec", role=request.session.get("role", ""))
+
+
+@app.post("/onec/settings")
+def onec_settings(request: Request, key: str = Form(...), value: str = Form(...),
+                  db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    if _onec_require(request, db) is None:
+        raise HTTPException(403, "Раздел обмена с 1С доступен только кадровику и администратору")
+    if key not in ("onec_export_employees", "onec_dry_run"):
+        raise HTTPException(400, "Неизвестная настройка")
+    if value not in ("on", "off"):
+        raise HTTPException(400, "Недопустимое значение")
+    _onec_set_flag(db, key, value)
+    return RedirectResponse("/onec", status_code=303)
+
+
+@app.post("/onec/reset-log")
+def onec_reset_log(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    if _onec_require(request, db) is None:
+        raise HTTPException(403, "Раздел обмена с 1С доступен только кадровику и администратору")
+    _onec_reset_export_log(db)
+    return RedirectResponse("/onec", status_code=303)
 
 
 @app.get("/reports", response_class=HTMLResponse)
