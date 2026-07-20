@@ -183,6 +183,22 @@ class Employee(Base):
         Enum(ConsentStatus), default=ConsentStatus.DRAFT, nullable=False
     )
 
+    # --- бумажное согласие на ПДн для генподрядчика (2026-07) ---
+    # НЕ дублирует consent_status: тот отражает согласие субъекта перед НАМИ как оператором
+    # (152-ФЗ) и может быть подтверждён кнопкой в боте. Эти две даты — про физическую бумагу
+    # с подписью, которую по п.33.6 договора СМР № ПСМИПБ1600106 надо передать в ООО ПСМ
+    # в течение 5 рабочих дней; за каждое непредоставленное согласие п.28.1.27 даёт штраф
+    # 10 000 ₽. Обязанность договорная (перед контрагентом), а не установленная законом,
+    # поэтому в ObligationType она сознательно НЕ заводится — там реестр обязанностей перед
+    # госорганами, и смешивать два правовых режима в одном списке задач нельзя.
+    # Срок передачи считается от даты ПОДПИСАНИЯ (решение Валерия, 2026-07): пока согласия
+    # нет, миграционный поток и так стоит — obligations не создаются до consent_status=
+    # CONFIRMED, поэтому отдельный отсчёт для неподписанных избыточен.
+    #   ALTER TABLE employees ADD COLUMN consent_signed_date DATE;
+    consent_signed_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    #   ALTER TABLE employees ADD COLUMN consent_transferred_date DATE;
+    consent_transferred_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+
     # --- поля, перенесённые из ручной xlsx-таблицы (2026-07) ---
     birth_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     passport_series: Mapped[str | None] = mapped_column(String, nullable=True)
