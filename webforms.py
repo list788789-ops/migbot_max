@@ -50,6 +50,8 @@ import json
 import logging
 import os
 import calendar
+import shutil
+import tempfile
 from datetime import date, datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -99,7 +101,7 @@ from models import (
 from obligations import create_obligations_for_employee
 from auth_binding import get_role_label, find_user_by_max_id
 import tabel
-from deadlines import lead_days_for
+from deadlines import lead_days_for, working_days_add
 from document_templates import (
     CLINIC_CHIEF_DOCTOR_NAME,
     CLINIC_CONTRACT_DATE,
@@ -115,6 +117,8 @@ from document_templates import (
     check_medical_referral_fields,
     generate_medical_referral_docx,
     generate_consent_docx,
+    generate_consents_batch_docx,
+    docx_to_pdf,
     generate_labor_contract_docx,
     generate_duty_receipt_docx,
     generate_termination_notice_docx,
@@ -167,6 +171,14 @@ SECRET_KEY = os.environ["WEBFORMS_SECRET_KEY"]
 ORG_NAME = os.environ.get("COMPANY_NAME", "ИП Буц Сергей Юрьевич")
 CLINIC_ID = os.environ.get("CLINIC_ID", "pirogova_murmansk")
 CONSENT_TEXT_VERSION = os.environ.get("CONSENT_TEXT_VERSION", "v1")
+
+# Срок передачи подписанного согласия на ПДн генподрядчику (ООО ПСМ) — п.33.6 договора
+# СМР № ПСМИПБ1600106: 5 рабочих дней. Отсчёт от даты ПОДПИСАНИЯ работником.
+# Обязанность ДОГОВОРНАЯ, не установленная законом, поэтому она сознательно не заведена
+# в ObligationType (там реестр обязанностей перед госорганами) и живёт отдельным блоком
+# на дашборде. Штраф за каждое непереданное — 10 000 ₽ (п.28.1.27).
+# Число — из договора; менять только вместе с договором, не «на глаз».
+CONSENT_TRANSFER_WORKING_DAYS = 5
 
 app = FastAPI()
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, session_cookie="migbot_session")
@@ -913,20 +925,24 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
     all_employees = db.scalars(select(Employee).order_by(Employee.full_name)).all()
 
     def missing_badges(e: Employee) -> list[str]:
-        # Граждане РФ и ИП-руководитель (off_tabel) не подлежат миграционному учёту: дата
-        # въезда, статус учёта и согласие мигранта им не требуются. Не выставляем им эти
-        # претензии (иначе сам ИП Буц вечно «требует внимания» — див. категория RF).
-        if getattr(e, "category", None) == Category.RF or getattr(e, "off_tabel", False):
-            return []
         badges = []
+        # Согласие на обработку ПДн проверяется у ВСЕХ, включая граждан РФ и off_tabel:
+        # это 152-ФЗ и п.33.6 договора СМР, а не миграционный учёт. Раньше стояло ниже
+        # отсечки по гражданству и по самому ИП Буц (RF, off_tabel) значок не показывался
+        # никогда — при том, что согласие с него договор требует так же, как с остальных.
+        if e.consent_status == ConsentStatus.DRAFT:
+            badges.append('<span class="badge red">нет согласия</span>')
+        # Граждане РФ и ИП-руководитель (off_tabel) не подлежат миграционному учёту: дата
+        # въезда и статус учёта им не требуются. Не выставляем им эти претензии (иначе сам
+        # ИП Буц вечно «требует внимания» — див. категория RF).
+        if getattr(e, "category", None) == Category.RF or getattr(e, "off_tabel", False):
+            return badges
         if e.entry_date is None:
             badges.append('<span class="badge red">нет даты въезда</span>')
         if e.registration_status is None:
             badges.append('<span class="badge red">статус учёта не задан</span>')
         if e.contract_date is None:
             badges.append('<span class="badge orange">нет даты договора</span>')
-        if e.consent_status == ConsentStatus.DRAFT:
-            badges.append('<span class="badge red">нет согласия</span>')
         return badges
 
     needs_attention = [(e, missing_badges(e)) for e in all_employees]
@@ -965,6 +981,46 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
     # дата начала работы наступила, а инструктажа нет. Отдельный раздел от "пробелов
     # в карточке" — это не незаполненное поле, а невыполненное действие по охране труда.
     instruction_gaps = prod.get_instruction_compliance_gaps(db)
+
+    # --- Согласия на ПДн: передача генподрядчику (п.33.6 договора СМР № ПСМИПБ1600106) ---
+    # Отдельный блок, а не строки в общем списке обязательств: это ДОГОВОРНАЯ обязанность
+    # перед ООО ПСМ, а не установленная законом обязанность перед госорганом. В ObligationType
+    # она сознательно не заводится — иначе список задач смешает два правовых режима, и по
+    # конкретной строке будет непонятно, чем регулируется срок и какая санкция.
+    # Санкция здесь договорная: 10 000 ₽ за каждое непредоставленное согласие (п.28.1.27).
+    # Отсчёт от даты ПОДПИСАНИЯ. Работники без подписанной бумаги в этот блок НЕ попадают:
+    # у них ещё нет события, от которого течёт срок, и их ловит значок «нет согласия» в
+    # «Требуют внимания» (плюс миграционный поток по ним и так стоит — obligations не
+    # создаются до consent_status=CONFIRMED).
+    _consent_wait = [
+        e for e in all_employees
+        if e.contract_end_date is None
+        and e.consent_signed_date is not None
+        and e.consent_transferred_date is None
+    ]
+    consent_transfer_rows_data = []
+    for _e in _consent_wait:
+        _due = working_days_add(_e.consent_signed_date, CONSENT_TRANSFER_WORKING_DAYS)
+        _left = (_due - today).days
+        consent_transfer_rows_data.append((_e, _due, _left))
+    # Самые горячие сверху: просроченные, затем ближайшие по сроку.
+    consent_transfer_rows_data.sort(key=lambda t: t[2])
+    consent_overdue_count = sum(1 for _, _, left in consent_transfer_rows_data if left < 0)
+
+    def consent_transfer_row(item) -> str:
+        e, due, left = item
+        if left < 0:
+            cls, label = "red", f"просрочено на {-left} дн."
+        elif left <= 2:
+            cls, label = "amber", f"осталось {left} дн."
+        else:
+            cls, label = "neutral", f"осталось {left} дн."
+        return (
+            f'<div class="card">{html.escape(e.full_name or "?")} — подписано '
+            f'{e.consent_signed_date.strftime("%d.%m.%Y")}<br>'
+            f'<span class="badge {cls}">передать в ПСМ до {due.strftime("%d.%m.%Y")} · {label}</span><br>'
+            f'<a class="btn" href="/employees/{e.id}">Открыть карточку</a></div>'
+        )
 
     def instruction_gap_row(g: dict) -> str:
         badge_class = "red" if g["stage"] == "critical" else "orange"
@@ -1112,6 +1168,14 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
 <section class="grid">
 <h2>🦺 Инструктажи не проведены ({len(instruction_gaps)}{f", из них критично: {sum(1 for g in instruction_gaps if g['stage'] == 'critical')}" if any(g['stage'] == 'critical' for g in instruction_gaps) else ""})</h2>
 {''.join(instruction_gap_row(g) for g in instruction_gaps) or '<p class="muted">Вводный и первичный проведены у всех, кто уже начал работу.</p>'}
+</section>
+
+<section class="grid">
+<h2>📄 Согласия на ПДн — передать в ПСМ ({len(consent_transfer_rows_data)}{f", просрочено: {consent_overdue_count}" if consent_overdue_count else ""})</h2>
+{''.join(consent_transfer_row(i) for i in consent_transfer_rows_data) or '<p class="muted">Все подписанные согласия переданы генподрядчику.</p>'}
+<p class="muted" style="font-size:13px">П.33.6 договора СМР: {CONSENT_TRANSFER_WORKING_DAYS} рабочих дней с даты подписания.
+Штраф за каждое непредоставленное — 10 000 ₽ (п.28.1.27). Работники, у которых бумага ещё не
+подписана, — в разделе «Требуют внимания».</p>
 </section>
 
 {f'''<section class="grid">
@@ -2781,29 +2845,101 @@ def instruction_scan_download(itype: str, request: Request, db: Session = Depend
                     headers={"Content-Disposition": _content_disposition(fn)})
 
 
-@app.get("/employees/{employee_id}/consent-blank")
-def employee_consent_blank(employee_id: str, request: Request,
-                            operator: str = "tsm", db: Session = Depends(get_db)):
-    """Бланк согласия на обработку ПДн (152-ФЗ) под подпись.
-    operator: 'tsm' (ООО «ТРЕСТСТРОЙМОНТАЖ», по умолчанию) или 'ip' (ИП Буц С.Ю.)."""
+_CONSENT_OP_LABELS = {"tsm": "ТСМ", "ip": "ИП-Буц"}
+_DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+def _consent_response(docx_path: str, filename_stem: str, fmt: str) -> Response:
+    """Отдаёт готовый docx-бланк согласия в браузер: PDF (по умолчанию) или исходный docx.
+
+    PDF — потому что это документ НА ПЕЧАТЬ под подпись: docx на разных машинах поедет
+    по разметке, и в пачке из десятков листов это заметят не сразу. fmt=docx оставлен
+    для случая, когда бланк надо доправить руками перед печатью.
+
+    Если LibreOffice на сервере недоступен, отдаём docx вместо ошибки: кадровику нужен
+    лист бумаги, а не 500-я страница."""
+    fmt = (fmt or "pdf").strip().lower()
+    if fmt != "docx":
+        tmp_dir = tempfile.mkdtemp(prefix="consent_web_")
+        try:
+            pdf_path = docx_to_pdf(docx_path, tmp_dir)
+            with open(pdf_path, "rb") as f:
+                data = f.read()
+            return Response(
+                content=data, media_type="application/pdf",
+                headers={"Content-Disposition": _content_disposition(f"{filename_stem}.pdf")},
+            )
+        except (RuntimeError, OSError) as e:
+            log.warning("Согласие: PDF не получен (%s) — отдаю docx", e)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+    with open(docx_path, "rb") as f:
+        data = f.read()
+    return Response(
+        content=data, media_type=_DOCX_MEDIA_TYPE,
+        headers={"Content-Disposition": _content_disposition(f"{filename_stem}.docx")},
+    )
+
+
+@app.get("/employees/consent-blanks")
+def employees_consent_blanks(request: Request, operator: str = "tsm", fmt: str = "pdf",
+                              db: Session = Depends(get_db)):
+    """Пакетная печать: ОДИН файл с бланками согласия на всех действующих работников,
+    по одному на страницу, в том же алфавитном порядке, что и список /employees.
+
+    Уволенные (contract_end_date заполнен) исключены — согласие требуется от работников,
+    вовлечённых в исполнение договора (п.33.6 договора СМР), а не от архива.
+
+    Маршрут объявлен ДО подключения webforms_employees (импорт в конце webforms.py),
+    поэтому «consent-blanks» не перехватывается более общим /employees/{employee_id}.
+    Если будешь переносить — порядок регистрации важен, иначе роут молча умрёт в 404."""
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
-    if operator not in ("tsm", "ip"):
+    if operator not in _CONSENT_OP_LABELS:
+        operator = "tsm"
+    employees = db.scalars(
+        select(Employee).where(Employee.contract_end_date.is_(None))
+        .order_by(Employee.full_name)
+    ).all()
+    if not employees:
+        raise HTTPException(404, "Нет действующих работников — печатать нечего.")
+    tmp_dir = tempfile.mkdtemp(prefix="consents_batch_")
+    try:
+        path = generate_consents_batch_docx(list(employees), operator=operator, output_dir=tmp_dir)
+        stem = f"Согласия_ПДн_{_CONSENT_OP_LABELS[operator]}_{len(employees)}_чел"
+        return _consent_response(path, stem, fmt)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@app.get("/employees/{employee_id}/consent-blank")
+def employee_consent_blank(employee_id: str, request: Request,
+                            operator: str = "tsm", fmt: str = "pdf",
+                            db: Session = Depends(get_db)):
+    """Бланк согласия на обработку ПДн (152-ФЗ) под подпись.
+    operator: 'tsm' (ООО «ТРЕСТСТРОЙМОНТАЖ», по умолчанию) или 'ip' (ИП Буц С.Ю.).
+
+    2026-07: require_fields=False — как в bot._send_consent_pdf. Раньше здесь работал
+    строгий режим по умолчанию: для работника с незаполненным паспортом или адресом
+    generate_consent_docx поднимал ValueError, роут его не ловил и веб отдавал 500 —
+    ровно на тех людях, ради которых пустографку и печатают."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    if operator not in _CONSENT_OP_LABELS:
         operator = "tsm"
     employee = db.get(Employee, employee_id)
     if employee is None:
         raise HTTPException(404, "Сотрудник не найден.")
-    path = generate_consent_docx(employee, operator=operator)
-    with open(path, "rb") as f:
-        data = f.read()
-    op_label = {"tsm": "ТСМ", "ip": "ИП-Буц"}[operator]
-    _safe = "".join(c if c not in '/\\:*?"<>|' else "-" for c in (employee.full_name or "работник"))
-    fn = f"Согласие_ПДн_{op_label}_{_safe}.docx"
-    return Response(
-        content=data,
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={"Content-Disposition": _content_disposition(fn)},
-    )
+    tmp_dir = tempfile.mkdtemp(prefix="consent_one_")
+    try:
+        path = generate_consent_docx(employee, operator=operator, output_dir=tmp_dir,
+                                     require_fields=False)
+        _safe = "".join(c if c not in '/\\:*?"<>|' else "-"
+                        for c in (employee.full_name or "работник"))
+        stem = f"Согласие_ПДн_{_CONSENT_OP_LABELS[operator]}_{_safe}"
+        return _consent_response(path, stem, fmt)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # --- Инструктажи ---------------------------------------------------------------
