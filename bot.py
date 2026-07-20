@@ -41,7 +41,6 @@ import asyncio
 import logging
 import os
 import shutil
-import subprocess
 import tempfile
 from datetime import date, datetime, timezone, timedelta
 
@@ -97,6 +96,7 @@ from document_templates import (
     TEST_ALLOW_MISSING_FIELDS,
     check_consent_fields,
     check_medical_referral_fields,
+    docx_to_pdf,
     generate_consent_docx,
     generate_employees_xlsx,
     generate_medical_referral_docx,
@@ -800,41 +800,12 @@ async def _send_employee_document(responder: "_Responder", employee_id: str, sca
             pass
 
 
-def _docx_to_pdf(docx_path: str, out_dir: str) -> str:
-    """Конвертирует docx в PDF через LibreOffice headless. Синхронная (блокирующая)
-    функция — вызывать через asyncio.to_thread, иначе на 2-4 сек замирает весь бот.
-
-    -env:UserInstallation указывает LibreOffice на одноразовый профиль в /tmp: под
-    systemd-юзером migbot-bot нет пригодного HOME, и без этого soffice молча падает
-    на инициализации профиля. Профиль уникален на вызов, чтобы параллельные конвертации
-    не дрались за одну папку.
-
-    Возвращает путь к .pdf. Бросает RuntimeError, если бинарь не найден или конвертация
-    не дала файла (хвост stderr — в текст исключения, уходит в чат)."""
-    soffice = shutil.which("soffice") or shutil.which("libreoffice")
-    if not soffice:
-        raise RuntimeError(
-            "конвертер PDF (LibreOffice) не установлен на сервере. "
-            "Установите: apt-get install -y libreoffice-writer --no-install-recommends"
-        )
-    profile_dir = tempfile.mkdtemp(prefix="lo_profile_")
-    try:
-        proc = subprocess.run(
-            [
-                soffice, "--headless", "--nologo", "--nofirststartwizard",
-                f"-env:UserInstallation=file://{profile_dir}",
-                "--convert-to", "pdf", "--outdir", out_dir, docx_path,
-            ],
-            capture_output=True, text=True, timeout=60,
-        )
-        base = os.path.splitext(os.path.basename(docx_path))[0]
-        pdf_path = os.path.join(out_dir, base + ".pdf")
-        if not os.path.exists(pdf_path):
-            tail = (proc.stderr or proc.stdout or "").strip()[-300:]
-            raise RuntimeError(f"конвертация в PDF не удалась (код {proc.returncode}). {tail}")
-        return pdf_path
-    finally:
-        shutil.rmtree(profile_dir, ignore_errors=True)
+# _docx_to_pdf переехал в document_templates.docx_to_pdf (2026-07): тот же конвертер
+# понадобился webforms.py для печати согласий из веба, а импортировать bot.py в webforms
+# нельзя — потянет maxapi и второй диспетчер. Здесь оставлен псевдоним, чтобы не править
+# все вызовы (_send_work_order_pdf, _send_ot_order_pdf, _send_instruction_journal_pdf,
+# _send_consent_pdf). Функция синхронная и блокирующая — вызывать через asyncio.to_thread.
+_docx_to_pdf = docx_to_pdf
 
 
 async def _deliver_work_order_list(responder: "_Responder", scope: str) -> None:
