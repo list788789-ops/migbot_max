@@ -64,6 +64,7 @@ from models import (
     Titul,
 )
 from obligations import create_obligations_for_employee
+from deadlines import working_days_add
 from document_templates import (
     CLINIC_CHIEF_DOCTOR_NAME,
     CLINIC_CONTRACT_DATE,
@@ -121,6 +122,7 @@ from webforms import (
     MSK,
     CLINIC_ID,
     CONSENT_TEXT_VERSION,
+    CONSENT_TRANSFER_WORKING_DAYS,
     OBLIGATION_LABELS,
     SAVE_FORM_JS,
 )
@@ -259,10 +261,47 @@ function _filterEmployees(){
         f'<a class="btn secondary" href="/archive">Архив уволенных ({archived_count})</a>'
         if archived_count else ''
     )
+    # Счётчик бумажных согласий: сколько подписано и сколько реально дошло до ПСМ.
+    # Печать пачки без этого счётчика бесполезна — через неделю никто не скажет, по кому
+    # бумага вернулась. Просрочка считается от даты подписания (п.33.6, 5 рабочих дней).
+    _today_c = datetime.now(MSK).date()
+    _signed = [e for e in working if e.consent_signed_date is not None]
+    _transferred = [e for e in _signed if e.consent_transferred_date is not None]
+    _overdue_transfer = [
+        e for e in _signed
+        if e.consent_transferred_date is None
+        and working_days_add(e.consent_signed_date, CONSENT_TRANSFER_WORKING_DAYS) < _today_c
+    ]
+    _counter_cls = "green" if len(_transferred) == len(working) else "amber"
+    _overdue_chip = (f' <span class="badge red">просрочено передать: {len(_overdue_transfer)}</span>'
+                     if _overdue_transfer else '')
+    _consent_counter = (
+        f'<p style="margin:6px 0"><span class="badge {_counter_cls}">'
+        f'бумажные согласия: подписано {len(_signed)} из {len(working)}, '
+        f'передано в ПСМ {len(_transferred)}</span>{_overdue_chip}</p>'
+    )
+
+    # Пакетная печать согласий: один PDF со всеми бланками, по одному на страницу, тем же
+    # алфавитным порядком, что и список ниже — бумажную пачку можно разложить как на экране.
+    # По п.33.6 договора СМР согласие нужно с КАЖДОГО работника, штраф 10 000 ₽ за каждое
+    # непредоставленное (п.28.1.27), поэтому печать по одному через карточку — не рабочий
+    # режим на ~60 человек. Уволенные в пакет не идут (их фильтрует сам роут).
+    _batch_consent = (
+        f'<details style="margin:8px 0"><summary style="cursor:pointer;padding:8px 0">'
+        f'🖨 Печать согласий на ПДн — на всех ({len(working)} чел.)</summary>'
+        f'<p style="margin-top:8px">'
+        f'<a class="btn secondary" href="/employees/consent-blanks?operator=tsm">Все бланки (ТСМ) — PDF</a> '
+        f'<a class="btn secondary" href="/employees/consent-blanks?operator=ip">Все бланки (ИП Буц) — PDF</a></p>'
+        f'<p class="muted" style="font-size:13px">Один файл, по бланку на страницу. '
+        f'Сборка ~60 листов занимает несколько секунд — не жмите повторно. '
+        f'Незаполненные поля печатаются прочерками, их вписывают от руки.</p></details>'
+    )
     return _render(
         "Сотрудники",
         f'<h1>Сотрудники ({len(working)})</h1>'
         f'<p><a class="btn" href="/employees/new">+ Добавить сотрудника</a> {_archive_link}</p>'
+        f'{_consent_counter}'
+        f'{_batch_consent}'
         f'{_search_box}'
         f'{active_section}{awaiting_section}'
         f'{_search_js}',
@@ -1103,6 +1142,58 @@ _toggleBasisNote();
         + '</form>'
     )
 
+    # Бумажное согласие для ПСМ (п.33.6 договора СМР). Отдельно от consent_status: тот
+    # может быть подтверждён кнопкой в боте, а здесь фиксируется физическая бумага с
+    # подписью и факт её передачи генподрядчику. Прорабу — только чтение (как и остальные
+    # формы записи в правой колонке).
+    _cs_signed = emp.consent_signed_date.isoformat() if emp.consent_signed_date else ""
+    _cs_transferred = emp.consent_transferred_date.isoformat() if emp.consent_transferred_date else ""
+    if not emp.consent_signed_date:
+        _paper_state = '<span class="badge red">бумага не подписана</span>'
+    elif not emp.consent_transferred_date:
+        _due = working_days_add(emp.consent_signed_date, CONSENT_TRANSFER_WORKING_DAYS)
+        _left = (_due - datetime.now(MSK).date()).days
+        _cls = "red" if _left < 0 else ("amber" if _left <= 2 else "neutral")
+        _word = "просрочено" if _left < 0 else "передать до"
+        _paper_state = (f'<span class="badge {_cls}">не передана в ПСМ · {_word} '
+                        f'{_due.strftime("%d.%m.%Y")}</span>')
+    else:
+        _paper_state = ('<span class="badge green">передана в ПСМ '
+                        f'{emp.consent_transferred_date.strftime("%d.%m.%Y")}</span>')
+
+    if can_write:
+        _paper_block = f'''
+<p style="margin-top:10px"><b>Бумажное согласие (для ПСМ)</b></p>
+<p>{_paper_state}</p>
+<form method="post" action="/employees/{emp.id}/consent_paper">
+<label>Дата подписания работником</label>
+<input type="date" name="signed_date" value="{_cs_signed}">
+<label>Дата передачи в ПСМ</label>
+<input type="date" name="transferred_date" value="{_cs_transferred}">
+<button type="submit" class="btn-full">Сохранить даты</button>
+</form>
+<p class="muted" style="font-size:13px">П.33.6 договора СМР: подписанное согласие передаётся
+генподрядчику в течение {CONSENT_TRANSFER_WORKING_DAYS} рабочих дней. Пустое поле = очистить дату.</p>'''
+    else:
+        _paper_block = (f'<p style="margin-top:10px"><b>Бумажное согласие (для ПСМ)</b></p>'
+                        f'<p>{_paper_state}</p>'
+                        f'<p class="muted" style="font-size:13px">Отметки проставляет кадровик.</p>')
+
+    # Печать бланка под подпись. Доступна независимо от статуса согласия и от полноты
+    # карточки (роут работает в режиме require_fields=False, пустые поля идут прочерками) —
+    # зеркалит «🖨 Печать согласия» в боте, где статус тоже не проверяется. PDF, потому что
+    # это лист на печать: docx поедет по разметке на чужой машине, а в пачке это заметят
+    # не сразу. Ссылка «.docx» — если бланк надо доправить руками перед печатью.
+    _consent_print_block = f'''
+<p style="margin-top:10px"><b>Печать бланка под подпись</b></p>
+<p><a class="btn secondary" href="/employees/{emp.id}/consent-blank?operator=tsm">📄 Бланк (ТСМ) — PDF</a>
+<a class="btn secondary" href="/employees/{emp.id}/consent-blank?operator=ip">📄 Бланк (ИП Буц) — PDF</a></p>
+<p class="muted" style="font-size:13px">Оператор — то юрлицо, которое обрабатывает данные:
+ТСМ по трудовому договору, ИП Буц если оператор — ИП. Незаполненные поля карточки печатаются
+прочерками, их можно вписать от руки.
+<a href="/employees/{emp.id}/consent-blank?operator=tsm&amp;fmt=docx">скачать .docx (ТСМ)</a> ·
+<a href="/employees/{emp.id}/consent-blank?operator=ip&amp;fmt=docx">.docx (ИП Буц)</a></p>'''
+
     if emp.consent_status == ConsentStatus.CONFIRMED:
         consent_block = '<p><span class="badge green">Согласие подтверждено</span></p>'
     else:
@@ -1386,6 +1477,8 @@ value="{emp.contract_date.isoformat() if emp.contract_date else ''}">
 <fieldset>
 <legend>Согласие на обработку ПД</legend>
 {consent_block}
+{_paper_block}
+{_consent_print_block}
 </fieldset>
 
 <fieldset>
@@ -1598,6 +1691,57 @@ def employee_contract_date_submit(
     if emp.consent_status == ConsentStatus.CONFIRMED:
         create_obligations_for_employee(db, emp)
 
+    return RedirectResponse(f"/employees/{employee_id}", status_code=303)
+
+
+@app.post("/employees/{employee_id}/consent_paper")
+def employee_consent_paper_submit(
+    employee_id: str,
+    request: Request,
+    signed_date: str = Form(""),
+    transferred_date: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    """Отметки по БУМАЖНОМУ согласию на ПДн (п.33.6 договора СМР с ООО ПСМ).
+
+    Не трогает consent_status и не создаёт obligations: это договорная обязанность перед
+    генподрядчиком, а не установленная законом миграционная — они живут раздельно
+    сознательно (см. комментарий у полей в models.Employee).
+
+    Пустая строка = очистить дату (кадровик ошибся при вводе и откатывает). Поля приходят
+    строками, а не date, именно ради этого: date = Form(None) на пустом input отдал бы 422.
+    """
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    _require_role(request, db, UserRole.KADROVIK)
+
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(404, "Сотрудник не найден")
+
+    def _parse(value: str, label: str):
+        value = (value or "").strip()
+        if not value:
+            return None
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            raise HTTPException(400, f"Некорректная {label}: {value}")
+
+    signed = _parse(signed_date, "дата подписания")
+    transferred = _parse(transferred_date, "дата передачи")
+
+    # Передать раньше, чем подписали, физически нельзя — это опечатка, а не факт.
+    # Пропустить её значит получить в отчёте для ПСМ срок, посчитанный от несуществующего
+    # события. Дешевле отбить на вводе.
+    if transferred and signed and transferred < signed:
+        raise HTTPException(400, "Дата передачи раньше даты подписания — проверьте ввод.")
+    if transferred and not signed:
+        raise HTTPException(400, "Сначала укажите дату подписания: передаётся подписанный бланк.")
+
+    emp.consent_signed_date = signed
+    emp.consent_transferred_date = transferred
+    db.commit()
     return RedirectResponse(f"/employees/{employee_id}", status_code=303)
 
 
