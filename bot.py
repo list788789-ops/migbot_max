@@ -612,7 +612,7 @@ async def on_bot_started(event):
     await bot.send_message(
         chat_id=event.chat_id,
         text=(
-            "Автоматизированная система учёта персонала и миграционного контроля.\n"
+            "ТАКТ — учёт персонала и миграционного контроля.\n"
             "Выберите действие или используйте команды: /medical_exam_result <id> <done|failed>, "
             "/set_entry_date <id> <ГГГГ-ММ-ДД>, /send_consent_doc <id>, /send_medical_referral <id>.\n\n"
             "Напоминания о горящих дедлайнах будут приходить в этот чат."
@@ -625,9 +625,9 @@ async def on_bot_started(event):
 async def on_start(event: MessageCreated):
     with Session(engine) as session:
         role = _role_for_max_id(session, event.message.sender.user_id)
-    text = "Автоматизированная система учёта на производстве. Выберите действие:"
+    text = "ТАКТ — АСУ строительного производства. Выберите действие:"
     if role:
-        text = f"Рабочее место: Автоматизированная система учёта на производстве. Роль: {role}.\nВыберите действие:"
+        text = f"Рабочее место: ТАКТ — АСУ строительного производства. Роль: {role}.\nВыберите действие:"
     await event.message.answer(
         text=text,
         attachments=[_build_main_menu(role).as_markup()],
