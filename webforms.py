@@ -86,6 +86,7 @@ from models import (
     WorkOrderDailyAdmission,
     WorkOrderMemberChange,
     WorkLogEntry,
+    WorkLogSignStatus,
     MemberChangeType,
     WorkOrder,
     WorkType,
