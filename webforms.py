@@ -86,7 +86,6 @@ from models import (
     WorkOrderDailyAdmission,
     WorkOrderMemberChange,
     WorkLogEntry,
-    WorkLogSignStatus,
     MemberChangeType,
     WorkOrder,
     WorkType,
@@ -537,6 +536,10 @@ def _nav(active: str = "", role: str = "") -> str:
     if role in ("admin", "kadrovik"):
         work.append(("common", "/common-docs", "Общие документы", "📁"))
         work.append(("onec", "/onec", "Обмен с 1С", "🔄"))
+    # Раздел «Покупки» (2026-07) — отдельным условием, а не добавлением в блок выше:
+    # у кадровика доступа к поступлениям нет, у бухгалтера — к общим документам.
+    if role in ("admin", "buhgalter"):
+        work.append(("purchases", "/purchases", "Покупки", "🧾"))
     service = []
     if role == "admin":
         service.append(("admin", "/admin/users", "Пользователи", "⚙️"))
@@ -770,7 +773,8 @@ def admin_users(request: Request, db: Session = Depends(get_db)):
 
     def _row(u):
         locked = u.locked_until is not None and u.locked_until > now
-        role_ru = {"prorab": "прораб", "kadrovik": "кадровик", "admin": "админ"}.get(
+        role_ru = {"prorab": "прораб", "kadrovik": "кадровик",
+                    "buhgalter": "бухгалтер", "admin": "админ"}.get(
             u.role.value if u.role else "", "—")
         parts = [f'<b>{u.full_name}</b> · {u.phone} · роль: {role_ru}']
         if u.status == UserStatus.PENDING:
@@ -780,6 +784,7 @@ def admin_users(request: Request, db: Session = Depends(get_db)):
                 '<option value="">— назначить роль —</option>'
                 '<option value="prorab">Прораб (только чтение и скачивание)</option>'
                 '<option value="kadrovik">Кадровик (всё по работникам)</option>'
+                '<option value="buhgalter">Бухгалтер (покупки, поставщики, номенклатура)</option>'
                 '<option value="admin">Админ</option>'
                 '</select> '
                 '<button type="submit">Одобрить</button></form>'
@@ -824,7 +829,7 @@ def admin_approve(user_id: str, request: Request, role: str = Form(...),
     u = db.get(User, user_id)
     if u is None:
         raise HTTPException(404, "Пользователь не найден")
-    if role not in ("prorab", "kadrovik", "admin"):
+    if role not in ("prorab", "kadrovik", "buhgalter", "admin"):
         raise HTTPException(400, "Неверная роль")
     u.role = UserRole(role)
     u.status = UserStatus.APPROVED
@@ -3726,3 +3731,26 @@ def titul_update(
 # в том файле резолвится без циклической ошибки. Роуты регистрируются на том же
 # экземпляре app (декораторы @app.get/@app.post внутри импортируемого модуля).
 import webforms_employees  # noqa: E402,F401
+
+# --- Раздел «Покупки» (2026-07) ------------------------------------------------
+# Поступление товаров и услуг: загрузка накладной поставщика из Excel, сопоставление
+# номенклатуры, проведение. Логика — в пакете purchases/ (parser → matching → service),
+# здесь только регистрация роутов.
+#
+# Регистрация ЗДЕСЬ, а не рядом с register_1c_routes в начале файла: роуты получают
+# _render/_logged_in/_current_user параметрами, а к моменту этого импорта они уже
+# определены. Зависимости передаются явно, а не импортируются в purchases.routes из
+# webforms — обратный импорт дал бы цикл (та же причина, по которой webforms_employees
+# импортируется последней строкой).
+#
+# Доступ — только UserRole.BUHGALTER и ADMIN, проверяется внутри на каждом роуте,
+# а не только скрытием пункта меню.
+from purchases.routes import register_purchases_routes  # noqa: E402
+
+register_purchases_routes(
+    app,
+    render=_render,
+    get_db=get_db,
+    logged_in=_logged_in,
+    current_user=_current_user,
+)
