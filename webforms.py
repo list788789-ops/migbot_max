@@ -66,6 +66,8 @@ log = logging.getLogger("webforms")
 from models import (
     User,
     UserRole,
+    WorkLogSignStatus,   # 2026-07: использовался в ОЖР без импорта
+                         # (правка была только на сервере, в репозиторий не попала)
     UserStatus,
     AttendanceMark,
     Category,
