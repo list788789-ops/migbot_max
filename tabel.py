@@ -309,10 +309,26 @@ def mark_sutki(session: Session, employee: Employee, created_by: str,
 
 
 def set_reason(session: Session, employee: Employee, code: str, created_by: str,
-               mark_date: date | None = None) -> None:
-    """Причина отсутствия в дневной слот: Н/Б/МЖ/МУ/В."""
+               mark_date: date | None = None, drop_rotation: bool = False) -> None:
+    """Причина отсутствия в дневной слот: Н/Б/МЖ/МУ/В.
+
+    drop_rotation=True — вместе с кодом снимает ожидание возврата с межвахты
+    (строку RotationReturn). Нужно при ПЕРЕЗАПИСИ ранее поставленной МЖ другим
+    кодом: сам по себе _set_mark меняет только код дня, а RotationReturn остаётся,
+    и бот продолжает ждать возврата и слать напоминания по человеку, который в
+    табеле уже помечен неявкой/больничным. Расхождение тихое, поэтому решение
+    принимает пользователь кнопкой, а не код молча."""
     mark_date = mark_date or date.today()
     _set_mark(session, employee, mark_date, "day", code, created_by)
+    if drop_rotation and code != ROTATION:
+        session.query(RotationReturn).filter_by(employee_id=employee.id).delete()
+        session.commit()
+
+
+def has_pending_rotation(session: Session, employee_id: str) -> bool:
+    """Есть ли незакрытое ожидание возврата с межвахты. Используется перед
+    перезаписью кода МЖ другой причиной."""
+    return session.get(RotationReturn, employee_id) is not None
 
 
 def set_rest(session: Session, employee: Employee, created_by: str,
@@ -631,6 +647,25 @@ def day_summary(session: Session, mark_date: date | None = None) -> dict:
         "sick": counts[SICK], "rotation": counts[ROTATION], "absent": counts[ABSENT],
         "migr": counts[MIGR], "absent_list": absent_list, "total": len(active),
     }
+
+
+def day_reason_summary(session: Session, mark_date: date | None = None) -> list[tuple[str, str]]:
+    """[(ФИО, код)] по всем активным, у кого дневной слот содержит причину отсутствия
+    (Н/Б/МЖ/МУ/В), отсортировано по ФИО. Используется ботом для одного итогового
+    сообщения-протокола вместо строки на каждое нажатие: в чате остаётся один
+    проверяемый список, а не лента «причина проставлена» без указания причины."""
+    mark_date = mark_date or date.today()
+    active_ids = {e.id for e in get_active_employees(session)}
+    if not active_ids:
+        return []
+    rows = (
+        session.query(AttendanceMark)
+        .filter_by(mark_date=mark_date, slot="day")
+        .filter(AttendanceMark.employee_id.in_(active_ids))
+        .filter(AttendanceMark.code.in_(REASON_CODES))
+        .all()
+    )
+    return sorted(((r.employee_name_snap or "—", r.code) for r in rows), key=lambda t: t[0])
 
 
 def get_month_codes(session: Session, year: int | None = None, month: int | None = None) -> dict:
