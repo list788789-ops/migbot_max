@@ -289,6 +289,8 @@ def _tabel_extra_button(prefix: str) -> CallbackButton | None:
         return CallbackButton(text="✅ Отметил всех присутствующих", payload="utro_done")
     if prefix == "eveningnight":
         return CallbackButton(text="✅ Готово", payload="evening_done")
+    if prefix == "reasonday":
+        return CallbackButton(text="✅ Завершить (остальным неявка)", payload="reason_finish")
     return None
 
 
@@ -332,9 +334,35 @@ PICKER_TITLES = {
     "eveningnight": "🌙 Вечер — кто заступает в ночь",
     "empaction": "🧹 Действия с сотрудником — выберите",
     "consentprint": "Печать согласия — выберите работника",
+    "reasonday": "📝 Причина отсутствия — осталось",
 }
 # Префиксы табеля — там незачем показывать паспорт в подписи кнопки (не тот контекст).
-_TABEL_PREFIXES = {"utroday", "eveningnight", "empaction"}
+_TABEL_PREFIXES = {"utroday", "eveningnight", "empaction", "reasonday"}
+
+# Payload'ы табеля, которые пишут в БД или закрывают день. Проверяются на роль
+# единым гейтом в обработчике колбэков (см. ниже) — пункты меню menu:* оставлены
+# со своими проверками, они и так их делали.
+_TABEL_GUARDED = (
+    "utro_done", "evening_done", "reason_finish", "reasonpick:", "reasoncode:",
+    "reasonback", "rotoverride:", "empaction", "empact_", "utroday:",
+    "eveningnight:", "reasonday:", "rotconfirm:", "rotextend:",
+)
+
+# Раньше бот отвечал «ФИО: причина проставлена» — по такому логу невозможно проверить,
+# ЧТО именно записалось. Теперь код всегда называется словом.
+_REASON_LABELS = {
+    tabel.ABSENT: "неявка (Н)",
+    tabel.SICK: "больничный (Б)",
+    tabel.ROTATION: "межвахта (МЖ)",
+    tabel.MIGR: "мигр.учёт (МУ)",
+    tabel.WEEKEND: "выходной (В)",
+    tabel.DAY: "явка (Д)",
+    tabel.REST: "отдых (О)",
+}
+
+
+def _reason_label(code: str | None) -> str:
+    return _REASON_LABELS.get(code, code or "—")
 
 
 def _picker_employees(session: Session, prefix: str) -> list[Employee]:
@@ -373,12 +401,21 @@ def _picker_employees(session: Session, prefix: str) -> list[Employee]:
         return tabel.get_not_worked_day(session)
     if prefix == "empaction":
         return tabel.get_active_employees(session)
+    if prefix == "reasonday":
+        # Тот же набор, что и utroday: активные с пустым дневным слотом. Отличается
+        # только сценарием — здесь ставят причину отсутствия, а не явку. Раньше этот
+        # список собирался вручную в utro_done и (а) обрезался 25 записями без
+        # пагинации, (б) никогда не перерисовывался. Теперь идёт через _deliver_picker
+        # и получает и то, и другое.
+        return tabel.get_unmarked_day(session)
     return []
 
 
 async def _deliver_picker(
     responder: "_Responder", prefix: str, page: int = 0, edit: bool = False,
     only_if_open: bool = False, extra_button: CallbackButton | None = None,
+    note: str | None = None, empty_text: str | None = None,
+    use_callback_mid: bool = True,
 ) -> None:
     """Общий постраничный список сотрудников-кнопок для empdate/delpick/consentpick/
     contractdate/utroday/eveningnight.
@@ -391,7 +428,15 @@ async def _deliver_picker(
     а не через кнопку) — ничего не отправляем, не заводим список, который никто не открывал.
 
     extra_button: дополнительная кнопка отдельной строкой над «Выход» (например,
-    «✅ Отметил всех присутствующих» для utroday)."""
+    «✅ Отметил всех присутствующих» для utroday).
+
+    note: строка-подтверждение, которая встаёт НАД заголовком списка (например
+    «✔ Иванов И.И. — больничный (Б)»). Сделано именно так, а не отдельным
+    сообщением: на телефоне каждое новое сообщение уводит клавиатуру вверх за
+    пределы экрана, человек её теряет и жмёт по старой — ровно этот механизм
+    и породил повторные отметки.
+
+    empty_text: чем заменить «Список пуст.», когда выбирать больше некого."""
     key = (responder.user_id(), prefix)
     if only_if_open and key not in _open_pickers:
         return
@@ -408,15 +453,25 @@ async def _deliver_picker(
         employees = _picker_employees(session, prefix)
 
         if not employees:
-            text = "Список пуст."
-            if edit and key in _open_pickers:
+            text = empty_text or "Список пуст."
+            if note:
+                text = f"{note}\n\n{text}"
+            # mid берём из колбэка так же, как в основной ветке ниже: раньше пустой
+            # список закрывался только по _open_pickers, который пуст после рестарта
+            # бота — и последняя отметка оставляла на экране полный список кнопок.
+            mid = (getattr(responder, "current_message_id", lambda: None)()
+                   if (edit and use_callback_mid) else None)
+            if mid is None:
+                mid = _open_pickers.get(key)
+            if edit and mid is not None:
                 try:
-                    await bot.edit_message(message_id=_open_pickers[key], text=text, attachments=[])
+                    await bot.edit_message(message_id=mid, text=text, attachments=[])
                 except Exception:
                     log.exception("Не удалось отредактировать пустой список (prefix=%s)", prefix)
-                _open_pickers.pop(key, None)
+                    await responder.send(text)
             else:
                 await responder.send(text)
+            _open_pickers.pop(key, None)
             return
 
         total = len(employees)
@@ -449,6 +504,8 @@ async def _deliver_picker(
     header = f"{PICKER_TITLES.get(prefix, prefix)}: {total}"
     if total_pages > 1:
         header += f"\nСтраница {page + 1}/{total_pages}"
+    if note:
+        header = f"{note}\n\n{header}"
 
     # Редактируем сообщение, из которого пришёл колбэк (current_message_id) — оно
     # всегда доступно в событии, НЕ зависит от _open_pickers в памяти. Раньше edit
@@ -457,7 +514,10 @@ async def _deliver_picker(
     # кнопки становились мёртвыми. Теперь, как у меню (show_menu), редактируем по
     # mid из колбэка — кнопки работают и после перезапуска.
     if edit:
-        mid = getattr(responder, "current_message_id", lambda: None)()
+        # use_callback_mid=False — когда колбэк прилетел из ДРУГОГО сообщения (например
+        # из утреннего списка при переходе к причинам): редактировать надо своё
+        # сообщение из памяти, иначе один список затрёт другой.
+        mid = getattr(responder, "current_message_id", lambda: None)() if use_callback_mid else None
         if mid is None and key in _open_pickers:
             mid = _open_pickers[key]  # fallback на память (напр. edit не из колбэка)
         if mid is not None:
@@ -474,6 +534,33 @@ async def _deliver_picker(
     message_id = await responder.send(text=header, attachments=[builder.as_markup()])
     if message_id:
         _open_pickers[key] = message_id
+
+
+async def _edit_picker_message(
+    responder: "_Responder", prefix: str, text: str,
+    keyboard: InlineKeyboardBuilder | None = None,
+) -> None:
+    """Перерисовать сообщение открытого списка (prefix) в произвольный промежуточный
+    экран — выбор причины, подтверждение, итоговый протокол — БЕЗ отправки нового
+    сообщения. Это ключевое: на телефоне каждое новое сообщение уводит клавиатуру
+    вверх, человек её теряет из виду и жмёт по старому, уже отработавшему списку.
+    Ровно так и возникали повторные отметки.
+
+    Если редактирование не удалось (сообщение удалено, бот перезапущен и т.п.) —
+    отправляем новое и запоминаем его как текущее, чтобы цепочка не рвалась."""
+    key = (responder.user_id(), prefix)
+    mid = responder.current_message_id() or _open_pickers.get(key)
+    attachments = [keyboard.as_markup()] if keyboard is not None else []
+    if mid is not None:
+        try:
+            await bot.edit_message(message_id=mid, text=text, attachments=attachments)
+            _open_pickers[key] = mid
+            return
+        except Exception:
+            log.exception("Не удалось перерисовать сообщение списка (prefix=%s)", prefix)
+    new_mid = await responder.send(text=text, attachments=attachments or None)
+    if new_mid:
+        _open_pickers[key] = new_mid
 
 
 async def _deliver_delete_confirmation(responder: "_Responder", employee_id: str) -> None:
@@ -1182,6 +1269,20 @@ async def on_callback(event: MessageCallback):
 
     # ================= ТАБЕЛЬ: Утро/Вечер/Межвахта/Отчёты (2026-07, слияние ботов) =================
 
+    # Роль проверялась только на ВХОДЕ в сценарий (menu:morning / menu:evening /
+    # menu:empaction), а сами кнопки табеля — нет. В групповом чате клавиатура живёт
+    # вечно и видна всем участникам: любой, кого добавили в чат, мог нажать
+    # «Завершить (остальным неявка)» и закрыть табель, причём в created_by ушёл бы
+    # его user_id — то есть в аудите отметку подписал бы посторонний. Гейт общий,
+    # чтобы новые кнопки табеля не приходилось защищать поштучно.
+    if payload.startswith(_TABEL_GUARDED):
+        with Session(engine) as session:
+            role = _role_for_max_id(session, responder.user_id())
+        if role not in ("prorab", "kadrovik", "admin"):
+            await event.answer(notification="Табель доступен только зарегистрированным "
+                                             "пользователям. Выполните /login.")
+            return
+
     if payload == "menu:morning":
         with Session(engine) as session:
             role = _role_for_max_id(session, responder.user_id())
@@ -1382,21 +1483,50 @@ async def on_callback(event: MessageCallback):
         return
 
     if payload == "utro_done":
-        with Session(engine) as session:
-            remaining = tabel.get_unmarked_day(session)
-            if not remaining:
-                await responder.send("Все отмечены. Утро завершено.")
-                return
-            builder = InlineKeyboardBuilder()
-            for e in remaining[:PICKER_PAGE_SIZE]:
-                builder.row(CallbackButton(text=e.full_name[:60], payload=f"reasonpick:{e.id}"))
-            builder.row(CallbackButton(text="✅ Завершить (остальным неявка)", payload="reason_finish"))
-        await responder.send(f"Укажите причину отсутствия (осталось {len(remaining)}):",
-                              attachments=[builder.as_markup()])
+        # Утренний список свою работу закончил, но в групповом чате его кнопки
+        # остаются нажимаемыми — рядом оказывалось два живых списка. Закрываем.
+        utro_key = (responder.user_id(), "utroday")
+        utro_mid = responder.current_message_id() or _open_pickers.get(utro_key)
+        if utro_mid is not None:
+            try:
+                await bot.edit_message(
+                    message_id=utro_mid,
+                    text="☀️ Явки отмечены. Ниже — причины отсутствия.",
+                    attachments=[],
+                )
+            except Exception:
+                log.exception("utro_done: не удалось закрыть утренний список")
+        _open_pickers.pop(utro_key, None)
+
+        # Дальше — обычный пикер: пагинация и перерисовка после каждой отметки
+        # берутся из _deliver_picker. Раньше список собирался здесь вручную,
+        # обрезался 25 записями (при 59 сотрудниках остальные не показывались
+        # вообще, но всё равно получали Н от «Завершить») и не обновлялся.
+        await _deliver_picker(
+            responder, "reasonday",
+            extra_button=_tabel_extra_button("reasonday"),
+            empty_text="✅ Все отмечены. Утро завершено.",
+            use_callback_mid=False,
+        )
+        return
+
+    if payload == "reasonback":
+        await _deliver_picker(
+            responder, "reasonday", edit=True,
+            extra_button=_tabel_extra_button("reasonday"),
+            empty_text="✅ Все отмечены. Утро завершено.",
+        )
         return
 
     if payload.startswith("reasonpick:"):
         employee_id = payload.split(":", 1)[1]
+        with Session(engine) as session:
+            employee = session.get(Employee, employee_id)
+            if employee is None:
+                await event.answer(notification="Сотрудник не найден.")
+                return
+            full_name = employee.full_name
+            current = tabel.get_day_slot(session, employee_id)
         kb = InlineKeyboardBuilder()
         kb.row(
             CallbackButton(text="❌ Неявка", payload=f"reasoncode:{employee_id}:{tabel.ABSENT}"),
@@ -1407,71 +1537,127 @@ async def on_callback(event: MessageCallback):
             CallbackButton(text="📋 Мигр.учёт", payload=f"reasoncode:{employee_id}:{tabel.MIGR}"),
         )
         kb.row(CallbackButton(text="🏖 Выходной", payload=f"reasoncode:{employee_id}:{tabel.WEEKEND}"))
-        await responder.send("Причина?", attachments=[kb.as_markup()])
+        kb.row(CallbackButton(text="◀ Назад к списку", payload="reasonback"))
+        text = f"{full_name}\nПричина?"
+        if current:
+            # Возможно, если параллельно отмечает второй пользователь.
+            text = (f"{full_name}\n⚠️ Уже отмечен: {_reason_label(current)}. "
+                    f"Выбор ниже перезапишет отметку.\nПричина?")
+        await _edit_picker_message(responder, "reasonday", text, kb)
         return
 
     if payload.startswith("reasoncode:") and payload.endswith(":force"):
         _, employee_id, code, _force = payload.split(":", 3)
-        # Убираем сообщение «Причина?» с кнопками — оно отработало, чтобы не копилось в чате.
-        try:
-            await event.message.delete()
-        except Exception:
-            log.exception("reasoncode:force — не удалось удалить сообщение с кнопками причины")
-        with Session(engine) as session:
-            employee = session.get(Employee, employee_id)
-            full_name = employee.full_name if employee is not None else "—"
-            if employee is not None:
-                tabel.set_reason(session, employee, code, responder.user_id())
-                today_count = tabel.count_migr_today(session)
-                if today_count > tabel.MIGR_DAILY_THRESHOLD:
-                    await responder.send(f"⚠️ Сегодня на мигр.учёте уже {today_count} человек "
-                                          f"(порог {tabel.MIGR_DAILY_THRESHOLD}). Риск вопросов "
-                                          f"от заказчика — проверьте обоснованность.")
-        await responder.send(f"{full_name}: причина проставлена.")
-        return
-
-    if payload.startswith("reasoncode:"):
-        _, employee_id, code = payload.split(":", 2)
-        # Убираем сообщение «Причина?» с кнопками — оно отработало, чтобы не копилось в чате.
-        try:
-            await event.message.delete()
-        except Exception:
-            log.exception("reasoncode — не удалось удалить сообщение с кнопками причины")
+        note = None
         with Session(engine) as session:
             employee = session.get(Employee, employee_id)
             if employee is None:
                 await event.answer(notification="Сотрудник не найден.")
                 return
             full_name = employee.full_name
+            tabel.set_reason(session, employee, code, responder.user_id())
+            note = f"✔ {full_name} — {_reason_label(code)}"
+            today_count = tabel.count_migr_today(session)
+            if today_count > tabel.MIGR_DAILY_THRESHOLD:
+                note += (f"\n⚠️ Сегодня на мигр.учёте уже {today_count} человек "
+                         f"(порог {tabel.MIGR_DAILY_THRESHOLD}). Риск вопросов "
+                         f"от заказчика — проверьте обоснованность.")
+        await _deliver_picker(
+            responder, "reasonday", edit=True, note=note,
+            extra_button=_tabel_extra_button("reasonday"),
+            empty_text="✅ Все отмечены. Утро завершено.",
+        )
+        return
+
+    if payload.startswith("rotoverride:"):
+        # Подтверждённая перезапись межвахты другим кодом: снимаем и код, и ожидание
+        # возврата. Без этого в табеле стояла бы, например, неявка, а бот продолжал бы
+        # ждать возврата и слал напоминания — расхождение, которое никто не замечает.
+        _, employee_id, code = payload.split(":", 2)
+        with Session(engine) as session:
+            employee = session.get(Employee, employee_id)
+            if employee is None:
+                await event.answer(notification="Сотрудник не найден.")
+                return
+            full_name = employee.full_name
+            tabel.set_reason(session, employee, code, responder.user_id(), drop_rotation=True)
+        await _deliver_picker(
+            responder, "reasonday", edit=True,
+            note=f"✔ {full_name} — {_reason_label(code)} (межвахта снята, "
+                 f"ожидание возврата отменено)",
+            extra_button=_tabel_extra_button("reasonday"),
+            empty_text="✅ Все отмечены. Утро завершено.",
+        )
+        return
+
+    if payload.startswith("reasoncode:"):
+        _, employee_id, code = payload.split(":", 2)
+        note = None
+        with Session(engine) as session:
+            employee = session.get(Employee, employee_id)
+            if employee is None:
+                await event.answer(notification="Сотрудник не найден.")
+                return
+            full_name = employee.full_name
+            prev_code = tabel.get_day_slot(session, employee_id)
 
             if code == tabel.ROTATION:
                 _pending_forms[responder.user_id()] = {
                     "state": "awaiting_rotation_return_date",
                     "employee_id": employee_id,
                 }
-                await responder.send(f"{full_name}: межвахта.\n"
-                                      f"⚠️ Укажите дату ВОЗВРАТА на объект (когда он вернётся "
-                                      f"к работе), а не дату отъезда.\nФормат: ГГГГ-ММ-ДД")
+                await _edit_picker_message(
+                    responder, "reasonday",
+                    f"{full_name}: межвахта.\n"
+                    f"⚠️ Укажите дату ВОЗВРАТА на объект (когда он вернётся "
+                    f"к работе), а не дату отъезда.\nФормат: ГГГГ-ММ-ДД",
+                )
+                return
+
+            # Перезапись межвахты другим кодом — только с явного подтверждения.
+            if prev_code == tabel.ROTATION or tabel.has_pending_rotation(session, employee_id):
+                kb = InlineKeyboardBuilder()
+                kb.row(CallbackButton(text="✅ Да, снять межвахту",
+                                       payload=f"rotoverride:{employee_id}:{code}"))
+                kb.row(CallbackButton(text="◀ Отмена", payload="reasonback"))
+                await _edit_picker_message(
+                    responder, "reasonday",
+                    f"⚠️ {full_name}: стоит межвахта, бот ждёт возврата на объект.\n"
+                    f"Поставить «{_reason_label(code)}» и отменить ожидание возврата?",
+                    kb,
+                )
                 return
 
             if code == tabel.MIGR:
                 migr_warn = tabel.check_migr_after_rotation(session, employee)
                 if migr_warn:
                     kb = InlineKeyboardBuilder()
-                    kb.row(CallbackButton(text="✅ Всё равно МУ", payload=f"reasoncode:{employee_id}:{tabel.MIGR}:force"))
-                    kb.row(CallbackButton(text="✖ Отмена", payload=f"reasonpick:{employee_id}"))
-                    await responder.send(f"⚠️ {migr_warn}\nВсё равно поставить МУ?",
-                                          attachments=[kb.as_markup()])
+                    kb.row(CallbackButton(text="✅ Всё равно МУ",
+                                           payload=f"reasoncode:{employee_id}:{tabel.MIGR}:force"))
+                    kb.row(CallbackButton(text="◀ Отмена", payload="reasonback"))
+                    await _edit_picker_message(
+                        responder, "reasonday",
+                        f"⚠️ {migr_warn}\nВсё равно поставить МУ?", kb,
+                    )
                     return
                 tabel.set_reason(session, employee, code, responder.user_id())
+                note = f"✔ {full_name} — {_reason_label(code)}"
                 today_count = tabel.count_migr_today(session)
                 if today_count > tabel.MIGR_DAILY_THRESHOLD:
-                    await responder.send(f"⚠️ Сегодня на мигр.учёте уже {today_count} человек "
-                                          f"(порог {tabel.MIGR_DAILY_THRESHOLD}). Риск вопросов "
-                                          f"от заказчика — проверьте обоснованность.")
+                    note += (f"\n⚠️ Сегодня на мигр.учёте уже {today_count} человек "
+                             f"(порог {tabel.MIGR_DAILY_THRESHOLD}). Риск вопросов "
+                             f"от заказчика — проверьте обоснованность.")
             else:
                 tabel.set_reason(session, employee, code, responder.user_id())
-        await responder.send(f"{full_name}: причина проставлена.")
+                note = f"✔ {full_name} — {_reason_label(code)}"
+                if prev_code:
+                    note += f" (было: {_reason_label(prev_code)})"
+
+        await _deliver_picker(
+            responder, "reasonday", edit=True, note=note,
+            extra_button=_tabel_extra_button("reasonday"),
+            empty_text="✅ Все отмечены. Утро завершено.",
+        )
         return
 
     if payload == "ack_never_marked":
@@ -1532,7 +1718,17 @@ async def on_callback(event: MessageCallback):
     if payload == "reason_finish":
         with Session(engine) as session:
             n = tabel.fill_unmarked_absent(session, responder.user_id())
-        await responder.send(f"Утро завершено. Неявка проставлена: {n} чел.")
+            rows = tabel.day_reason_summary(session)
+        lines = [f"📋 Утро закрыто {date.today():%d.%m.%Y}. "
+                 f"Неявка проставлена автоматически: {n} чел."]
+        if rows:
+            lines.append("")
+            lines.append(f"Отсутствующие сегодня ({len(rows)}):")
+            lines += [f"  • {name} — {_reason_label(code)}" for name, code in rows]
+        # Протокол пишем в то же сообщение, где был список: в чате остаётся один
+        # проверяемый итог вместо ленты «причина проставлена» без указания причины.
+        await _edit_picker_message(responder, "reasonday", "\n".join(lines))
+        _open_pickers.pop((responder.user_id(), "reasonday"), None)
         return
 
     if payload == "evening_done":
